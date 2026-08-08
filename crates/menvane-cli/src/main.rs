@@ -7,6 +7,7 @@ use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use menvane_integrations::{
     ClaudeHook, ClaudeInstaller, ClaudePaths, CodexHook, CodexInstaller, CodexPaths, McpServer,
+    OpenCodeHook, OpenCodeInstaller, OpenCodePaths,
 };
 use menvane_server::{
     DEFAULT_ADDRESS, DEFAULT_PORT, daemon_running, home_from_environment, serve, start_daemon,
@@ -71,6 +72,7 @@ struct HookArgs {
 enum Client {
     Claude,
     Codex,
+    Opencode,
 }
 
 #[derive(Args)]
@@ -232,6 +234,20 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            Client::Opencode => {
+                let installer =
+                    OpenCodeInstaller::new(OpenCodePaths::discover()?, std::env::current_exe()?);
+                let changed = installer.connect()?;
+                menvane.set_integration_connected("opencode", true)?;
+                println!(
+                    "OpenCode integration {}",
+                    if changed {
+                        "connected"
+                    } else {
+                        "already connected"
+                    }
+                );
+            }
         },
         Command::Disconnect(arguments) => match arguments.client {
             Client::Claude => {
@@ -262,6 +278,20 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            Client::Opencode => {
+                let installer =
+                    OpenCodeInstaller::new(OpenCodePaths::discover()?, std::env::current_exe()?);
+                let changed = installer.disconnect()?;
+                menvane.set_integration_connected("opencode", false)?;
+                println!(
+                    "OpenCode integration {}",
+                    if changed {
+                        "disconnected"
+                    } else {
+                        "not connected"
+                    }
+                );
+            }
         },
         Command::Hook(arguments) => match arguments.client {
             Client::Claude => {
@@ -277,6 +307,14 @@ async fn main() -> Result<()> {
                 std::io::stdin().read_to_string(&mut input)?;
                 let payload = serde_json::from_str(&input)?;
                 let output = CodexHook::new(&menvane, std::env::current_exe()?)
+                    .handle(&arguments.event, payload)?;
+                println!("{}", serde_json::to_string(&output)?);
+            }
+            Client::Opencode => {
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let payload = serde_json::from_str(&input)?;
+                let output = OpenCodeHook::new(&menvane, std::env::current_exe()?)
                     .handle(&arguments.event, payload)?;
                 println!("{}", serde_json::to_string(&output)?);
             }
