@@ -12,6 +12,7 @@ use axum::{Json, Router};
 use fs2::FileExt;
 use menvane_domain::NormalizedEvent;
 use menvane_engine::{CaptureOutcome, Menvane};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1";
@@ -45,6 +46,7 @@ pub fn app(state: Arc<Menvane>) -> Router {
     Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/events", post(ingest_event))
+        .route("/api/v1/recall", post(recall))
         .route("/api/v1/jobs", get(jobs))
         .with_state(state)
 }
@@ -125,6 +127,29 @@ async fn jobs(
             })
             .collect(),
     )))
+}
+
+#[derive(Deserialize)]
+struct RecallRequest {
+    cwd: String,
+    session_id: String,
+    kind: String,
+    #[serde(default)]
+    prompt: String,
+}
+
+async fn recall(
+    State(menvane): State<Arc<Menvane>>,
+    Json(request): Json<RecallRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cwd = std::path::Path::new(&request.cwd);
+    let context = match request.kind.as_str() {
+        "session-start" => menvane.session_briefing(cwd, &request.session_id),
+        "user-prompt" => menvane.prompt_context(cwd, &request.prompt, &request.session_id),
+        _ => Err(anyhow::anyhow!("unsupported recall kind: {}", request.kind)),
+    }
+    .map_err(internal_server_error)?;
+    Ok(Json(json!({ "context": context })))
 }
 
 fn internal_server_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {

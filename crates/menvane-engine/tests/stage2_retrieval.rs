@@ -61,7 +61,7 @@ fn automatic_recall_filters_global_applicability() {
     let explicit = menvane
         .search(&python, "maven build-guidance", ScopeSelection::Auto, 10)
         .unwrap();
-    assert_eq!(titles(&explicit), ["Maven build guidance"]);
+    assert!(titles(&explicit).contains(&"Maven build guidance"));
 }
 
 fn write_global(

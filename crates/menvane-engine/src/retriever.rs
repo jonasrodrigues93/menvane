@@ -38,7 +38,16 @@ impl<'a> Retriever<'a> {
         let candidate_limit = limit.saturating_mul(8).max(limit);
         let mut results =
             self.index
-                .search(query, search_scope, candidate_limit, include_sessions)?;
+                .search(query, search_scope, candidate_limit, include_sessions, true)?;
+        if results.is_empty() && mode == RetrievalMode::Automatic {
+            results = self.index.search(
+                query,
+                search_scope,
+                candidate_limit,
+                include_sessions,
+                false,
+            )?;
+        }
         results.retain(|memory| {
             memory.scope != "global"
                 || eligible_global(
@@ -52,6 +61,36 @@ impl<'a> Retriever<'a> {
             let rrf = 1.0 / (RRF_K + result.fts_rank as f64);
             result.score =
                 rrf * type_multiplier(&result.memory_type) * status_multiplier(&result.status);
+        }
+        results.sort_by(|left, right| right.score.total_cmp(&left.score));
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    pub fn briefing(&self, project: &Project, limit: usize) -> Result<Vec<SearchResult>> {
+        let mut results = self.index.list(
+            SearchScope::Auto(&project.id),
+            limit.saturating_mul(8),
+            false,
+        )?;
+        results.retain(|memory| {
+            memory.scope != "global"
+                || eligible_global(
+                    &memory.applicability,
+                    Some(&project.technologies),
+                    RetrievalMode::Automatic,
+                    "",
+                )
+        });
+        results.retain(|memory| match memory.memory_type.as_str() {
+            "decision" | "gotcha" => true,
+            "fact" => memory.scope == "global" && memory.confidence >= 0.8,
+            _ => false,
+        });
+        for result in &mut results {
+            result.score = result.confidence
+                * type_multiplier(&result.memory_type)
+                * status_multiplier(&result.status);
         }
         results.sort_by(|left, right| right.score.total_cmp(&left.score));
         results.truncate(limit);

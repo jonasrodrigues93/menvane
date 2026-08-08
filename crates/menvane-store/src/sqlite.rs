@@ -128,8 +128,9 @@ impl IndexStore {
         scope: SearchScope<'_>,
         limit: usize,
         include_sessions: bool,
+        match_all_terms: bool,
     ) -> Result<Vec<SearchResult>> {
-        let fts_query = fts_query(query);
+        let fts_query = fts_query(query, match_all_terms);
         if fts_query.is_empty() {
             bail!("search query must contain letters or numbers");
         }
@@ -157,6 +158,68 @@ impl IndexStore {
                 i64::try_from(limit)?,
                 include_sessions
             ],
+            |row| {
+                let id: String = row.get(0)?;
+                Ok(SearchResult {
+                    id: Uuid::parse_str(&id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            id.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    memory_type: row.get(1)?,
+                    scope: row.get(2)?,
+                    title: row.get(3)?,
+                    status: row.get(4)?,
+                    confidence: row.get(5)?,
+                    applicability: serde_json::from_str(&row.get::<_, String>(6)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    excerpt: row.get(7)?,
+                    score: row.get(8)?,
+                    fts_rank: 0,
+                })
+            },
+        )?;
+        rows.enumerate()
+            .map(|(index, row)| {
+                let mut result = row?;
+                result.fts_rank = index + 1;
+                Ok(result)
+            })
+            .collect::<Result<Vec<_>, rusqlite::Error>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list(
+        &self,
+        scope: SearchScope<'_>,
+        limit: usize,
+        include_sessions: bool,
+    ) -> Result<Vec<SearchResult>> {
+        let connection = self.open_initialized()?;
+        let (scope_sql, project_id) = match scope {
+            SearchScope::Auto(project_id) => ("(scope = 'global' OR project_id = ?1)", project_id),
+            SearchScope::Project(project_id) => ("project_id = ?1", project_id),
+            SearchScope::Global => ("scope = 'global'", ""),
+        };
+        let sql = format!(
+            "SELECT id, type, scope, title, status, confidence, applicability_json, substr(body, 1, 500), 0.0
+             FROM memories
+             WHERE {scope_sql} AND status != 'forgotten' AND (?3 OR type != 'session')
+             ORDER BY updated_at DESC
+             LIMIT ?2"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![project_id, i64::try_from(limit)?, include_sessions],
             |row| {
                 let id: String = row.get(0)?;
                 Ok(SearchResult {
@@ -340,13 +403,13 @@ fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Resul
     Ok(())
 }
 
-fn fts_query(query: &str) -> String {
+fn fts_query(query: &str, match_all_terms: bool) -> String {
     query
         .split(|character: char| !character.is_alphanumeric() && character != '_')
         .filter(|token| !token.is_empty())
         .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
-        .join(" AND ")
+        .join(if match_all_terms { " AND " } else { " OR " })
 }
 
 pub fn mark_forgotten(memory: &mut Memory) {
@@ -384,7 +447,7 @@ mod tests {
         index.upsert_memory(&memory, &path).unwrap();
         assert_eq!(
             index
-                .search("durable", SearchScope::Global, 10, false)
+                .search("durable", SearchScope::Global, 10, false, true)
                 .unwrap()
                 .len(),
             1
@@ -394,7 +457,7 @@ mod tests {
         index.upsert_memory(&memory, &path).unwrap();
         assert!(
             index
-                .search("durable", SearchScope::Global, 10, false)
+                .search("durable", SearchScope::Global, 10, false, true)
                 .unwrap()
                 .is_empty()
         );

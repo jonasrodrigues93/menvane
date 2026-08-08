@@ -219,11 +219,14 @@ impl Menvane {
     }
 
     pub fn ingest_event(&self, event: NormalizedEvent) -> Result<CaptureOutcome> {
-        let sanitizer = CaptureSanitizer::new(self.config.capture.clone())?;
-        let Some(event) = sanitizer.sanitize(event) else {
+        let Some(event) = self.sanitize_event(event)? else {
             return Ok(CaptureOutcome::Dropped);
         };
         SessionEngine::new(self).ingest(event)
+    }
+
+    pub fn sanitize_event(&self, event: NormalizedEvent) -> Result<Option<NormalizedEvent>> {
+        Ok(CaptureSanitizer::new(self.config.capture.clone())?.sanitize(event))
     }
 
     pub fn finalize_idle_sessions(&self) -> Result<usize> {
@@ -232,6 +235,54 @@ impl Menvane {
 
     pub fn jobs(&self) -> Result<Vec<JobRecord>> {
         self.sessions.jobs()
+    }
+
+    pub fn session_briefing(&self, cwd: &Path, session_key: &str) -> Result<String> {
+        let project = self.ensure_project(cwd)?;
+        let mut memories = Vec::new();
+        for memory in Retriever::new(&self.index).briefing(&project, 20)? {
+            if self.sessions.claim_injection(session_key, memory.id)? {
+                memories.push(memory);
+            }
+        }
+        let technologies = [
+            project.technologies.languages.join(", "),
+            project.technologies.frameworks.join(", "),
+            project.technologies.tools.join(", "),
+            project.technologies.databases.join(", "),
+            project.technologies.platforms.join(", "),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+        let prefix = format!(
+            "Project: {}\nTechnologies: {}\n",
+            project.identity,
+            if technologies.is_empty() {
+                "none detected"
+            } else {
+                &technologies
+            }
+        );
+        Ok(format_memory_context(&prefix, &memories, 2_500))
+    }
+
+    pub fn prompt_context(&self, cwd: &Path, prompt: &str, session_key: &str) -> Result<String> {
+        let mut memories = Vec::new();
+        for memory in self.recall(cwd, prompt, 20)? {
+            if self.sessions.claim_injection(session_key, memory.id)? {
+                memories.push(memory);
+            }
+            if memories.len() == 6 {
+                break;
+            }
+        }
+        Ok(format_memory_context("", &memories, 6_000))
+    }
+
+    pub fn set_integration_connected(&self, client: &str, connected: bool) -> Result<()> {
+        self.sessions.set_integration_connected(client, connected)
     }
 
     pub fn home(&self) -> &Path {
@@ -376,5 +427,28 @@ fn format_memory_body(memory_type: MemoryType, body: &str) -> String {
             "## Trigger\n\n## Preconditions\n\n## Procedure\n\n{body}\n\n## Decision points\n\n## Validation\n\n## Failure handling\n\n## Expected outcome"
         ),
         MemoryType::Session => body.to_owned(),
+    }
+}
+
+fn format_memory_context(prefix: &str, memories: &[SearchResult], max_chars: usize) -> String {
+    let mut context = String::from(
+        "MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n",
+    );
+    context.push_str(prefix);
+    for memory in memories {
+        let entry = format!(
+            "\n[{} | {} | {}]\n{}\n{}\n",
+            memory.memory_type, memory.scope, memory.status, memory.title, memory.excerpt
+        );
+        if context.chars().count() + entry.chars().count() + 28 > max_chars {
+            break;
+        }
+        context.push_str(&entry);
+    }
+    context.push_str("\nEND MENVANE MEMORY CONTEXT");
+    if context.chars().count() <= max_chars {
+        context
+    } else {
+        context.chars().take(max_chars).collect()
     }
 }

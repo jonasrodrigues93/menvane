@@ -13,6 +13,7 @@ axum.workspace = true
 fs2.workspace = true
 menvane-domain = { path = "../menvane-domain" }
 menvane-engine = { path = "../menvane-engine" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

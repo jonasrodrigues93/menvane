@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS integration_state (
     last_event_at TEXT,
     details_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS session_injections (
+    session_key TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    injected_at TEXT NOT NULL,
+    PRIMARY KEY(session_key, memory_id)
+);
 "#;
 
 #[derive(Debug, Clone)]
@@ -282,6 +288,23 @@ impl SessionRepository {
             })
         })
         .collect()
+    }
+
+    pub fn claim_injection(&self, session_key: &str, memory_id: Uuid) -> Result<bool> {
+        let connection = self.open()?;
+        Ok(connection.execute(
+            "INSERT OR IGNORE INTO session_injections(session_key, memory_id, injected_at) VALUES (?1, ?2, ?3)",
+            params![session_key, memory_id.to_string(), Utc::now().to_rfc3339()],
+        )? == 1)
+    }
+
+    pub fn set_integration_connected(&self, client: &str, connected: bool) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "INSERT INTO integration_state(client, connected, mcp_registered, hook_status, details_json) VALUES (?1, ?2, ?2, ?3, '{}') ON CONFLICT(client) DO UPDATE SET connected=excluded.connected, mcp_registered=excluded.mcp_registered, hook_status=excluded.hook_status",
+            params![client, connected, if connected { "installed" } else { "removed" }],
+        )?;
+        Ok(())
     }
 
     fn open(&self) -> Result<Connection> {

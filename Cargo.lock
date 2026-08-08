@@ -644,6 +644,7 @@ dependencies = [
  "menvane-engine",
  "menvane-integrations",
  "menvane-server",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "uuid",
@@ -683,10 +684,14 @@ name = "menvane-integrations"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "hex",
  "menvane-domain",
  "menvane-engine",
+ "menvane-server",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "uuid",
 ]
@@ -701,6 +706,7 @@ dependencies = [
  "fs2",
  "menvane-domain",
  "menvane-engine",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

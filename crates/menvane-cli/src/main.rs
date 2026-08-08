@@ -1,10 +1,11 @@
+use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
-use menvane_integrations::McpServer;
+use menvane_integrations::{ClaudeHook, ClaudeInstaller, ClaudePaths, McpServer};
 use menvane_server::{
     DEFAULT_ADDRESS, DEFAULT_PORT, daemon_running, home_from_environment, serve, start_daemon,
     stop_daemon,
@@ -26,6 +27,9 @@ struct Cli {
 enum Command {
     Serve(ServeArgs),
     Daemon(DaemonArgs),
+    Connect(ClientArgs),
+    Disconnect(ClientArgs),
+    Hook(HookArgs),
     Write(WriteArgs),
     Search(SearchArgs),
     Read(ReadArgs),
@@ -33,6 +37,24 @@ enum Command {
     Reindex,
     Doctor,
     Mcp,
+}
+
+#[derive(Args)]
+struct ClientArgs {
+    #[arg(value_enum)]
+    client: Client,
+}
+
+#[derive(Args)]
+struct HookArgs {
+    #[arg(value_enum)]
+    client: Client,
+    event: String,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Client {
+    Claude,
 }
 
 #[derive(Args)]
@@ -165,6 +187,48 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Connect(arguments) => match arguments.client {
+            Client::Claude => {
+                let installer =
+                    ClaudeInstaller::new(ClaudePaths::discover()?, std::env::current_exe()?);
+                let changed = installer.connect()?;
+                menvane.set_integration_connected("claude-code", true)?;
+                println!(
+                    "Claude Code integration {}",
+                    if changed {
+                        "connected"
+                    } else {
+                        "already connected"
+                    }
+                );
+            }
+        },
+        Command::Disconnect(arguments) => match arguments.client {
+            Client::Claude => {
+                let installer =
+                    ClaudeInstaller::new(ClaudePaths::discover()?, std::env::current_exe()?);
+                let changed = installer.disconnect()?;
+                menvane.set_integration_connected("claude-code", false)?;
+                println!(
+                    "Claude Code integration {}",
+                    if changed {
+                        "disconnected"
+                    } else {
+                        "not connected"
+                    }
+                );
+            }
+        },
+        Command::Hook(arguments) => match arguments.client {
+            Client::Claude => {
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let payload = serde_json::from_str(&input)?;
+                let output = ClaudeHook::new(&menvane, std::env::current_exe()?)
+                    .handle(&arguments.event, payload)?;
+                println!("{}", serde_json::to_string(&output)?);
+            }
+        },
         Command::Write(arguments) => {
             let memory = menvane.write(
                 &arguments.cwd,

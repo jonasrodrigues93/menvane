@@ -15,6 +15,7 @@ menvane-domain = { path = "../menvane-domain" }
 menvane-engine = { path = "../menvane-engine" }
 menvane-integrations = { path = "../menvane-integrations" }
 menvane-server = { path = "../menvane-server" }
+serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
 uuid.workspace = true
