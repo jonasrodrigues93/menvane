@@ -30,6 +30,7 @@ enum Command {
     Connect(ClientArgs),
     Disconnect(ClientArgs),
     Hook(HookArgs),
+    Provider(ProviderArgs),
     Write(WriteArgs),
     Search(SearchArgs),
     Read(ReadArgs),
@@ -37,6 +38,18 @@ enum Command {
     Reindex,
     Doctor,
     Mcp,
+}
+
+#[derive(Args)]
+struct ProviderArgs {
+    #[command(subcommand)]
+    command: ProviderCommand,
+}
+
+#[derive(Subcommand)]
+enum ProviderCommand {
+    Status,
+    Test,
 }
 
 #[derive(Args)]
@@ -229,6 +242,20 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&output)?);
             }
         },
+        Command::Provider(arguments) => match arguments.command {
+            ProviderCommand::Status => {
+                let (provider, model, health) = menvane.provider_health().await?;
+                println!("provider\t{provider}");
+                println!("model\t{model}");
+                println!("health\t{health:?}");
+            }
+            ProviderCommand::Test => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&menvane.provider_test().await?)?
+                );
+            }
+        },
         Command::Write(arguments) => {
             let memory = menvane.write(
                 &arguments.cwd,
@@ -300,11 +327,29 @@ async fn main() -> Result<()> {
         }
         Command::Doctor => {
             let report = menvane.doctor();
+            let provider = menvane.provider_health().await;
             for check in &report.checks {
                 let status = if check.healthy { "ok" } else { "failed" };
                 println!("{status}\t{}\t{}", check.name, check.detail);
             }
-            if !report.healthy() {
+            let provider_healthy = match provider {
+                Ok((name, model, health)) => {
+                    println!(
+                        "{}\tLLM provider\t{name}/{model}: {health:?}",
+                        if health == menvane_domain::ProviderHealth::Ready {
+                            "ok"
+                        } else {
+                            "failed"
+                        }
+                    );
+                    health == menvane_domain::ProviderHealth::Ready
+                }
+                Err(error) => {
+                    println!("failed\tLLM provider\t{error}");
+                    false
+                }
+            };
+            if !report.healthy() || !provider_healthy {
                 bail!("one or more doctor checks failed");
             }
         }

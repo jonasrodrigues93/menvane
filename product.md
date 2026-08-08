@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 0.4.0
+Version: 0.5.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -81,3 +81,23 @@ Claude hooks normalize client payloads before domain ingestion and ensure the da
 Session start injects a briefing of project identity, detected technologies, active decisions, critical gotchas, and high-confidence applicable global facts within 2,500 characters. User prompts retrieve at most six relevant project and applicable global memories within 6,000 characters. No external language-model request occurs on this path, and identical memories are not repeatedly injected into one external session.
 
 Injected memory is delimited as historical context and explicitly states that current user instructions and repository state are authoritative. Hook capture and recall require no memory instruction from the user.
+
+## Language Model Providers
+
+Language-model generation is accessed only through the provider-independent `LlmProvider` boundary. Compilation requires structured output and JSON Schema capability. Provider failures distinguish unavailable service, authentication, rate or usage limits, network errors, unsupported capabilities, invalid application input, invalid schemas, and internal failures.
+
+The default provider is `codex` with model `default`. It invokes the installed Codex CLI and uses existing local Codex authentication without reading or persisting credentials. Internal calls set `MENVANE_INTERNAL=1`, execute in an ephemeral temporary directory with a read-only sandbox, ignore user and project configuration, disable available tools and hooks, supply all evidence directly, and delete schema and response files afterward. Health distinguishes missing binary, missing authentication, unavailable explicit model, and ready state.
+
+The `openrouter` provider uses the OpenAI-compatible chat completions endpoint and JSON Schema response format. Its model must be explicit. The API key is read only from the configured environment variable, which defaults to `OPENROUTER_API_KEY`, and is never written to Markdown, SQLite, logs, Git, or responses.
+
+An explicit fallback provider may be configured under `[llm.fallback]`. Fallback applies only to provider availability, authentication, usage limits, network errors, and unsupported capabilities. It does not hide invalid Menvane input, invalid schemas, or internal defects.
+
+`menvane provider status` performs only local and configuration health checks and does not make paid inference requests. `menvane provider test` performs one minimal structured request and validates the response. Doctor includes provider compatibility and health.
+
+## Memory Compilation
+
+The memory compiler receives bounded session evidence, important prompts and tools, errors, decisions, validation results, existing related memories, and the project technology profile. It requests schema-constrained JSON and never allows a provider to write Markdown directly. Invalid structured output receives one bounded retry and then fails.
+
+Compiler output may contain zero memories. Valid output uses only facts, decisions, procedures, and gotchas. Procedure content contains trigger, preconditions, ordered steps, decision points, validation, failure handling, and expected outcome. Global classification requires high scope confidence; uncertainty resolves to project scope.
+
+Before creating durable memory, Menvane searches the same scope and type. Equivalent content reinforces confidence and source evidence. Incompatible content with the same identity creates a new memory and supersedes the old one instead of silently rewriting history. Provider unavailability does not affect capture, session Markdown, manual memory operations, search, MCP, project detection, or technology detection; compilation jobs remain durable and retryable.

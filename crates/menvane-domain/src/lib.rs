@@ -5,5 +5,8 @@ mod session;
 
 pub use memory::{Applicability, Memory, MemoryMetadata, MemoryStatus, MemoryType, Scope};
 pub use project::{Project, ProjectTechnologies};
-pub use retrieval::{EmbeddingError, EmbeddingProvider, ProviderCapabilities};
+pub use retrieval::{
+    EmbeddingError, EmbeddingProvider, JsonSchema, LlmError, LlmErrorKind, LlmProvider, LlmRequest,
+    ProviderCapabilities, ProviderHealth, StructuredResponse,
+};
 pub use session::{NormalizedEvent, NormalizedEventKind, SessionState};

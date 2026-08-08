@@ -1,4 +1,6 @@
+mod compiler;
 mod project_resolver;
+mod providers;
 mod retriever;
 mod sanitizer;
 mod session_engine;
@@ -12,7 +14,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use menvane_domain::{
-    Applicability, Memory, MemoryMetadata, MemoryType, NormalizedEvent, Project, Scope,
+    Applicability, JsonSchema, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryType,
+    NormalizedEvent, Project, ProviderHealth, Scope,
 };
 use menvane_store::{
     IndexStore, JobRecord, MarkdownStore, SearchResult, SessionRepository, mark_forgotten,
@@ -20,7 +23,9 @@ use menvane_store::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
+pub use providers::{CodexProvider, OpenRouterProvider, ProviderChain};
 pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
 pub use sanitizer::{CaptureSanitizer, CaptureSanitizerConfig};
 pub use session_engine::{CaptureOutcome, SessionEngine};
@@ -66,6 +71,50 @@ struct MenvaneConfig {
     capture: CaptureSanitizerConfig,
     #[serde(default)]
     sessions: SessionConfiguration,
+    #[serde(default)]
+    llm: LlmConfiguration,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LlmConfiguration {
+    #[serde(default = "default_llm_provider")]
+    provider: String,
+    #[serde(default = "default_llm_model")]
+    model: String,
+    #[serde(default = "default_openrouter_url")]
+    base_url: String,
+    #[serde(default = "default_openrouter_key_env")]
+    api_key_env: String,
+    #[serde(default)]
+    fallback: Option<Box<LlmConfiguration>>,
+}
+
+impl Default for LlmConfiguration {
+    fn default() -> Self {
+        Self {
+            provider: default_llm_provider(),
+            model: default_llm_model(),
+            base_url: default_openrouter_url(),
+            api_key_env: default_openrouter_key_env(),
+            fallback: None,
+        }
+    }
+}
+
+fn default_llm_provider() -> String {
+    "codex".to_owned()
+}
+
+fn default_llm_model() -> String {
+    "default".to_owned()
+}
+
+fn default_openrouter_url() -> String {
+    "https://openrouter.ai/api/v1".to_owned()
+}
+
+fn default_openrouter_key_env() -> String {
+    "OPENROUTER_API_KEY".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -289,6 +338,135 @@ impl Menvane {
         &self.home
     }
 
+    pub async fn provider_health(&self) -> Result<(String, String, ProviderHealth)> {
+        let provider = self.configured_provider()?;
+        Ok((
+            provider.name().to_owned(),
+            provider.model().to_owned(),
+            provider.health().await,
+        ))
+    }
+
+    pub async fn provider_test(&self) -> Result<serde_json::Value> {
+        let provider = self.configured_provider()?;
+        let response = provider
+            .generate_structured(
+                LlmRequest {
+                    system: "Return the requested structured health response.".to_owned(),
+                    prompt: "Return {\"ok\": true}.".to_owned(),
+                    timeout: std::time::Duration::from_secs(30),
+                },
+                JsonSchema(serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["ok"],
+                    "properties": { "ok": { "type": "boolean", "const": true } }
+                })),
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+        if response
+            .value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            bail!("provider test returned an invalid structured response");
+        }
+        Ok(response.value)
+    }
+
+    pub async fn compile_and_store(
+        &self,
+        cwd: &Path,
+        input: CompilationInput,
+    ) -> Result<(Vec<Uuid>, String)> {
+        let source_session = input.source_session;
+        let result = MemoryCompiler::new(self.configured_provider()?)
+            .compile(input)
+            .await
+            .map_err(anyhow::Error::new)?;
+        let mut ids = Vec::new();
+        for candidate in result.memories {
+            ids.push(self.store_compiled_memory(cwd, candidate, source_session)?);
+        }
+        Ok((ids, result.provider))
+    }
+
+    pub fn configured_provider(&self) -> Result<std::sync::Arc<dyn LlmProvider>> {
+        let primary = provider_from_configuration(&self.config.llm)?;
+        let fallback = self
+            .config
+            .llm
+            .fallback
+            .as_deref()
+            .map(provider_from_configuration)
+            .transpose()?;
+        Ok(std::sync::Arc::new(ProviderChain::new(primary, fallback)))
+    }
+
+    fn store_compiled_memory(
+        &self,
+        cwd: &Path,
+        candidate: CompiledMemory,
+        source_session: Option<Uuid>,
+    ) -> Result<Uuid> {
+        let scope = match candidate.scope {
+            Scope::Global => ScopeSelection::Global,
+            Scope::Project => ScopeSelection::Project,
+        };
+        let related = self.search(cwd, &candidate.title, scope, 20)?;
+        let equivalent = related.into_iter().find(|memory| {
+            memory.memory_type == candidate.memory_type.to_string()
+                && memory.scope == candidate.scope.to_string()
+                && memory.title.eq_ignore_ascii_case(&candidate.title)
+        });
+        let mut supersedes = Vec::new();
+        if let Some(existing) = equivalent {
+            let (mut memory, path) = self.index.read_memory(&self.markdown, existing.id)?;
+            if normalize_markdown(&memory.body) == normalize_markdown(&candidate.body) {
+                memory.metadata.confidence = memory.metadata.confidence.max(candidate.confidence);
+                memory.metadata.updated_at = Utc::now();
+                memory.metadata.last_verified_at = Some(Utc::now());
+                if let Some(session) = source_session
+                    && !memory.metadata.source_sessions.contains(&session)
+                {
+                    memory.metadata.source_sessions.push(session);
+                }
+                self.markdown.update_memory(&path, &memory)?;
+                self.index.upsert_memory(&memory, &path)?;
+                self.markdown
+                    .commit(&format!("feat(memory): reinforce {}", memory.metadata.id));
+                return Ok(memory.metadata.id);
+            }
+            memory.metadata.status = menvane_domain::MemoryStatus::Superseded;
+            memory.metadata.updated_at = Utc::now();
+            self.markdown.update_memory(&path, &memory)?;
+            self.index.upsert_memory(&memory, &path)?;
+            supersedes.push(memory.metadata.id);
+        }
+        let memory = self.write(
+            cwd,
+            WriteMemory {
+                title: candidate.title,
+                body: candidate.body,
+                memory_type: candidate.memory_type,
+                scope: candidate.scope,
+                confidence: candidate.confidence,
+                tags: Vec::new(),
+                applies_to: candidate.applies_to,
+            },
+        )?;
+        let (mut memory, path) = self.index.read_memory(&self.markdown, memory.metadata.id)?;
+        if let Some(session) = source_session {
+            memory.metadata.source_sessions.push(session);
+        }
+        memory.metadata.supersedes = supersedes;
+        self.markdown.update_memory(&path, &memory)?;
+        self.index.upsert_memory(&memory, &path)?;
+        Ok(memory.metadata.id)
+    }
+
     pub fn doctor(&self) -> DoctorReport {
         let mut checks = Vec::new();
         let writable_probe = self.home.join(format!(".doctor-{}", Uuid::now_v7()));
@@ -451,4 +629,34 @@ fn format_memory_context(prefix: &str, memories: &[SearchResult], max_chars: usi
     } else {
         context.chars().take(max_chars).collect()
     }
+}
+
+fn provider_from_configuration(
+    configuration: &LlmConfiguration,
+) -> Result<std::sync::Arc<dyn LlmProvider>> {
+    match configuration.provider.as_str() {
+        "codex" => Ok(std::sync::Arc::new(CodexProvider::new(
+            "codex",
+            &configuration.model,
+        ))),
+        "openrouter" => {
+            if configuration.model == "default" || configuration.model.trim().is_empty() {
+                bail!("OpenRouter requires an explicit model");
+            }
+            Ok(std::sync::Arc::new(OpenRouterProvider::new(
+                &configuration.model,
+                &configuration.base_url,
+                &configuration.api_key_env,
+            )))
+        }
+        provider => bail!("unsupported LLM provider: {provider}"),
+    }
+}
+
+fn normalize_markdown(markdown: &str) -> String {
+    markdown
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
