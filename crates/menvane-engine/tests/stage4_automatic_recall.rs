@@ -63,6 +63,12 @@ fn session_and_prompt_context_are_bounded_trusted_and_not_repeated() {
         .prompt_context(&project, "SQLite migration lock failure", "claude-session")
         .unwrap();
     assert!(!repeated.contains("Migration lock failure"));
+    assert_eq!(
+        menvane
+            .prompt_context(&project, "  ", "claude-session")
+            .unwrap(),
+        ""
+    );
 }
 
 fn write(

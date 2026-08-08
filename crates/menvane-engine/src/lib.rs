@@ -361,6 +361,9 @@ impl Menvane {
     }
 
     pub fn prompt_context(&self, cwd: &Path, prompt: &str, session_key: &str) -> Result<String> {
+        if prompt.trim().is_empty() {
+            return Ok(String::new());
+        }
         let mut memories = Vec::new();
         for memory in self.recall(cwd, prompt, 20)? {
             if self.sessions.claim_injection(session_key, memory.id)? {

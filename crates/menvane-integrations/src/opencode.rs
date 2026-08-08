@@ -157,13 +157,19 @@ export const Menvane = async ({{ directory }}) => ({{
   event: async ({{ event }}) => {{
     const map = {{ "session.created": "SessionStart", "session.idle": "Stop", "session.compacted": "PostCompact", "session.deleted": "SessionEnd", "tool.completed": "PostToolUse" }}
     const name = map[event.type]
-    if (name) await invoke(name, {{ ...event.properties, cwd: event.properties?.cwd || directory, hook_event_name: name }})
+    const properties = event.properties || {{}}
+    const sessionID = properties.sessionID || properties.session_id || properties.info?.id
+    if (name && sessionID) await invoke(name, {{ ...properties, session_id: sessionID, cwd: properties.cwd || properties.info?.directory || directory, hook_event_name: name }})
   }},
-  "chat.message": async (input) => {{ await invoke("UserPromptSubmit", {{ ...input, session_id: input.sessionID, cwd: directory, prompt: input.message?.parts?.map(part => part.text || "").join("\n") || "", hook_event_name: "UserPromptSubmit" }}) }},
-  "chat.params": async (input, output) => {{
+  "chat.message": async (input, output) => {{
+    const prompt = output.parts?.filter(part => part.type === "text").map(part => part.text || "").join("\n").trim() || ""
+    if (prompt) await invoke("UserPromptSubmit", {{ session_id: input.sessionID, cwd: directory, prompt, hook_event_name: "UserPromptSubmit" }})
+  }},
+  "experimental.chat.system.transform": async (input, output) => {{
+    if (!input.sessionID) return
     const response = await invoke("SessionStart", {{ session_id: input.sessionID, cwd: directory, hook_event_name: "SessionStart", source: "startup" }})
     const context = response.hookSpecificOutput?.additionalContext
-    if (context) output.options.system = [...(output.options.system || []), context]
+    if (context && !output.system.includes(context)) output.system.push(context)
   }},
   "tool.execute.after": async (input, output) => {{ await invoke("PostToolUse", {{ session_id: input.sessionID, cwd: directory, tool_name: input.tool, tool_input: input.args, tool_response: output, hook_event_name: "PostToolUse" }}) }}
 }})
@@ -244,6 +250,10 @@ mod tests {
         let source = fs::read_to_string(&paths.plugin).unwrap();
         assert!(!source.contains("rank"));
         assert!(!source.contains("consolidat"));
+        assert!(source.contains("output.parts?.filter"));
+        assert!(source.contains("properties.info?.id"));
+        assert!(source.contains("experimental.chat.system.transform"));
+        assert!(!source.contains("output.options.system"));
         assert!(installer.disconnect().unwrap());
         let disconnected = read_object(&paths.configuration).unwrap();
         assert!(
