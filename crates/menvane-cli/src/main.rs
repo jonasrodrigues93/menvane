@@ -92,11 +92,34 @@ struct ProviderConfigureArgs {
     base_url: String,
     #[arg(long, default_value = "OPENAI_API_KEY")]
     api_key_env: String,
+    #[arg(long, value_enum, default_value = "medium")]
+    reasoning_effort: ReasoningEffort,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum ConfigurableProvider {
     Openai,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
 }
 
 #[derive(Args)]
@@ -406,6 +429,7 @@ async fn main() -> Result<()> {
                         &configuration.model,
                         &configuration.base_url,
                         &configuration.api_key_env,
+                        Some(configuration.reasoning_effort.as_str()),
                     )?;
                     println!(
                         "configured OpenAI model {}; restart the daemon to apply",

@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.1.0
+Version: 1.2.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -88,11 +88,11 @@ Language-model generation is accessed only through the provider-independent `Llm
 
 The default provider is `openai`. It calls the OpenAI API directly through the configured OpenAI-compatible endpoint, which defaults to `https://api.openai.com/v1`, and uses the API key from `OPENAI_API_KEY` by default. The selected model is explicit and configurable. Menvane stores only the API-key environment variable name and never reads authentication from OpenCode, Codex, or another agent configuration.
 
-`menvane provider configure openai --model <model>` configures the direct provider without accepting or persisting a secret value. `--base-url` and `--api-key-env` allow endpoint and environment-name overrides. The daemon must be restarted after configuration changes.
+`menvane provider configure openai --model <model>` configures the direct provider without accepting or persisting a secret value. `--reasoning-effort` selects `minimal`, `low`, `medium`, `high`, or `xhigh` and defaults to `medium`. `--base-url` and `--api-key-env` allow endpoint and environment-name overrides. The daemon must be restarted after configuration changes.
 
 The optional `codex` compatibility provider invokes the installed Codex CLI and uses existing local Codex authentication without reading or persisting credentials. Internal calls set `MENVANE_INTERNAL=1`, execute in an ephemeral temporary directory with a read-only sandbox, ignore user and project configuration, disable available tools and hooks, supply all evidence directly, and delete schema and response files afterward. Health distinguishes missing binary, missing authentication, unavailable explicit model, and ready state.
 
-The `openai` and `openrouter` providers use OpenAI-compatible chat completions and JSON Schema structured output. Their models must be explicit. API keys are read only from configured environment variables and are never written to Markdown, SQLite, configuration values, logs, Git, UI, or responses. OpenRouter defaults to `OPENROUTER_API_KEY` and its standard API endpoint when selected.
+The `openai` and `openrouter` providers use OpenAI-compatible chat completions and JSON Schema structured output. Their models must be explicit. Configured reasoning effort is included in structured inference requests. API keys are read only from configured environment variables and are never written to Markdown, SQLite, configuration values, logs, Git, UI, or responses. OpenRouter defaults to `OPENROUTER_API_KEY` and its standard API endpoint when selected.
 
 An explicit fallback provider may be configured under `[llm.fallback]`. Fallback applies only to provider availability, authentication, usage limits, network errors, and unsupported capabilities. It does not hide invalid Menvane input, invalid schemas, or internal defects.
 

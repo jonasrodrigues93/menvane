@@ -13,11 +13,13 @@ fn openai_configuration_persists_only_environment_variable_name() {
             "gpt-test-model",
             "https://api.openai.com/v1",
             "MY_OPENAI_API_KEY",
+            Some("medium"),
         )
         .unwrap();
     let configuration = fs::read_to_string(home.join("config.toml")).unwrap();
     assert!(configuration.contains("provider = \"openai\""));
     assert!(configuration.contains("model = \"gpt-test-model\""));
     assert!(configuration.contains("api_key_env = \"MY_OPENAI_API_KEY\""));
+    assert!(configuration.contains("reasoning_effort = \"medium\""));
     assert!(!configuration.contains("sk-"));
 }

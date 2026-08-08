@@ -290,7 +290,7 @@ fn slugify(value: &str) -> String {
 }
 
 fn default_config() -> &'static str {
-    "[capture]\nmax_prompt_bytes = 16384\nmax_tool_output_bytes = 4096\nmax_tool_input_bytes = 4096\nignore_paths = [\".env\", \".env.*\", \"**/secrets/**\", \"**/.ssh/**\"]\n\n[sessions]\nidle_finalize_seconds = 120\n\n[llm]\nprovider = \"openai\"\nmodel = \"gpt-5.4\"\nbase_url = \"https://api.openai.com/v1\"\napi_key_env = \"OPENAI_API_KEY\"\n"
+    "[capture]\nmax_prompt_bytes = 16384\nmax_tool_output_bytes = 4096\nmax_tool_input_bytes = 4096\nignore_paths = [\".env\", \".env.*\", \"**/secrets/**\", \"**/.ssh/**\"]\n\n[sessions]\nidle_finalize_seconds = 120\n\n[llm]\nprovider = \"openai\"\nmodel = \"gpt-5.4\"\nbase_url = \"https://api.openai.com/v1\"\napi_key_env = \"OPENAI_API_KEY\"\nreasoning_effort = \"medium\"\n"
 }
 
 #[cfg(test)]

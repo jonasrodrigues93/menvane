@@ -154,6 +154,7 @@ pub struct OpenRouterProvider {
     model: String,
     base_url: String,
     api_key_env: String,
+    reasoning_effort: Option<String>,
 }
 
 pub struct OpenAIProvider {
@@ -169,6 +170,11 @@ impl OpenAIProvider {
         Self {
             compatible: OpenRouterProvider::new(model, base_url, api_key_env),
         }
+    }
+
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.compatible = self.compatible.with_reasoning_effort(reasoning_effort);
+        self
     }
 }
 
@@ -212,7 +218,13 @@ impl OpenRouterProvider {
             model: model.into(),
             base_url: base_url.into(),
             api_key_env: api_key_env.into(),
+            reasoning_effort: None,
         }
+    }
+
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
     }
 }
 
@@ -225,22 +237,29 @@ impl LlmProvider for OpenRouterProvider {
     ) -> Result<StructuredResponse, LlmError> {
         let api_key = std::env::var(&self.api_key_env)
             .map_err(|_| authentication("OpenRouter API key is not configured"))?;
+        let mut payload = json!({
+            "model": self.model,
+            "messages": [
+                { "role": "system", "content": request.system },
+                { "role": "user", "content": request.prompt }
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": { "name": "menvane_compilation", "strict": true, "schema": schema.0 }
+            }
+        });
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            payload["reasoning_effort"] = Value::String(reasoning_effort.clone());
+        }
         let response = self
             .client
-            .post(format!("{}/chat/completions", self.base_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                self.base_url.trim_end_matches('/')
+            ))
             .bearer_auth(api_key)
             .timeout(request.timeout)
-            .json(&json!({
-                "model": self.model,
-                "messages": [
-                    { "role": "system", "content": request.system },
-                    { "role": "user", "content": request.prompt }
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": { "name": "menvane_compilation", "strict": true, "schema": schema.0 }
-                }
-            }))
+            .json(&payload)
             .send()
             .await
             .map_err(|error| network(error.to_string()))?;
@@ -663,7 +682,8 @@ exit 1
         let address = listener.local_addr().unwrap();
         let router = Router::new().route(
             "/chat/completions",
-            post(|headers: axum::http::HeaderMap| async move {
+            post(
+                |headers: axum::http::HeaderMap, axum::Json(payload): axum::Json<Value>| async move {
                 if headers
                     .get("authorization")
                     .and_then(|value| value.to_str().ok())
@@ -674,16 +694,24 @@ exit 1
                         axum::Json(json!({ "error": "missing key" })),
                     );
                 }
+                if payload.get("reasoning_effort").and_then(Value::as_str) != Some("medium") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({ "error": "missing reasoning effort" })),
+                    );
+                }
                 (
                     StatusCode::OK,
                     axum::Json(
                         json!({ "choices": [{ "message": { "content": "{\"ok\":true}" } }] }),
                     ),
                 )
-            }),
+                },
+            ),
         );
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let provider = OpenAIProvider::new("test-model", format!("http://{address}"), key_name);
+        let provider = OpenAIProvider::new("test-model", format!("http://{address}"), key_name)
+            .with_reasoning_effort(Some("medium".to_owned()));
         let response = provider
             .generate_structured(request(), schema())
             .await

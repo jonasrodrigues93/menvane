@@ -25,7 +25,7 @@ Configure direct OpenAI inference before starting the daemon:
 
 ```bash
 export OPENAI_API_KEY="..."
-menvane provider configure openai --model gpt-5.4
+menvane provider configure openai --model gpt-5.4 --reasoning-effort medium
 menvane daemon restart
 menvane provider status
 ```

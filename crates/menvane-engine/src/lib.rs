@@ -100,6 +100,8 @@ struct LlmConfiguration {
     #[serde(default = "default_openrouter_key_env")]
     api_key_env: String,
     #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
     fallback: Option<Box<LlmConfiguration>>,
 }
 
@@ -110,6 +112,7 @@ impl Default for LlmConfiguration {
             model: default_llm_model(),
             base_url: default_openrouter_url(),
             api_key_env: default_openrouter_key_env(),
+            reasoning_effort: Some("medium".to_owned()),
             fallback: None,
         }
     }
@@ -544,7 +547,13 @@ impl Menvane {
         Ok(())
     }
 
-    pub fn configure_openai(&self, model: &str, base_url: &str, api_key_env: &str) -> Result<()> {
+    pub fn configure_openai(
+        &self,
+        model: &str,
+        base_url: &str,
+        api_key_env: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Result<()> {
         if model.trim().is_empty() {
             bail!("OpenAI model cannot be empty");
         }
@@ -557,6 +566,11 @@ impl Menvane {
                 .all(|character| character.is_ascii_alphanumeric() || character == '_')
         {
             bail!("API key environment variable name is invalid");
+        }
+        if reasoning_effort.is_some_and(|effort| {
+            !matches!(effort, "minimal" | "low" | "medium" | "high" | "xhigh")
+        }) {
+            bail!("reasoning effort must be minimal, low, medium, high, or xhigh");
         }
         let mut configuration: toml::Table =
             toml::from_str(&fs::read_to_string(self.home.join("config.toml"))?)?;
@@ -581,6 +595,14 @@ impl Menvane {
             "api_key_env".to_owned(),
             toml::Value::String(api_key_env.to_owned()),
         );
+        if let Some(reasoning_effort) = reasoning_effort {
+            llm.insert(
+                "reasoning_effort".to_owned(),
+                toml::Value::String(reasoning_effort.to_owned()),
+            );
+        } else {
+            llm.remove("reasoning_effort");
+        }
         self.update_configuration_text(&toml::to_string_pretty(&configuration)?)
     }
 
@@ -1113,11 +1135,14 @@ fn provider_from_configuration(
             "codex",
             &configuration.model,
         ))),
-        "openai" => Ok(std::sync::Arc::new(OpenAIProvider::new(
-            &configuration.model,
-            &configuration.base_url,
-            &configuration.api_key_env,
-        ))),
+        "openai" => Ok(std::sync::Arc::new(
+            OpenAIProvider::new(
+                &configuration.model,
+                &configuration.base_url,
+                &configuration.api_key_env,
+            )
+            .with_reasoning_effort(configuration.reasoning_effort.clone()),
+        )),
         "openrouter" => {
             if configuration.model == "default" || configuration.model.trim().is_empty() {
                 bail!("OpenRouter requires an explicit model");
