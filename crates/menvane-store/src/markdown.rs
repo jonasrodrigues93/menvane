@@ -2,11 +2,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use menvane_domain::{Memory, MemoryMetadata, Project, Scope};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
+
+static GIT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct ParsedMarkdown<T> {
     pub metadata: T,
@@ -141,6 +144,9 @@ impl MarkdownStore {
         if !self.memory_root.join(".git").exists() {
             return;
         }
+        let Ok(_guard) = GIT_WRITE_LOCK.lock() else {
+            return;
+        };
         let _ = Command::new("git")
             .args(["add", "."])
             .current_dir(&self.memory_root)

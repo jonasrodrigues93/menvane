@@ -15,6 +15,8 @@ use menvane_engine::{CaptureOutcome, Menvane};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+mod ui;
+
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1";
 pub const DEFAULT_PORT: u16 = 47_831;
 
@@ -48,6 +50,14 @@ pub fn app(state: Arc<Menvane>) -> Router {
         .route("/api/v1/events", post(ingest_event))
         .route("/api/v1/recall", post(recall))
         .route("/api/v1/jobs", get(jobs))
+        .route("/api/v1/projects", get(api_projects))
+        .route("/api/v1/memories", get(api_memories))
+        .route("/api/v1/sessions", get(api_sessions))
+        .route("/api/v1/imports", get(api_imports))
+        .route("/api/v1/integrations", get(api_integrations))
+        .route("/api/v1/settings", get(api_settings))
+        .route("/api/v1/providers", get(api_providers))
+        .merge(ui::router())
         .with_state(state)
 }
 
@@ -129,6 +139,59 @@ async fn jobs(
     )))
 }
 
+async fn api_projects(
+    State(menvane): State<Arc<Menvane>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Ok(Json(
+        serde_json::to_value(menvane.all_projects().map_err(internal_server_error)?)
+            .map_err(|error| internal_server_error(error.into()))?,
+    ))
+}
+
+async fn api_memories(
+    State(menvane): State<Arc<Menvane>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let memories = menvane.all_memories().map_err(internal_server_error)?;
+    Ok(Json(Value::Array(memories.into_iter().map(|memory| json!({ "metadata": memory.metadata, "title": memory.title, "body": memory.body })).collect())))
+}
+
+async fn api_sessions(
+    State(menvane): State<Arc<Menvane>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let memories = menvane.all_memories().map_err(internal_server_error)?;
+    Ok(Json(Value::Array(memories.into_iter().filter(|memory| memory.metadata.memory_type == menvane_domain::MemoryType::Session).map(|memory| json!({ "metadata": memory.metadata, "title": memory.title, "body": memory.body })).collect())))
+}
+
+async fn api_imports() -> Json<Value> {
+    Json(
+        json!({ "clients": ["claude", "codex", "opencode"], "dry_run": true, "orphans": "retained" }),
+    )
+}
+
+async fn api_integrations() -> Json<Value> {
+    Json(json!({ "clients": ["claude", "codex", "opencode"], "mcp": "stdio" }))
+}
+
+async fn api_settings(
+    State(menvane): State<Arc<Menvane>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Ok(Json(
+        json!({ "toml": menvane.configuration_text().map_err(internal_server_error)? }),
+    ))
+}
+
+async fn api_providers(
+    State(menvane): State<Arc<Menvane>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (provider, model, health) = menvane
+        .provider_health()
+        .await
+        .map_err(internal_server_error)?;
+    Ok(Json(
+        json!({ "provider": provider, "model": model, "health": health }),
+    ))
+}
+
 #[derive(Deserialize)]
 struct RecallRequest {
     cwd: String,
@@ -190,6 +253,8 @@ mod tests {
     use axum::http::Request;
     use chrono::Utc;
     use menvane_domain::NormalizedEventKind;
+    use menvane_domain::{Applicability, MemoryType, Scope};
+    use menvane_engine::WriteMemory;
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -221,6 +286,64 @@ mod tests {
         let second = post_event(router, &event).await;
         assert_eq!(first["outcome"], "stored");
         assert_eq!(second["outcome"], "duplicate");
+    }
+
+    #[tokio::test]
+    async fn mandatory_ui_views_and_admin_edit_are_functional() {
+        let temporary = TempDir::new().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+        let memory = menvane
+            .write(
+                &project,
+                WriteMemory {
+                    title: "UI inspection memory".to_owned(),
+                    body: "Visible durable evidence".to_owned(),
+                    memory_type: MemoryType::Fact,
+                    scope: Scope::Project,
+                    confidence: 1.0,
+                    tags: Vec::new(),
+                    applies_to: Applicability::default(),
+                },
+            )
+            .unwrap();
+        let project_id = menvane.ensure_project(&project).unwrap().id;
+        let router = app(Arc::new(menvane));
+        for path in [
+            "/",
+            "/projects",
+            &format!("/projects/{project_id}"),
+            "/memories",
+            &format!("/memories/{}", memory.metadata.id),
+            "/procedures",
+            "/sessions",
+            "/search",
+            "/imports",
+            "/integrations",
+            "/providers",
+            "/settings",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        let body = "title=Edited+memory&body=Immediately+indexed+content";
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/memories/{}/edit", memory.metadata.id))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
     }
 
     async fn post_event(router: Router, event: &NormalizedEvent) -> Value {

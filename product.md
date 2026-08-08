@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 0.10.0
+Version: 0.11.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -137,3 +137,13 @@ Menvane records retrieved, injected, explicitly read, successfully applied, and 
 All importers produce client-independent normalized sessions and pass them through the session engine; they never create consolidated knowledge directly. External formats are treated as versioned best-effort input. Reimport uses client plus external session identifier and is idempotent.
 
 `--dry-run` reports discovered sessions, invalid records, and estimated bytes without persistence. A session without reliable existing project path is stored as an orphan in operational SQLite and is never guessed into a project. Orphan payload remains available for later administrative association and compilation.
+
+## Web Interface
+
+The daemon serves a responsive, server-rendered HTML interface with no CDN, React, or client framework. The dashboard summarizes projects, global memory, procedures, sessions, queue state, integrations, and provider health. Dedicated views cover projects, memories, procedures, sessions, search, imports, integrations, providers, and non-secret settings.
+
+Memory lists filter by physical scope, type, status, and technology. Detail views show rendered content, raw Markdown, metadata, confidence, applicability, source sessions, procedure successes and failures, and supersession evidence. Administrative edits use the same Markdown and index application layer, commit durable history, and update search immediately.
+
+The search view uses the runtime retrieval engine and exposes FTS rank, RRF constant, freshness, and final score. The visual interface is fully local and uses embedded assets with minimal JavaScript only for progressive page arrival.
+
+REST endpoints under `/api/v1` cover health, projects, memories, sessions, imports, integrations, settings, jobs, providers, normalized events, and recall. HTTP handlers delegate to the same engine used by CLI, MCP, hooks, and UI.

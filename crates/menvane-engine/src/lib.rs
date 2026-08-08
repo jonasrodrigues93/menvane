@@ -489,6 +489,37 @@ impl Menvane {
         Ok(ImportOutcome::Imported)
     }
 
+    pub fn all_projects(&self) -> Result<Vec<Project>> {
+        self.markdown
+            .project_files()?
+            .into_iter()
+            .map(|path| self.markdown.parse_project(&path))
+            .collect()
+    }
+
+    pub fn all_memories(&self) -> Result<Vec<Memory>> {
+        self.markdown
+            .memory_files()?
+            .into_iter()
+            .map(|path| self.markdown.parse_memory(&path))
+            .collect()
+    }
+
+    pub fn edit_memory(&self, id: Uuid, title: &str, body: &str) -> Result<Memory> {
+        let (mut memory, path) = self.index.read_memory(&self.markdown, id)?;
+        memory.title = title.trim().to_owned();
+        memory.body = body.trim().to_owned();
+        memory.metadata.updated_at = Utc::now();
+        self.markdown.update_memory(&path, &memory)?;
+        self.index.upsert_memory(&memory, &path)?;
+        self.markdown.commit(&format!("docs(memory): edit {id}"));
+        Ok(memory)
+    }
+
+    pub fn configuration_text(&self) -> Result<String> {
+        Ok(fs::read_to_string(self.home.join("config.toml"))?)
+    }
+
     pub fn home(&self) -> &Path {
         &self.home
     }
