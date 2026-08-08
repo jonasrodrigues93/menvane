@@ -1,4 +1,5 @@
 mod compiler;
+mod global_promoter;
 mod project_resolver;
 mod providers;
 mod retriever;
@@ -24,6 +25,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
+pub use global_promoter::GlobalPromoter;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
 pub use providers::{CodexProvider, OpenRouterProvider, ProviderChain};
 pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
@@ -332,6 +334,46 @@ impl Menvane {
 
     pub fn set_integration_connected(&self, client: &str, connected: bool) -> Result<()> {
         self.sessions.set_integration_connected(client, connected)
+    }
+
+    pub fn record_procedure_application(
+        &self,
+        id: Uuid,
+        source_session: Uuid,
+        success: bool,
+    ) -> Result<Memory> {
+        let (mut memory, path) = self.index.read_memory(&self.markdown, id)?;
+        if memory.metadata.memory_type != MemoryType::Procedure {
+            bail!("memory {id} is not a procedure");
+        }
+        if !self
+            .sessions
+            .record_procedure_application(id, source_session, success)?
+        {
+            return Ok(memory);
+        }
+        if success {
+            memory.metadata.successes = Some(memory.metadata.successes.unwrap_or(0) + 1);
+            memory.metadata.last_verified_at = Some(Utc::now());
+            if memory.metadata.successes.unwrap_or(0) >= 2 {
+                memory.metadata.status = menvane_domain::MemoryStatus::Active;
+            }
+        } else {
+            memory.metadata.failures = Some(memory.metadata.failures.unwrap_or(0) + 1);
+        }
+        if !memory.metadata.source_sessions.contains(&source_session) {
+            memory.metadata.source_sessions.push(source_session);
+        }
+        memory.metadata.updated_at = Utc::now();
+        self.markdown.update_memory(&path, &memory)?;
+        self.index.upsert_memory(&memory, &path)?;
+        self.markdown
+            .commit(&format!("feat(procedure): reinforce {id}"));
+        Ok(memory)
+    }
+
+    pub fn promote_global_memories(&self) -> Result<Vec<Uuid>> {
+        GlobalPromoter::new(self).promote()
     }
 
     pub fn home(&self) -> &Path {

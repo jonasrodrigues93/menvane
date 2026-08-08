@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 0.5.0
+Version: 0.6.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -101,3 +101,11 @@ The memory compiler receives bounded session evidence, important prompts and too
 Compiler output may contain zero memories. Valid output uses only facts, decisions, procedures, and gotchas. Procedure content contains trigger, preconditions, ordered steps, decision points, validation, failure handling, and expected outcome. Global classification requires high scope confidence; uncertainty resolves to project scope.
 
 Before creating durable memory, Menvane searches the same scope and type. Equivalent content reinforces confidence and source evidence. Incompatible content with the same identity creates a new memory and supersedes the old one instead of silently rewriting history. Provider unavailability does not affect capture, session Markdown, manual memory operations, search, MCP, project detection, or technology detection; compilation jobs remain durable and retryable.
+
+## Procedure Learning And Promotion
+
+A first successful procedure is a candidate with one success and no failures. An independently recorded successful application increments successes, updates verification time, and activates the procedure at two successes. Duplicate delivery of the same session signal is idempotent. A failed application increments failures but does not delete or automatically replace the procedure, which remains available for later compiler evaluation.
+
+Global promotion evaluates equivalent project procedures and gotchas. Execution-derived knowledge remains project-scoped until equivalent evidence exists in at least two independent projects. Promotion creates one active contextual global memory retaining source project identifiers, source sessions, successes, failures, confidence, and applicability. Source variants remain inspectable as historical evidence. Retrieval deduplicates project and global variants.
+
+Project-specific decisions are not candidates for global promotion. Explicit universal preferences may still be classified as global facts directly by the compiler.

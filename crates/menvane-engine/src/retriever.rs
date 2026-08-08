@@ -63,6 +63,14 @@ impl<'a> Retriever<'a> {
                 rrf * type_multiplier(&result.memory_type) * status_multiplier(&result.status);
         }
         results.sort_by(|left, right| right.score.total_cmp(&left.score));
+        let mut seen = HashSet::new();
+        results.retain(|memory| {
+            seen.insert(format!(
+                "{}:{}",
+                memory.memory_type,
+                memory.title.to_ascii_lowercase()
+            ))
+        });
         results.truncate(limit);
         Ok(results)
     }

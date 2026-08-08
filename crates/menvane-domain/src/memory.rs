@@ -167,6 +167,8 @@ pub struct MemoryMetadata {
     pub imported: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_project_ids: Vec<String>,
 }
 
 impl Applicability {
@@ -216,6 +218,7 @@ impl MemoryMetadata {
             ended_at: None,
             imported: None,
             generation: None,
+            source_project_ids: Vec::new(),
         }
     }
 }

@@ -86,6 +86,13 @@ CREATE TABLE IF NOT EXISTS session_injections (
     injected_at TEXT NOT NULL,
     PRIMARY KEY(session_key, memory_id)
 );
+CREATE TABLE IF NOT EXISTS procedure_applications (
+    memory_id TEXT NOT NULL,
+    source_session TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(memory_id, source_session, signal)
+);
 "#;
 
 #[derive(Debug, Clone)]
@@ -305,6 +312,24 @@ impl SessionRepository {
             params![client, connected, if connected { "installed" } else { "removed" }],
         )?;
         Ok(())
+    }
+
+    pub fn record_procedure_application(
+        &self,
+        memory_id: Uuid,
+        source_session: Uuid,
+        success: bool,
+    ) -> Result<bool> {
+        let connection = self.open()?;
+        Ok(connection.execute(
+            "INSERT OR IGNORE INTO procedure_applications(memory_id, source_session, signal, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                memory_id.to_string(),
+                source_session.to_string(),
+                if success { "success" } else { "failure" },
+                Utc::now().to_rfc3339()
+            ],
+        )? == 1)
     }
 
     fn open(&self) -> Result<Connection> {
