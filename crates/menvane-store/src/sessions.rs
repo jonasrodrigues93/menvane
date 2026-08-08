@@ -131,6 +131,21 @@ pub struct JobRecord {
     pub attempt_count: u32,
     pub next_retry_at: DateTime<Utc>,
     pub last_error: Option<String>,
+    pub dedupe_key: String,
+}
+
+pub struct IntegrationRecord {
+    pub client: String,
+    pub connected: bool,
+    pub mcp_registered: bool,
+    pub hook_status: String,
+    pub last_event_at: Option<DateTime<Utc>>,
+}
+
+pub struct OrphanRecord {
+    pub client: String,
+    pub external_session_id: String,
+    pub payload_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +202,10 @@ impl SessionRepository {
                 event.timestamp.to_rfc3339(),
                 serde_json::to_string(event)?,
             ],
+        )?;
+        transaction.execute(
+            "INSERT INTO integration_state(client, connected, mcp_registered, hook_status, last_event_at, details_json) VALUES (?1, 1, 0, 'event received', ?2, '{}') ON CONFLICT(client) DO UPDATE SET last_event_at=excluded.last_event_at",
+            params![event.client, event.timestamp.to_rfc3339()],
         )?;
         if let Some(content) = observation_content(event) {
             transaction.execute(
@@ -276,7 +295,7 @@ impl SessionRepository {
     pub fn jobs(&self) -> Result<Vec<JobRecord>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT id, job_type, status, attempt_count, next_retry_at, last_error FROM jobs ORDER BY created_at",
+            "SELECT id, job_type, status, attempt_count, next_retry_at, last_error, dedupe_key FROM jobs ORDER BY created_at",
         )?;
         let rows = statement.query_map([], |row| {
             let id: String = row.get(0)?;
@@ -288,10 +307,11 @@ impl SessionRepository {
                 row.get(3)?,
                 next_retry_at,
                 row.get(5)?,
+                row.get(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, job_type, status, attempt_count, next_retry_at, last_error) = row?;
+            let (id, job_type, status, attempt_count, next_retry_at, last_error, dedupe_key) = row?;
             Ok(JobRecord {
                 id: Uuid::parse_str(&id)?,
                 job_type,
@@ -299,9 +319,124 @@ impl SessionRepository {
                 attempt_count,
                 next_retry_at: DateTime::parse_from_rfc3339(&next_retry_at)?.with_timezone(&Utc),
                 last_error,
+                dedupe_key,
             })
         })
         .collect()
+    }
+
+    pub fn claim_compile_job(&self) -> Result<Option<JobRecord>> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM jobs WHERE job_type='compile_session' AND status='pending' AND next_retry_at <= ?1 ORDER BY created_at LIMIT 1",
+                [Utc::now().to_rfc3339()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute(
+            "UPDATE jobs SET status='running', attempt_count=attempt_count+1, updated_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), id],
+        )?;
+        let job = transaction.query_row(
+            "SELECT id, job_type, status, attempt_count, next_retry_at, last_error, dedupe_key FROM jobs WHERE id=?1",
+            [&id],
+            |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, String>(4)?, row.get(5)?, row.get(6)?)),
+        )?;
+        transaction.commit()?;
+        Ok(Some(JobRecord {
+            id: Uuid::parse_str(&job.0)?,
+            job_type: job.1,
+            status: job.2,
+            attempt_count: job.3,
+            next_retry_at: DateTime::parse_from_rfc3339(&job.4)?.with_timezone(&Utc),
+            last_error: job.5,
+            dedupe_key: job.6,
+        }))
+    }
+
+    pub fn finish_job(&self, id: Uuid, provider: Option<&str>, error: Option<&str>) -> Result<()> {
+        let connection = self.open()?;
+        let job = connection.query_row(
+            "SELECT attempt_count FROM jobs WHERE id=?1",
+            [id.to_string()],
+            |row| row.get::<_, u32>(0),
+        )?;
+        let (status, next_retry_at) = if error.is_none() {
+            ("completed", Utc::now())
+        } else if job < 5 {
+            let delay = 2_i64.pow(job.min(10));
+            ("pending", Utc::now() + chrono::Duration::seconds(delay))
+        } else {
+            ("failed", Utc::now())
+        };
+        connection.execute(
+            "UPDATE jobs SET status=?1, next_retry_at=?2, last_error=?3, provider=?4, updated_at=?5 WHERE id=?6",
+            params![status, next_retry_at.to_rfc3339(), error, provider, Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn integrations(&self) -> Result<Vec<IntegrationRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare("SELECT client, connected, mcp_registered, hook_status, last_event_at FROM integration_state ORDER BY client")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (client, connected, mcp_registered, hook_status, last_event_at) = row?;
+            Ok(IntegrationRecord {
+                client,
+                connected,
+                mcp_registered,
+                hook_status,
+                last_event_at: last_event_at
+                    .map(|value| {
+                        DateTime::parse_from_rfc3339(&value).map(|value| value.with_timezone(&Utc))
+                    })
+                    .transpose()?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn orphans(&self) -> Result<Vec<OrphanRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare("SELECT client, external_session_id, payload_json FROM orphan_sessions ORDER BY created_at")?;
+        let rows = statement.query_map([], |row| {
+            Ok(OrphanRecord {
+                client: row.get(0)?,
+                external_session_id: row.get(1)?,
+                payload_json: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn clear_orphan(&self, client: &str, external_session_id: &str) -> Result<()> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM orphan_sessions WHERE client=?1 AND external_session_id=?2",
+            params![client, external_session_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM imports WHERE client=?1 AND external_session_id=?2 AND status='orphan'",
+            params![client, external_session_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn claim_injection(&self, session_key: &str, memory_id: Uuid) -> Result<bool> {

@@ -21,9 +21,10 @@ pub fn router() -> Router<Arc<Menvane>> {
         .route("/sessions", get(sessions))
         .route("/search", get(search))
         .route("/imports", get(imports))
+        .route("/imports/associate", post(associate_orphan))
         .route("/integrations", get(integrations))
         .route("/providers", get(providers))
-        .route("/settings", get(settings))
+        .route("/settings", get(settings).post(update_settings))
         .route("/assets/menvane.css", get(styles))
         .route("/assets/menvane.js", get(script))
 }
@@ -216,27 +217,42 @@ async fn search(State(menvane): State<Arc<Menvane>>, Query(query): Query<SearchQ
     }))
 }
 
-async fn imports() -> Response {
-    page(
-        "Imports",
-        format!(
-            "{}<section class='callout'><p>Scan and import from the CLI while the daemon records status here.</p><pre>menvane import claude --dry-run\nmenvane import codex --dry-run\nmenvane import opencode --dry-run</pre><p>Unresolved project identities remain orphaned and are never guessed.</p></section>",
-            heading("Imports", "Preview external evidence before consolidation.")
-        ),
-    )
+async fn imports(State(menvane): State<Arc<Menvane>>) -> Response {
+    page_result("Imports", menvane.orphans().and_then(|orphans| {
+        let projects = menvane.all_projects()?;
+        let rows = orphans.iter().map(|orphan| {
+            let options = projects.iter().map(|project| format!("<option value='{}'>{}</option>", project.id, escape(&project.name))).collect::<String>();
+            format!("<form class='ledger-row' method='post' action='/imports/associate'><span>{}</span><strong>{}</strong><input type='hidden' name='client' value='{}'><input type='hidden' name='external_session_id' value='{}'><select name='project_id'>{options}</select><button>Associate</button></form>", escape(&orphan.client), escape(&orphan.external_session_id), escape_attribute(&orphan.client), escape_attribute(&orphan.external_session_id))
+        }).collect::<String>();
+        Ok(format!("{}<section class='callout'><pre>menvane import claude --dry-run\nmenvane import codex --dry-run\nmenvane import opencode --dry-run</pre><p>Unresolved identities remain orphaned until explicitly associated.</p></section><section class='ledger'>{rows}</section>", heading("Imports", "Preview external evidence before consolidation.")))
+    }))
 }
 
-async fn integrations() -> Response {
-    page(
-        "Integrations",
-        format!(
-            "{}<section class='metrics'>{}{}{}</section><pre>menvane connect claude\nmenvane connect codex\nmenvane connect opencode</pre>",
-            heading("Integrations", "Three agents, one local memory plane."),
-            metric("Claude", 1, "hook + MCP"),
-            metric("Codex", 1, "hook + MCP"),
-            metric("OpenCode", 1, "plugin + MCP")
-        ),
-    )
+#[derive(Deserialize)]
+struct AssociateOrphan {
+    client: String,
+    external_session_id: String,
+    project_id: String,
+}
+
+async fn associate_orphan(
+    State(menvane): State<Arc<Menvane>>,
+    Form(form): Form<AssociateOrphan>,
+) -> Response {
+    match menvane.associate_orphan(&form.client, &form.external_session_id, &form.project_id) {
+        Ok(_) => Redirect::to("/imports").into_response(),
+        Err(error) => error_page(error),
+    }
+}
+
+async fn integrations(State(menvane): State<Arc<Menvane>>) -> Response {
+    page_result("Integrations", menvane.integrations().map(|states| {
+        let rows = ["claude-code", "codex", "opencode"].iter().map(|client| {
+            let state = states.iter().find(|state| state.client == *client);
+            format!("<div class='ledger-row'><span>{}</span><strong>{}</strong><small>{}</small></div>", escape(client), if state.is_some_and(|state| state.connected) { "Connected" } else { "Disconnected" }, state.map(|state| state.hook_status.as_str()).unwrap_or("not installed"))
+        }).collect::<String>();
+        format!("{}<section class='ledger'>{rows}</section><pre>menvane connect all</pre>", heading("Integrations", "Three agents, one local memory plane."))
+    }))
 }
 
 async fn providers(State(menvane): State<Arc<Menvane>>) -> Response {
@@ -256,7 +272,22 @@ async fn providers(State(menvane): State<Arc<Menvane>>) -> Response {
 }
 
 async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
-    page_result("Settings", menvane.configuration_text().map(|configuration| format!("{}<p class='callout'>Non-secret configuration lives at <code>MENVANE_HOME/config.toml</code>. Secret values are environment-only.</p><pre>{}</pre>", heading("Settings", "Observable runtime configuration."), escape(&configuration))))
+    page_result("Settings", menvane.configuration_text().map(|configuration| format!("{}<p class='callout'>Secret values are environment-only. Restart the daemon after changes.</p><form class='editor' method='post'><textarea name='configuration' rows='28'>{}</textarea><button>Validate and save</button></form>", heading("Settings", "Observable runtime configuration."), escape(&configuration))))
+}
+
+#[derive(Deserialize)]
+struct SettingsEdit {
+    configuration: String,
+}
+
+async fn update_settings(
+    State(menvane): State<Arc<Menvane>>,
+    Form(edit): Form<SettingsEdit>,
+) -> Response {
+    match menvane.update_configuration_text(&edit.configuration) {
+        Ok(_) => Redirect::to("/settings").into_response(),
+        Err(error) => error_page(error),
+    }
 }
 
 async fn styles() -> impl IntoResponse {

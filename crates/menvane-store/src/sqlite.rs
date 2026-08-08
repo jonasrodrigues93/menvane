@@ -320,6 +320,14 @@ impl IndexStore {
         Ok((project_files.len(), memory_files.len()))
     }
 
+    pub fn backup(&self, destination: &Path) -> Result<()> {
+        let source = self.open_initialized()?;
+        let mut destination = Connection::open(destination)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+        backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
+        Ok(())
+    }
+
     fn open(&self) -> Result<Connection> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;

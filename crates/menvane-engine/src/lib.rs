@@ -21,9 +21,11 @@ use menvane_domain::{
     ReinforcementSignal, Scope,
 };
 use menvane_store::{
-    IndexStore, JobRecord, MarkdownStore, SearchResult, SessionRepository, mark_forgotten,
+    IndexStore, IntegrationRecord, JobRecord, MarkdownStore, OrphanRecord, SearchResult,
+    SessionRepository, mark_forgotten,
 };
 use serde::Deserialize;
+use serde::Serialize;
 use uuid::Uuid;
 
 pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
@@ -520,6 +522,145 @@ impl Menvane {
         Ok(fs::read_to_string(self.home.join("config.toml"))?)
     }
 
+    pub fn update_configuration_text(&self, configuration: &str) -> Result<()> {
+        let _: MenvaneConfig = toml::from_str(configuration)?;
+        let lowercase = configuration.to_ascii_lowercase();
+        for forbidden in ["api_key =", "token =", "password =", "secret ="] {
+            if lowercase.contains(forbidden) {
+                bail!("secrets must be supplied through environment variables");
+            }
+        }
+        let path = self.home.join("config.toml");
+        let temporary = self.home.join(format!(".config-{}.tmp", Uuid::now_v7()));
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        use std::io::Write;
+        file.write_all(configuration.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(temporary, path)?;
+        std::fs::File::open(&self.home)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn integrations(&self) -> Result<Vec<IntegrationRecord>> {
+        self.sessions.integrations()
+    }
+
+    pub fn orphans(&self) -> Result<Vec<OrphanRecord>> {
+        self.sessions.orphans()
+    }
+
+    pub fn associate_orphan(
+        &self,
+        client: &str,
+        external_session_id: &str,
+        project_id: &str,
+    ) -> Result<ImportOutcome> {
+        let orphan = self
+            .sessions
+            .orphans()?
+            .into_iter()
+            .find(|orphan| {
+                orphan.client == client && orphan.external_session_id == external_session_id
+            })
+            .context("orphan session not found")?;
+        let project = self
+            .all_projects()?
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .context("project not found")?;
+        let cwd = project
+            .known_paths
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .context("project has no available checkout")?;
+        let mut session: NormalizedSession = serde_json::from_str(&orphan.payload_json)?;
+        session.cwd = Some(cwd.clone());
+        for event in &mut session.events {
+            event.cwd.clone_from(&cwd);
+        }
+        self.sessions.clear_orphan(client, external_session_id)?;
+        match self.import_session(session.clone()) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                self.sessions.record_import(
+                    client,
+                    external_session_id,
+                    "orphan",
+                    Some(&serde_json::to_string(&session)?),
+                )?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn backup(&self, destination: &Path) -> Result<()> {
+        if destination.exists() {
+            bail!(
+                "backup destination already exists: {}",
+                destination.display()
+            );
+        }
+        fs::create_dir_all(destination)?;
+        copy_tree(&self.home.join("memory"), &destination.join("memory"))?;
+        fs::copy(
+            self.home.join("config.toml"),
+            destination.join("config.toml"),
+        )?;
+        self.index.backup(&destination.join("index.sqlite"))?;
+        let mut files = backup_files(destination)?;
+        files.sort();
+        let manifest = BackupManifest {
+            version: 1,
+            created_at: Utc::now(),
+            files: files
+                .into_iter()
+                .map(|path| {
+                    let relative = path
+                        .strip_prefix(destination)?
+                        .to_string_lossy()
+                        .into_owned();
+                    Ok((relative, sha256_file(&path)?))
+                })
+                .collect::<Result<std::collections::BTreeMap<_, _>>>()?,
+        };
+        fs::write(
+            destination.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        Ok(())
+    }
+
+    pub fn restore(&self, source: &Path) -> Result<()> {
+        validate_backup(source)?;
+        if self.home.join("daemon.pid").exists() {
+            bail!("stop the Menvane daemon before restoring");
+        }
+        let staging = self.home.join(format!(".restore-stage-{}", Uuid::now_v7()));
+        let previous = self
+            .home
+            .join(format!(".restore-previous-{}", Uuid::now_v7()));
+        fs::create_dir_all(&staging)?;
+        copy_tree(&source.join("memory"), &staging.join("memory"))?;
+        fs::copy(source.join("config.toml"), staging.join("config.toml"))?;
+        fs::copy(source.join("index.sqlite"), staging.join("index.sqlite"))?;
+        fs::create_dir_all(&previous)?;
+        for name in ["memory", "config.toml", "index.sqlite"] {
+            let current = self.home.join(name);
+            if current.exists() {
+                fs::rename(&current, previous.join(name))?;
+            }
+            fs::rename(staging.join(name), current)?;
+        }
+        fs::remove_dir_all(staging)?;
+        self.index.initialize()?;
+        self.sessions.initialize()?;
+        fs::remove_dir_all(previous)?;
+        Ok(())
+    }
+
     pub fn home(&self) -> &Path {
         &self.home
     }
@@ -577,6 +718,58 @@ impl Menvane {
             ids.push(self.store_compiled_memory(cwd, candidate, source_session)?);
         }
         Ok((ids, result.provider))
+    }
+
+    pub async fn process_next_compilation(&self) -> Result<bool> {
+        let Some(job) = self.sessions.claim_compile_job()? else {
+            return Ok(false);
+        };
+        let session_id = Uuid::parse_str(&job.dedupe_key)?;
+        let result = async {
+            let session = self.index.read_memory(&self.markdown, session_id)?.0;
+            let project_id = session
+                .metadata
+                .project_id
+                .as_deref()
+                .context("session compilation requires a project")?;
+            let project = self
+                .all_projects()?
+                .into_iter()
+                .find(|project| project.id == project_id)
+                .context("session project is missing")?;
+            let cwd = project
+                .known_paths
+                .iter()
+                .map(Path::new)
+                .find(|path| path.exists())
+                .context("session project has no available checkout")?;
+            self.compile_and_store(
+                cwd,
+                CompilationInput {
+                    session_summary: session.body,
+                    important_prompts: Vec::new(),
+                    important_tool_events: Vec::new(),
+                    errors: Vec::new(),
+                    decisions: Vec::new(),
+                    validation_results: Vec::new(),
+                    existing_related_memories: Vec::new(),
+                    technology_profile: serde_json::to_value(project.technologies)?,
+                    source_session: Some(session_id),
+                },
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok((_, provider)) => {
+                self.sessions.finish_job(job.id, Some(&provider), None)?;
+            }
+            Err(error) => {
+                self.sessions
+                    .finish_job(job.id, None, Some(&error.to_string()))?;
+            }
+        }
+        Ok(true)
     }
 
     pub fn configured_provider(&self) -> Result<std::sync::Arc<dyn LlmProvider>> {
@@ -707,6 +900,61 @@ impl Menvane {
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
             .map_err(|error| error.to_string());
         checks.push(check("Git", git));
+        let daemon = fs::read_to_string(self.home.join("daemon.pid"))
+            .map_err(|error| error.to_string())
+            .and_then(|pid| {
+                Command::new("kill")
+                    .args(["-0", pid.trim()])
+                    .status()
+                    .map_err(|error| error.to_string())
+                    .and_then(|status| {
+                        status
+                            .success()
+                            .then(|| format!("process {}", pid.trim()))
+                            .ok_or_else(|| "not running".to_owned())
+                    })
+            });
+        checks.push(check("daemon", daemon));
+        match self.sessions.integrations() {
+            Ok(integrations) => {
+                for (client, label) in [
+                    ("claude-code", "Claude integration"),
+                    ("codex", "Codex integration"),
+                    ("opencode", "OpenCode integration"),
+                ] {
+                    let result = integrations
+                        .iter()
+                        .find(|state| state.client == client && state.connected)
+                        .map(|state| format!("{}; MCP={}", state.hook_status, state.mcp_registered))
+                        .ok_or_else(|| "not connected".to_owned());
+                    checks.push(check(label, result));
+                }
+            }
+            Err(error) => checks.push(DoctorCheck {
+                name: "integrations",
+                healthy: false,
+                detail: error.to_string(),
+            }),
+        }
+        checks.push(check(
+            "jobs",
+            self.sessions.jobs().and_then(|jobs| {
+                let failed = jobs.iter().filter(|job| job.status == "failed").count();
+                if failed == 0 {
+                    Ok(format!(
+                        "{} pending",
+                        jobs.iter().filter(|job| job.status == "pending").count()
+                    ))
+                } else {
+                    bail!("{failed} failed jobs")
+                }
+            }),
+        ));
+        checks.push(DoctorCheck {
+            name: "embedding provider",
+            healthy: true,
+            detail: "disabled; FTS5 active".to_owned(),
+        });
         DoctorReport { checks }
     }
 
@@ -845,4 +1093,75 @@ fn normalize_markdown(markdown: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
+}
+
+#[derive(Serialize, Deserialize)]
+struct BackupManifest {
+    version: u32,
+    created_at: chrono::DateTime<Utc>,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+fn validate_backup(source: &Path) -> Result<()> {
+    let manifest: BackupManifest =
+        serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
+    if manifest.version != 1 {
+        bail!("unsupported backup version: {}", manifest.version);
+    }
+    for (relative, expected) in manifest.files {
+        let path = source.join(&relative);
+        if !path.starts_with(source) || !path.is_file() {
+            bail!("backup file is missing: {relative}");
+        }
+        if sha256_file(&path)? != expected {
+            bail!("backup checksum mismatch: {relative}");
+        }
+    }
+    let _: MenvaneConfig = toml::from_str(&fs::read_to_string(source.join("config.toml"))?)?;
+    let markdown = MarkdownStore::new(source);
+    for path in markdown.project_files()? {
+        markdown.parse_project(&path)?;
+    }
+    for path in markdown.memory_files()? {
+        markdown.parse_memory(&path)?;
+    }
+    let index = IndexStore::new(source.join("index.sqlite"));
+    index.initialize()?;
+    index.memory_count()?;
+    Ok(())
+}
+
+fn backup_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_none_or(|name| name != "manifest.json") {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let path = entry?.path();
+        let target = destination.join(path.file_name().context("path has no filename")?);
+        if path.is_dir() {
+            copy_tree(&path, &target)?;
+        } else {
+            fs::copy(path, target)?;
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::Digest;
+    Ok(hex::encode(sha2::Sha256::digest(fs::read(path)?)))
 }

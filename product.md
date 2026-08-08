@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 0.11.0
+Version: 1.0.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -147,3 +147,13 @@ Memory lists filter by physical scope, type, status, and technology. Detail view
 The search view uses the runtime retrieval engine and exposes FTS rank, RRF constant, freshness, and final score. The visual interface is fully local and uses embedded assets with minimal JavaScript only for progressive page arrival.
 
 REST endpoints under `/api/v1` cover health, projects, memories, sessions, imports, integrations, settings, jobs, providers, normalized events, and recall. HTTP handlers delegate to the same engine used by CLI, MCP, hooks, and UI.
+
+## Backup, Restore, And Distribution
+
+`menvane backup <path>` creates a new backup directory containing the complete Markdown memory repository, non-secret configuration, a consistent SQLite online backup, and a checksummed manifest. Existing destinations are never overwritten. `menvane restore <path> --confirm` verifies every checksum, configuration, Markdown frontmatter, and SQLite readability before staging and replacing current state. Restore refuses to run while a daemon PID is present and never replaces state without explicit confirmation.
+
+Daemon startup uses one process lock per Menvane home, graceful shutdown, idle-session recovery, WAL, bounded waits, and idempotent event and job keys. Atomic Markdown writes and reindex permit reconciliation after interrupted index updates. Git durable-history writes are serialized independently from concurrent capture.
+
+Release builds target Linux, macOS, and WSL as Linux. The repository CI runs formatting, Clippy, all tests, and release builds without real Codex authentication, OpenRouter credentials, or paid APIs. Runtime provider status may use local non-paid health interfaces; deterministic fake providers and mock servers cover CI behavior.
+
+Menvane is operationally complete when normal work in any connected agent is captured and consolidated, and later connected agents in the same project receive project plus applicable global context automatically. Unrelated project memory remains isolated, contextual global memory respects technology, procedures strengthen through reuse, sessions archive without hard deletion, and deleting SQLite followed by reindex preserves all durable knowledge.

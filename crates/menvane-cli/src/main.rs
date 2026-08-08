@@ -30,11 +30,13 @@ struct Cli {
 enum Command {
     Serve(ServeArgs),
     Daemon(DaemonArgs),
-    Connect(ClientArgs),
+    Connect(ConnectArgs),
     Disconnect(ClientArgs),
     Hook(HookArgs),
     Provider(ProviderArgs),
     Import(ImportArgs),
+    Backup(BackupArgs),
+    Restore(RestoreArgs),
     Write(WriteArgs),
     Search(SearchArgs),
     Read(ReadArgs),
@@ -43,6 +45,18 @@ enum Command {
     Doctor,
     Gc,
     Mcp,
+}
+
+#[derive(Args)]
+struct BackupArgs {
+    output: PathBuf,
+}
+
+#[derive(Args)]
+struct RestoreArgs {
+    source: PathBuf,
+    #[arg(long, help = "Confirm replacement of current Menvane state")]
+    confirm: bool,
 }
 
 #[derive(Args)]
@@ -71,6 +85,20 @@ enum ProviderCommand {
 struct ClientArgs {
     #[arg(value_enum)]
     client: Client,
+}
+
+#[derive(Args)]
+struct ConnectArgs {
+    #[arg(value_enum)]
+    client: ConnectClient,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ConnectClient {
+    Claude,
+    Codex,
+    Opencode,
+    All,
 }
 
 #[derive(Args)]
@@ -218,7 +246,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Connect(arguments) => match arguments.client {
-            Client::Claude => {
+            ConnectClient::Claude => {
                 let installer =
                     ClaudeInstaller::new(ClaudePaths::discover()?, std::env::current_exe()?);
                 let changed = installer.connect()?;
@@ -232,7 +260,7 @@ async fn main() -> Result<()> {
                     }
                 );
             }
-            Client::Codex => {
+            ConnectClient::Codex => {
                 let installer =
                     CodexInstaller::new(CodexPaths::discover()?, std::env::current_exe()?);
                 let changed = installer.connect()?;
@@ -246,7 +274,7 @@ async fn main() -> Result<()> {
                     }
                 );
             }
-            Client::Opencode => {
+            ConnectClient::Opencode => {
                 let installer =
                     OpenCodeInstaller::new(OpenCodePaths::discover()?, std::env::current_exe()?);
                 let changed = installer.connect()?;
@@ -259,6 +287,16 @@ async fn main() -> Result<()> {
                         "already connected"
                     }
                 );
+            }
+            ConnectClient::All => {
+                let executable = std::env::current_exe()?;
+                ClaudeInstaller::new(ClaudePaths::discover()?, &executable).connect()?;
+                CodexInstaller::new(CodexPaths::discover()?, &executable).connect()?;
+                OpenCodeInstaller::new(OpenCodePaths::discover()?, &executable).connect()?;
+                for client in ["claude-code", "codex", "opencode"] {
+                    menvane.set_integration_connected(client, true)?;
+                }
+                println!("all integrations connected");
             }
         },
         Command::Disconnect(arguments) => match arguments.client {
@@ -380,6 +418,17 @@ async fn main() -> Result<()> {
                 println!("orphans\t{orphans}");
                 println!("invalid\t{}", scan.invalid_records);
             }
+        }
+        Command::Backup(arguments) => {
+            menvane.backup(&arguments.output)?;
+            println!("backup created at {}", arguments.output.display());
+        }
+        Command::Restore(arguments) => {
+            if !arguments.confirm {
+                bail!("restore requires --confirm because it replaces current state");
+            }
+            menvane.restore(&arguments.source)?;
+            println!("restored backup from {}", arguments.source.display());
         }
         Command::Write(arguments) => {
             let memory = menvane.write(

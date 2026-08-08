@@ -228,8 +228,6 @@ impl OpenCodeImporter {
                 .json()
                 .await
                 .map_err(|error| error.to_string())?;
-            let temporary = JsonlImporter::with_roots("opencode", Vec::new());
-            let path = PathBuf::from(id);
             let mut events = Vec::new();
             let cwd = find_string(&summary, &["directory", "cwd"]).map(str::to_owned);
             for (index, message) in messages.into_iter().enumerate() {
@@ -239,7 +237,7 @@ impl OpenCodeImporter {
                             format!("opencode:{id}:{index}").as_bytes(),
                         )),
                         kind,
-                        client: temporary.client.clone(),
+                        client: "opencode".to_owned(),
                         external_session_id: id.to_owned(),
                         timestamp: Utc::now(),
                         cwd: cwd.clone().unwrap_or_default(),
@@ -253,7 +251,25 @@ impl OpenCodeImporter {
                     });
                 }
             }
-            let _ = path;
+            events.insert(
+                0,
+                boundary_event(
+                    "opencode",
+                    id,
+                    cwd.as_deref().unwrap_or_default(),
+                    Utc::now(),
+                    NormalizedEventKind::SessionStarted,
+                    "import-start",
+                ),
+            );
+            events.push(boundary_event(
+                "opencode",
+                id,
+                cwd.as_deref().unwrap_or_default(),
+                Utc::now(),
+                NormalizedEventKind::SessionEnded,
+                "import-end",
+            ));
             sessions.push(NormalizedSession {
                 client: "opencode".to_owned(),
                 external_session_id: id.to_owned(),

@@ -911,10 +911,13 @@ dependencies = [
  "menvane-domain",
  "menvane-engine",
  "menvane-server",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "toml",
  "uuid",
 ]
 
@@ -930,9 +933,11 @@ dependencies = [
  "menvane-engine",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

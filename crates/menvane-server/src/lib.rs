@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -31,6 +31,7 @@ pub async fn serve(menvane: Menvane, address: &str, port: u16) -> Result<()> {
         loop {
             interval.tick().await;
             let _ = maintenance.finalize_idle_sessions();
+            let _ = maintenance.process_next_compilation().await;
         }
     });
     let socket: SocketAddr = format!("{address}:{port}").parse()?;
@@ -57,6 +58,7 @@ pub fn app(state: Arc<Menvane>) -> Router {
         .route("/api/v1/integrations", get(api_integrations))
         .route("/api/v1/settings", get(api_settings))
         .route("/api/v1/providers", get(api_providers))
+        .route("/api/v1/search", get(api_search))
         .merge(ui::router())
         .with_state(state)
 }
@@ -190,6 +192,51 @@ async fn api_providers(
     Ok(Json(
         json!({ "provider": provider, "model": model, "health": health }),
     ))
+}
+
+#[derive(Deserialize)]
+struct ApiSearchQuery {
+    query: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    10
+}
+
+async fn api_search(
+    State(menvane): State<Arc<Menvane>>,
+    Query(query): Query<ApiSearchQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let cwd = std::env::current_dir().map_err(|error| internal_server_error(error.into()))?;
+    let results = menvane
+        .search(
+            &cwd,
+            &query.query,
+            menvane_engine::ScopeSelection::Auto,
+            query.limit,
+        )
+        .map_err(internal_server_error)?;
+    Ok(Json(Value::Array(
+        results
+            .into_iter()
+            .map(|memory| {
+                json!({
+                    "id": memory.id,
+                    "type": memory.memory_type,
+                    "scope": memory.scope,
+                    "title": memory.title,
+                    "status": memory.status,
+                    "confidence": memory.confidence,
+                    "applicability": memory.applicability,
+                    "score": memory.score,
+                    "fts_rank": memory.fts_rank,
+                    "age_days": memory.age_days
+                })
+            })
+            .collect(),
+    )))
 }
 
 #[derive(Deserialize)]
