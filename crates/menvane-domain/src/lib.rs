@@ -10,4 +10,6 @@ pub use retrieval::{
     ProviderCapabilities, ProviderHealth, StructuredResponse,
 };
 pub use session::ReinforcementSignal;
-pub use session::{NormalizedEvent, NormalizedEventKind, SessionState};
+pub use session::{
+    NormalizedEvent, NormalizedEventKind, NormalizedSession, SessionImporter, SessionState,
+};

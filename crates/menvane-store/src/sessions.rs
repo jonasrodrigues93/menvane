@@ -93,6 +93,13 @@ CREATE TABLE IF NOT EXISTS procedure_applications (
     created_at TEXT NOT NULL,
     PRIMARY KEY(memory_id, source_session, signal)
 );
+CREATE TABLE IF NOT EXISTS orphan_sessions (
+    client TEXT NOT NULL,
+    external_session_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(client, external_session_id)
+);
 "#;
 
 #[derive(Debug, Clone)]
@@ -361,6 +368,52 @@ impl SessionRepository {
                 })
                 .transpose()?,
         ))
+    }
+
+    pub fn import_exists(&self, client: &str, external_session_id: &str) -> Result<bool> {
+        let connection = self.open()?;
+        Ok(connection
+            .query_row(
+                "SELECT 1 FROM imports WHERE client=?1 AND external_session_id=?2",
+                params![client, external_session_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn record_import(
+        &self,
+        client: &str,
+        external_session_id: &str,
+        status: &str,
+        orphan_payload: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO imports(id, client, external_session_id, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![Uuid::now_v7().to_string(), client, external_session_id, status, Utc::now().to_rfc3339()],
+        )?;
+        if let Some(payload) = orphan_payload {
+            connection.execute(
+                "INSERT OR REPLACE INTO orphan_sessions(client, external_session_id, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![client, external_session_id, payload, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_latest_session_imported(
+        &self,
+        client: &str,
+        external_session_id: &str,
+    ) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "UPDATE sessions SET imported=1 WHERE id=(SELECT id FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1)",
+            params![client, external_session_id],
+        )?;
+        Ok(())
     }
 
     fn open(&self) -> Result<Connection> {

@@ -65,3 +65,16 @@ pub struct NormalizedEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedSession {
+    pub client: String,
+    pub external_session_id: String,
+    pub cwd: Option<String>,
+    pub events: Vec<NormalizedEvent>,
+    pub estimated_bytes: u64,
+}
+
+pub trait SessionImporter {
+    fn discover(&self) -> Result<Vec<NormalizedSession>, String>;
+}

@@ -17,7 +17,8 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use menvane_domain::{
     Applicability, JsonSchema, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryType,
-    NormalizedEvent, Project, ProviderHealth, ReinforcementSignal, Scope,
+    NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProviderHealth,
+    ReinforcementSignal, Scope,
 };
 use menvane_store::{
     IndexStore, JobRecord, MarkdownStore, SearchResult, SessionRepository, mark_forgotten,
@@ -53,6 +54,13 @@ pub struct DoctorCheck {
     pub name: &'static str,
     pub healthy: bool,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportOutcome {
+    Imported,
+    AlreadyImported,
+    Orphan,
 }
 
 impl DoctorReport {
@@ -431,6 +439,54 @@ impl Menvane {
                 .commit(&format!("chore(sessions): archive {archived}"));
         }
         Ok(archived)
+    }
+
+    pub fn import_session(&self, mut session: NormalizedSession) -> Result<ImportOutcome> {
+        if self
+            .sessions
+            .import_exists(&session.client, &session.external_session_id)?
+        {
+            return Ok(ImportOutcome::AlreadyImported);
+        }
+        let Some(cwd) = session.cwd.as_deref() else {
+            self.sessions.record_import(
+                &session.client,
+                &session.external_session_id,
+                "orphan",
+                Some(&serde_json::to_string(&session)?),
+            )?;
+            return Ok(ImportOutcome::Orphan);
+        };
+        if !Path::new(cwd).exists() {
+            session.cwd = None;
+            self.sessions.record_import(
+                &session.client,
+                &session.external_session_id,
+                "orphan",
+                Some(&serde_json::to_string(&session)?),
+            )?;
+            return Ok(ImportOutcome::Orphan);
+        }
+        let mut ended = None;
+        for event in session.events {
+            if event.kind == NormalizedEventKind::SessionEnded {
+                ended = Some(event);
+            } else {
+                self.ingest_event(event)?;
+            }
+        }
+        self.sessions
+            .mark_latest_session_imported(&session.client, &session.external_session_id)?;
+        if let Some(event) = ended {
+            self.ingest_event(event)?;
+        }
+        self.sessions.record_import(
+            &session.client,
+            &session.external_session_id,
+            "imported",
+            None,
+        )?;
+        Ok(ImportOutcome::Imported)
     }
 
     pub fn home(&self) -> &Path {

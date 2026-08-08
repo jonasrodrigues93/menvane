@@ -6,8 +6,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use menvane_integrations::{
-    ClaudeHook, ClaudeInstaller, ClaudePaths, CodexHook, CodexInstaller, CodexPaths, McpServer,
-    OpenCodeHook, OpenCodeInstaller, OpenCodePaths,
+    ClaudeHook, ClaudeInstaller, ClaudePaths, CodexHook, CodexInstaller, CodexPaths, JsonlImporter,
+    McpServer, OpenCodeHook, OpenCodeImporter, OpenCodeInstaller, OpenCodePaths,
 };
 use menvane_server::{
     DEFAULT_ADDRESS, DEFAULT_PORT, daemon_running, home_from_environment, serve, start_daemon,
@@ -34,6 +34,7 @@ enum Command {
     Disconnect(ClientArgs),
     Hook(HookArgs),
     Provider(ProviderArgs),
+    Import(ImportArgs),
     Write(WriteArgs),
     Search(SearchArgs),
     Read(ReadArgs),
@@ -42,6 +43,16 @@ enum Command {
     Doctor,
     Gc,
     Mcp,
+}
+
+#[derive(Args)]
+struct ImportArgs {
+    #[arg(value_enum)]
+    client: Client,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long, default_value = "http://127.0.0.1:4096")]
+    url: String,
 }
 
 #[derive(Args)]
@@ -334,6 +345,42 @@ async fn main() -> Result<()> {
                 );
             }
         },
+        Command::Import(arguments) => {
+            let scan = match arguments.client {
+                Client::Claude => JsonlImporter::claude()
+                    .map_err(anyhow::Error::msg)?
+                    .scan()
+                    .map_err(anyhow::Error::msg)?,
+                Client::Codex => JsonlImporter::codex()
+                    .map_err(anyhow::Error::msg)?
+                    .scan()
+                    .map_err(anyhow::Error::msg)?,
+                Client::Opencode => OpenCodeImporter::new(arguments.url)
+                    .scan()
+                    .await
+                    .map_err(anyhow::Error::msg)?,
+            };
+            if arguments.dry_run {
+                println!("sessions discovered\t{}", scan.sessions.len());
+                println!("invalid\t{}", scan.invalid_records);
+                println!("estimated bytes\t{}", scan.estimated_bytes);
+            } else {
+                let mut imported = 0;
+                let mut existing = 0;
+                let mut orphans = 0;
+                for session in scan.sessions {
+                    match menvane.import_session(session)? {
+                        menvane_engine::ImportOutcome::Imported => imported += 1,
+                        menvane_engine::ImportOutcome::AlreadyImported => existing += 1,
+                        menvane_engine::ImportOutcome::Orphan => orphans += 1,
+                    }
+                }
+                println!("imported\t{imported}");
+                println!("already imported\t{existing}");
+                println!("orphans\t{orphans}");
+                println!("invalid\t{}", scan.invalid_records);
+            }
+        }
         Command::Write(arguments) => {
             let memory = menvane.write(
                 &arguments.cwd,

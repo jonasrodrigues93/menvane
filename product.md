@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 0.9.0
+Version: 0.10.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -129,3 +129,11 @@ Sessions use a 45-day time half-life plus meaningful-access reinforcement with a
 Facts and gotchas never disappear due to age and have a freshness floor of 0.50 with a 180-day half-life. Procedures never disappear due to age and have a 0.65 floor with a 365-day half-life. Decisions have no temporal decay and rank only by lifecycle status. Superseded and historical memories remain inspectable at lower rank.
 
 Menvane records retrieved, injected, explicitly read, successfully applied, and failed application as separate signals. Retrieval and injection do not validate memory. Explicit reads and successful applications are meaningful access; successful procedure application is the strongest positive verification and failed application remains negative evidence. This prevents popularity loops from simple repeated surfacing.
+
+## Historical Import
+
+`menvane import claude` and `menvane import codex` recursively discover supported JSONL session files under configured client homes. Readers stream line by line, enforce a one-megabyte record bound, skip and count malformed records, ignore unknown event types, and retain only useful user and tool evidence. Codex checks both active and archived session directories. `menvane import opencode` uses the configured local OpenCode HTTP API rather than scraping private storage.
+
+All importers produce client-independent normalized sessions and pass them through the session engine; they never create consolidated knowledge directly. External formats are treated as versioned best-effort input. Reimport uses client plus external session identifier and is idempotent.
+
+`--dry-run` reports discovered sessions, invalid records, and estimated bytes without persistence. A session without reliable existing project path is stored as an orphan in operational SQLite and is never guessed into a project. Orphan payload remains available for later administrative association and compilation.
