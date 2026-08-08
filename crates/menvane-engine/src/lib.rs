@@ -1,4 +1,5 @@
 mod project_resolver;
+mod retriever;
 mod technology_detector;
 
 use std::env;
@@ -9,10 +10,11 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use menvane_domain::{Applicability, Memory, MemoryMetadata, MemoryType, Project, Scope};
-use menvane_store::{IndexStore, MarkdownStore, SearchResult, SearchScope, mark_forgotten};
+use menvane_store::{IndexStore, MarkdownStore, SearchResult, mark_forgotten};
 use uuid::Uuid;
 
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
+pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
 pub use technology_detector::TechnologyDetector;
 
 pub struct WriteMemory {
@@ -113,21 +115,46 @@ impl Menvane {
         scope: ScopeSelection,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
+        self.search_with_sessions(cwd, query, scope, limit, false)
+    }
+
+    pub fn search_with_sessions(
+        &self,
+        cwd: &Path,
+        query: &str,
+        scope: ScopeSelection,
+        limit: usize,
+        include_sessions: bool,
+    ) -> Result<Vec<SearchResult>> {
         let project = match scope {
             ScopeSelection::Global => None,
             ScopeSelection::Auto | ScopeSelection::Project => Some(self.ensure_project(cwd)?),
         };
-        let project_id = project.as_ref().map(|project| project.id.as_str());
-        let search_scope = match scope {
-            ScopeSelection::Auto => SearchScope::Auto(
-                project_id.context("automatic search requires a resolved project")?,
-            ),
-            ScopeSelection::Project => SearchScope::Project(
-                project_id.context("project search requires a resolved project")?,
-            ),
-            ScopeSelection::Global => SearchScope::Global,
+        let retrieval_scope = match scope {
+            ScopeSelection::Auto => RetrievalScope::Auto,
+            ScopeSelection::Project => RetrievalScope::Project,
+            ScopeSelection::Global => RetrievalScope::Global,
         };
-        self.index.search(query, search_scope, limit)
+        Retriever::new(&self.index).retrieve(
+            query,
+            project.as_ref(),
+            retrieval_scope,
+            RetrievalMode::Explicit,
+            include_sessions,
+            limit,
+        )
+    }
+
+    pub fn recall(&self, cwd: &Path, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let project = self.ensure_project(cwd)?;
+        Retriever::new(&self.index).retrieve(
+            query,
+            Some(&project),
+            RetrievalScope::Auto,
+            RetrievalMode::Automatic,
+            false,
+            limit,
+        )
     }
 
     pub fn read(&self, id: Uuid) -> Result<Memory> {

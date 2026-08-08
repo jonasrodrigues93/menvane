@@ -13,5 +13,6 @@ anyhow.workspace = true
 clap.workspace = true
 menvane-domain = { path = "../menvane-domain" }
 menvane-engine = { path = "../menvane-engine" }
+menvane-integrations = { path = "../menvane-integrations" }
 serde_yaml.workspace = true
 uuid.workspace = true

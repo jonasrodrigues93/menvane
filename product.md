@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 0.1.0
+Version: 0.2.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -41,3 +41,17 @@ Technology detection is deterministic and inspects known project files and depen
 ## Commands
 
 `menvane write` creates a durable memory. `menvane search` searches current-project and global memory by default. `menvane read` displays a memory. `menvane forget` marks one forgotten. `menvane reindex` reconstructs SQLite from Markdown. `menvane doctor` checks the home, SQLite, FTS5, Git availability, and Markdown/index consistency.
+
+## Retrieval
+
+Retrieval uses SQLite FTS5 and Reciprocal Rank Fusion with `K = 60`. Procedures and decisions receive a 1.15 type multiplier, gotchas 1.10, facts 1.00, and sessions 0.75. Active, candidate, needs-validation, superseded, and historical statuses receive their defined lifecycle multipliers. Sessions are excluded unless explicitly requested.
+
+Automatic recall searches only the current project and global memory. Global universal memories are eligible everywhere. Global contextual memories are eligible only when every populated applicability dimension overlaps the current project's detected technologies. Explicit searches may inspect an otherwise incompatible contextual memory when the query names one of its technologies.
+
+Embedding providers are independent from language-model providers. Embedding storage is derived and reconstructible; retrieval remains fully functional with FTS5 when no embedding provider is configured.
+
+## MCP
+
+`menvane mcp` serves MCP over newline-delimited JSON-RPC on standard input and output. It resolves the active project from its process working directory and exposes exactly `memory_search`, `memory_read`, `memory_write`, and `memory_forget`.
+
+MCP search returns identifiers, type, scope, title, score, status, confidence, applicability, and a short excerpt. Read returns metadata, the full Markdown body, source sessions, and supersession metadata. Forgetting changes status without deleting Markdown. Automatic manual writes conservatively use project scope when no compiler is available.

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use menvane_domain::{Memory, MemoryStatus, Project};
+use menvane_domain::{Applicability, Memory, MemoryStatus, Project};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -46,6 +46,15 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     applicability,
     tokenize = 'unicode61'
 );
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(memory_id, provider, model)
+);
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -63,8 +72,10 @@ pub struct SearchResult {
     pub title: String,
     pub status: String,
     pub confidence: f64,
+    pub applicability: Applicability,
     pub excerpt: String,
     pub score: f64,
+    pub fts_rank: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +126,7 @@ impl IndexStore {
         query: &str,
         scope: SearchScope<'_>,
         limit: usize,
+        include_sessions: bool,
     ) -> Result<Vec<SearchResult>> {
         let fts_query = fts_query(query);
         if fts_query.is_empty() {
@@ -129,16 +141,21 @@ impl IndexStore {
             SearchScope::Global => ("m.scope = 'global'", ""),
         };
         let sql = format!(
-            "SELECT m.id, m.type, m.scope, m.title, m.status, m.confidence, snippet(memory_fts, 2, '', '', ' … ', 24), -bm25(memory_fts) AS score
+            "SELECT m.id, m.type, m.scope, m.title, m.status, m.confidence, m.applicability_json, snippet(memory_fts, 2, '', '', ' … ', 24), -bm25(memory_fts) AS score
              FROM memory_fts
              JOIN memories m ON m.id = memory_fts.id
-             WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten'
+             WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten' AND (?4 OR m.type != 'session')
              ORDER BY score DESC
              LIMIT ?3"
         );
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
-            params![fts_query, project_id, i64::try_from(limit)?],
+            params![
+                fts_query,
+                project_id,
+                i64::try_from(limit)?,
+                include_sessions
+            ],
             |row| {
                 let id: String = row.get(0)?;
                 Ok(SearchResult {
@@ -154,12 +171,29 @@ impl IndexStore {
                     title: row.get(3)?,
                     status: row.get(4)?,
                     confidence: row.get(5)?,
-                    excerpt: row.get(6)?,
-                    score: row.get(7)?,
+                    applicability: serde_json::from_str(&row.get::<_, String>(6)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    excerpt: row.get(7)?,
+                    score: row.get(8)?,
+                    fts_rank: 0,
                 })
             },
         )?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        rows.enumerate()
+            .map(|(index, row)| {
+                let mut result = row?;
+                result.fts_rank = index + 1;
+                Ok(result)
+            })
+            .collect::<Result<Vec<_>, rusqlite::Error>>()
+            .map_err(Into::into)
     }
 
     pub fn memory_count(&self) -> Result<u64> {
@@ -353,7 +387,7 @@ mod tests {
         index.upsert_memory(&memory, &path).unwrap();
         assert_eq!(
             index
-                .search("durable", SearchScope::Global, 10)
+                .search("durable", SearchScope::Global, 10, false)
                 .unwrap()
                 .len(),
             1
@@ -363,7 +397,7 @@ mod tests {
         index.upsert_memory(&memory, &path).unwrap();
         assert!(
             index
-                .search("durable", SearchScope::Global, 10)
+                .search("durable", SearchScope::Global, 10, false)
                 .unwrap()
                 .is_empty()
         );

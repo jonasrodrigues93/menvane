@@ -432,6 +432,7 @@ dependencies = [
  "clap",
  "menvane-domain",
  "menvane-engine",
+ "menvane-integrations",
  "serde_yaml",
  "uuid",
 ]
@@ -466,6 +467,15 @@ dependencies = [
 [[package]]
 name = "menvane-integrations"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "menvane-domain",
+ "menvane-engine",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
 
 [[package]]
 name = "menvane-server"

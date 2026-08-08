@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
+use menvane_integrations::McpServer;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -25,6 +26,7 @@ enum Command {
     Forget(ForgetArgs),
     Reindex,
     Doctor,
+    Mcp,
 }
 
 #[derive(Args)]
@@ -181,6 +183,12 @@ fn main() -> Result<()> {
             if !report.healthy() {
                 bail!("one or more doctor checks failed");
             }
+        }
+        Command::Mcp => {
+            let cwd = std::env::current_dir()?;
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            McpServer::new(&menvane, cwd).serve(stdin.lock(), stdout.lock())?;
         }
     }
     Ok(())
