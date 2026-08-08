@@ -90,6 +90,7 @@ impl IndexStore {
 
     pub fn initialize(&self) -> Result<()> {
         let connection = self.open()?;
+        connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         connection.execute_batch(SCHEMA)?;
         Ok(())
     }
@@ -263,18 +264,14 @@ impl IndexStore {
     }
 
     fn open_initialized(&self) -> Result<Connection> {
-        let connection = self.open()?;
-        connection.execute_batch(SCHEMA)?;
-        Ok(connection)
+        self.open()
     }
 }
 
 fn configure_connection(connection: &Connection, wal: bool) -> Result<()> {
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-    if wal {
-        connection.execute_batch("PRAGMA journal_mode = WAL;")?;
-    } else {
+    if !wal {
         connection.execute_batch("PRAGMA journal_mode = DELETE;")?;
     }
     Ok(())

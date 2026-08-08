@@ -1,5 +1,7 @@
 mod project_resolver;
 mod retriever;
+mod sanitizer;
+mod session_engine;
 mod technology_detector;
 
 use std::env;
@@ -9,12 +11,19 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use menvane_domain::{Applicability, Memory, MemoryMetadata, MemoryType, Project, Scope};
-use menvane_store::{IndexStore, MarkdownStore, SearchResult, mark_forgotten};
+use menvane_domain::{
+    Applicability, Memory, MemoryMetadata, MemoryType, NormalizedEvent, Project, Scope,
+};
+use menvane_store::{
+    IndexStore, JobRecord, MarkdownStore, SearchResult, SessionRepository, mark_forgotten,
+};
+use serde::Deserialize;
 use uuid::Uuid;
 
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
 pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
+pub use sanitizer::{CaptureSanitizer, CaptureSanitizerConfig};
+pub use session_engine::{CaptureOutcome, SessionEngine};
 pub use technology_detector::TechnologyDetector;
 
 pub struct WriteMemory {
@@ -47,6 +56,34 @@ pub struct Menvane {
     home: PathBuf,
     markdown: MarkdownStore,
     index: IndexStore,
+    sessions: SessionRepository,
+    config: MenvaneConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MenvaneConfig {
+    #[serde(default)]
+    capture: CaptureSanitizerConfig,
+    #[serde(default)]
+    sessions: SessionConfiguration,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SessionConfiguration {
+    #[serde(default = "default_idle_finalize_seconds")]
+    idle_finalize_seconds: u64,
+}
+
+impl Default for SessionConfiguration {
+    fn default() -> Self {
+        Self {
+            idle_finalize_seconds: default_idle_finalize_seconds(),
+        }
+    }
+}
+
+fn default_idle_finalize_seconds() -> u64 {
+    120
 }
 
 impl Menvane {
@@ -65,12 +102,17 @@ impl Menvane {
         let home = home.into();
         let markdown = MarkdownStore::new(&home);
         markdown.initialize()?;
+        let config: MenvaneConfig = toml::from_str(&fs::read_to_string(home.join("config.toml"))?)?;
         let index = IndexStore::new(home.join("index.sqlite"));
         index.initialize()?;
+        let sessions = SessionRepository::new(home.join("index.sqlite"));
+        sessions.initialize()?;
         Ok(Self {
             home,
             markdown,
             index,
+            sessions,
+            config,
         })
     }
 
@@ -171,7 +213,29 @@ impl Menvane {
     }
 
     pub fn reindex(&self) -> Result<(usize, usize)> {
-        self.index.reindex(&self.markdown)
+        let result = self.index.reindex(&self.markdown)?;
+        self.sessions.initialize()?;
+        Ok(result)
+    }
+
+    pub fn ingest_event(&self, event: NormalizedEvent) -> Result<CaptureOutcome> {
+        let sanitizer = CaptureSanitizer::new(self.config.capture.clone())?;
+        let Some(event) = sanitizer.sanitize(event) else {
+            return Ok(CaptureOutcome::Dropped);
+        };
+        SessionEngine::new(self).ingest(event)
+    }
+
+    pub fn finalize_idle_sessions(&self) -> Result<usize> {
+        SessionEngine::new(self).finalize_idle(self.config.sessions.idle_finalize_seconds)
+    }
+
+    pub fn jobs(&self) -> Result<Vec<JobRecord>> {
+        self.sessions.jobs()
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
     }
 
     pub fn doctor(&self) -> DoctorReport {

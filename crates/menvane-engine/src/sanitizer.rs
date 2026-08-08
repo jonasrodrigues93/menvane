@@ -1,0 +1,177 @@
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use menvane_domain::NormalizedEvent;
+use regex::Regex;
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaptureSanitizerConfig {
+    #[serde(default = "default_prompt_bytes")]
+    pub max_prompt_bytes: usize,
+    #[serde(default = "default_tool_output_bytes")]
+    pub max_tool_output_bytes: usize,
+    #[serde(default = "default_tool_input_bytes")]
+    pub max_tool_input_bytes: usize,
+    #[serde(default = "default_ignore_paths")]
+    pub ignore_paths: Vec<String>,
+}
+
+impl Default for CaptureSanitizerConfig {
+    fn default() -> Self {
+        Self {
+            max_prompt_bytes: default_prompt_bytes(),
+            max_tool_output_bytes: default_tool_output_bytes(),
+            max_tool_input_bytes: default_tool_input_bytes(),
+            ignore_paths: default_ignore_paths(),
+        }
+    }
+}
+
+pub struct CaptureSanitizer {
+    config: CaptureSanitizerConfig,
+    ignored_paths: GlobSet,
+    authentication_header: Regex,
+    likely_secret: Regex,
+    secret_assignment: Regex,
+}
+
+impl CaptureSanitizer {
+    pub fn new(config: CaptureSanitizerConfig) -> anyhow::Result<Self> {
+        let mut builder = GlobSetBuilder::new();
+        for pattern in &config.ignore_paths {
+            builder.add(Glob::new(pattern)?);
+        }
+        Ok(Self {
+            config,
+            ignored_paths: builder.build()?,
+            authentication_header: Regex::new(
+                r"(?im)^(authorization|proxy-authorization)\s*:\s*.*$",
+            )?,
+            likely_secret: Regex::new(
+                r"(?i)\b(sk-[a-z0-9_-]{16,}|gh[pousr]_[a-z0-9]{20,}|xox[baprs]-[a-z0-9-]{16,}|eyJ[a-z0-9_-]{10,}\.[a-z0-9_-]{10,}\.[a-z0-9_-]{10,})\b",
+            )?,
+            secret_assignment: Regex::new(
+                r#"(?i)\b(api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*["']?[^\s,"']+"#,
+            )?,
+        })
+    }
+
+    pub fn sanitize(&self, mut event: NormalizedEvent) -> Option<NormalizedEvent> {
+        if event
+            .attributed_path
+            .as_deref()
+            .is_some_and(|path| self.path_is_ignored(path))
+        {
+            return None;
+        }
+        let prompt_limit = self.config.max_prompt_bytes;
+        let input_limit = self.config.max_tool_input_bytes;
+        let output_limit = self.config.max_tool_output_bytes;
+        event.bounded_input = event.bounded_input.map(|value| {
+            let limit = if event.tool_family.is_some() {
+                input_limit
+            } else {
+                prompt_limit
+            };
+            self.clean(&value, limit)
+        });
+        event.bounded_output = event
+            .bounded_output
+            .map(|value| self.clean(&value, output_limit));
+        Some(event)
+    }
+
+    fn path_is_ignored(&self, path: &str) -> bool {
+        let normalized = path.replace('\\', "/");
+        self.ignored_paths.is_match(&normalized)
+            || std::path::Path::new(&normalized)
+                .file_name()
+                .is_some_and(|name| self.ignored_paths.is_match(name))
+            || normalized
+                .split_once('/')
+                .is_some_and(|(_, relative)| self.ignored_paths.is_match(relative))
+    }
+
+    fn clean(&self, value: &str, limit: usize) -> String {
+        let value = self
+            .authentication_header
+            .replace_all(value, "$1: [REDACTED]");
+        let value = self.likely_secret.replace_all(&value, "[REDACTED]");
+        let value = self.secret_assignment.replace_all(&value, "$1=[REDACTED]");
+        truncate_utf8(&value, limit)
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}\n[TRUNCATED]", &value[..boundary])
+}
+
+fn default_prompt_bytes() -> usize {
+    16_384
+}
+
+fn default_tool_output_bytes() -> usize {
+    4_096
+}
+
+fn default_tool_input_bytes() -> usize {
+    4_096
+}
+
+fn default_ignore_paths() -> Vec<String> {
+    vec![
+        ".env".to_owned(),
+        ".env.*".to_owned(),
+        "**/secrets/**".to_owned(),
+        "**/.ssh/**".to_owned(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use menvane_domain::{NormalizedEvent, NormalizedEventKind};
+
+    use super::*;
+
+    #[test]
+    fn drops_ignored_paths_and_redacts_secrets() {
+        let sanitizer = CaptureSanitizer::new(CaptureSanitizerConfig::default()).unwrap();
+        let mut ignored = event();
+        ignored.attributed_path = Some("project/secrets/token.txt".to_owned());
+        assert!(sanitizer.sanitize(ignored).is_none());
+        let mut retained = event();
+        retained.bounded_output = Some(
+            "Authorization: Bearer secret\napi_key=very-secret\nsk-12345678901234567890".to_owned(),
+        );
+        let cleaned = sanitizer.sanitize(retained).unwrap();
+        let output = cleaned.bounded_output.unwrap();
+        assert!(!output.contains("very-secret"));
+        assert!(!output.contains("12345678901234567890"));
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    fn event() -> NormalizedEvent {
+        NormalizedEvent {
+            event_id: "event-1".to_owned(),
+            kind: NormalizedEventKind::ToolCompleted,
+            client: "test".to_owned(),
+            external_session_id: "session-1".to_owned(),
+            timestamp: Utc::now(),
+            cwd: "/tmp/project".to_owned(),
+            project_id: None,
+            tool_family: Some("shell".to_owned()),
+            bounded_input: None,
+            bounded_output: None,
+            attributed_path: None,
+            success: Some(true),
+            model: None,
+        }
+    }
+}

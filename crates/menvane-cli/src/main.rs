@@ -5,6 +5,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use menvane_integrations::McpServer;
+use menvane_server::{
+    DEFAULT_ADDRESS, DEFAULT_PORT, daemon_running, home_from_environment, serve, start_daemon,
+    stop_daemon,
+};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -20,6 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Serve(ServeArgs),
+    Daemon(DaemonArgs),
     Write(WriteArgs),
     Search(SearchArgs),
     Read(ReadArgs),
@@ -27,6 +33,28 @@ enum Command {
     Reindex,
     Doctor,
     Mcp,
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    #[arg(long, default_value = DEFAULT_ADDRESS)]
+    address: String,
+    #[arg(long, default_value_t = DEFAULT_PORT)]
+    port: u16,
+}
+
+#[derive(Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    Start,
+    Stop,
+    Restart,
+    Status,
 }
 
 #[derive(Args)]
@@ -101,10 +129,42 @@ enum SearchScopeArg {
     Global,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let menvane = Menvane::from_environment()?;
     match cli.command {
+        Command::Serve(arguments) => {
+            serve(menvane, &arguments.address, arguments.port).await?;
+        }
+        Command::Daemon(arguments) => {
+            let home = home_from_environment()?;
+            match arguments.command {
+                DaemonCommand::Start => {
+                    let pid = start_daemon(&home, &std::env::current_exe()?)?;
+                    println!("started daemon process {pid}");
+                }
+                DaemonCommand::Stop => {
+                    stop_daemon(&home)?;
+                    println!("stopped daemon");
+                }
+                DaemonCommand::Restart => {
+                    if daemon_running(&home) {
+                        stop_daemon(&home)?;
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    let pid = start_daemon(&home, &std::env::current_exe()?)?;
+                    println!("restarted daemon process {pid}");
+                }
+                DaemonCommand::Status => {
+                    if daemon_running(&home) {
+                        println!("running");
+                    } else {
+                        bail!("daemon is not running");
+                    }
+                }
+            }
+        }
         Command::Write(arguments) => {
             let memory = menvane.write(
                 &arguments.cwd,

@@ -155,6 +155,18 @@ pub struct MemoryMetadata {
     pub successes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failures: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
 }
 
 impl Applicability {
@@ -198,6 +210,12 @@ impl MemoryMetadata {
             supersedes: Vec::new(),
             successes: procedure.then_some(1),
             failures: procedure.then_some(0),
+            client: None,
+            external_session_id: None,
+            started_at: None,
+            ended_at: None,
+            imported: None,
+            generation: None,
         }
     }
 }

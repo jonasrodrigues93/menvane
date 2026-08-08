@@ -1,0 +1,457 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use menvane_domain::{NormalizedEvent, NormalizedEventKind, SessionState};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use uuid::Uuid;
+
+const SESSION_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    client TEXT NOT NULL,
+    external_session_id TEXT NOT NULL,
+    project_id TEXT,
+    generation INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    last_event_at TEXT NOT NULL,
+    markdown_path TEXT,
+    imported INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(client, external_session_id, generation)
+);
+CREATE INDEX IF NOT EXISTS sessions_external ON sessions(client, external_session_id, generation DESC);
+CREATE INDEX IF NOT EXISTS sessions_state_event ON sessions(state, last_event_at);
+CREATE TABLE IF NOT EXISTS session_events (
+    event_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+CREATE INDEX IF NOT EXISTS session_events_session ON session_events(session_id, timestamp, event_id);
+CREATE TABLE IF NOT EXISTS observations (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    event_id TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    job_type TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT NOT NULL,
+    last_error TEXT,
+    provider TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(job_type, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status, next_retry_at);
+CREATE TABLE IF NOT EXISTS imports (
+    id TEXT PRIMARY KEY,
+    client TEXT NOT NULL,
+    external_session_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(client, external_session_id)
+);
+CREATE TABLE IF NOT EXISTS access_events (
+    id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS integration_state (
+    client TEXT PRIMARY KEY,
+    connected INTEGER NOT NULL,
+    mcp_registered INTEGER NOT NULL,
+    hook_status TEXT NOT NULL,
+    last_event_at TEXT,
+    details_json TEXT NOT NULL
+);
+"#;
+
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub id: Uuid,
+    pub client: String,
+    pub external_session_id: String,
+    pub project_id: Option<String>,
+    pub generation: u32,
+    pub state: SessionState,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub last_event_at: DateTime<Utc>,
+    pub markdown_path: Option<PathBuf>,
+    pub imported: bool,
+}
+
+pub struct IngestResult {
+    pub session: SessionRecord,
+    pub inserted: bool,
+    pub should_finalize: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobRecord {
+    pub id: Uuid,
+    pub job_type: String,
+    pub status: String,
+    pub attempt_count: u32,
+    pub next_retry_at: DateTime<Utc>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRepository {
+    path: PathBuf,
+}
+
+impl SessionRepository {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn initialize(&self) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+        connection.execute_batch(SESSION_SCHEMA)?;
+        Ok(())
+    }
+
+    pub fn ingest(
+        &self,
+        event: &NormalizedEvent,
+        project_id: Option<&str>,
+    ) -> Result<IngestResult> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if event_exists(&transaction, &event.event_id)? {
+            let session = latest_session(&transaction, &event.client, &event.external_session_id)?
+                .context("duplicate event refers to a missing session")?;
+            transaction.commit()?;
+            return Ok(IngestResult {
+                session,
+                inserted: false,
+                should_finalize: false,
+            });
+        }
+        let previous = latest_session(&transaction, &event.client, &event.external_session_id)?;
+        let session = match previous {
+            Some(previous) if previous.state != SessionState::Finalized => previous,
+            Some(previous) => create_session(
+                &transaction,
+                event,
+                project_id.or(previous.project_id.as_deref()),
+                previous.generation + 1,
+            )?,
+            None => create_session(&transaction, event, project_id, 1)?,
+        };
+        transaction.execute(
+            "INSERT INTO session_events(event_id, session_id, kind, timestamp, payload_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.event_id,
+                session.id.to_string(),
+                event_kind(event.kind),
+                event.timestamp.to_rfc3339(),
+                serde_json::to_string(event)?,
+            ],
+        )?;
+        if let Some(content) = observation_content(event) {
+            transaction.execute(
+                "INSERT INTO observations(id, session_id, event_id, kind, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    Uuid::now_v7().to_string(),
+                    session.id.to_string(),
+                    event.event_id,
+                    event_kind(event.kind),
+                    content,
+                    event.timestamp.to_rfc3339(),
+                ],
+            )?;
+        }
+        let state = state_after_event(session.state, event.kind);
+        let ended_at = (state == SessionState::Finalized).then(|| event.timestamp.to_rfc3339());
+        transaction.execute(
+            "UPDATE sessions SET state=?1, last_event_at=?2, ended_at=COALESCE(?3, ended_at), project_id=COALESCE(project_id, ?4) WHERE id=?5",
+            params![
+                session_state(state),
+                event.timestamp.to_rfc3339(),
+                ended_at,
+                project_id,
+                session.id.to_string()
+            ],
+        )?;
+        if state == SessionState::Finalized {
+            enqueue_job(&transaction, "finalize_session", &session.id.to_string())?;
+        }
+        let session = session_by_id(&transaction, session.id)?;
+        transaction.commit()?;
+        Ok(IngestResult {
+            session,
+            inserted: true,
+            should_finalize: state == SessionState::Finalized,
+        })
+    }
+
+    pub fn events(&self, session_id: Uuid) -> Result<Vec<NormalizedEvent>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT payload_json FROM session_events WHERE session_id=?1 ORDER BY timestamp, event_id",
+        )?;
+        let rows = statement.query_map([session_id.to_string()], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn finalize_idle_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<SessionRecord>> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM sessions WHERE state='idle' AND last_event_at <= ?1 ORDER BY last_event_at",
+            )?;
+            statement
+                .query_map([cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut sessions = Vec::new();
+        for id in ids {
+            transaction.execute(
+                "UPDATE sessions SET state='finalized', ended_at=last_event_at WHERE id=?1 AND state='idle'",
+                [&id],
+            )?;
+            enqueue_job(&transaction, "finalize_session", &id)?;
+            sessions.push(session_by_id(&transaction, Uuid::parse_str(&id)?)?);
+        }
+        transaction.commit()?;
+        Ok(sessions)
+    }
+
+    pub fn mark_finalized(&self, session_id: Uuid, markdown_path: &Path) -> Result<()> {
+        let connection = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "UPDATE sessions SET markdown_path=?1 WHERE id=?2",
+            params![markdown_path.to_string_lossy(), session_id.to_string()],
+        )?;
+        connection.execute(
+            "UPDATE jobs SET status='completed', updated_at=?1 WHERE job_type='finalize_session' AND dedupe_key=?2",
+            params![now, session_id.to_string()],
+        )?;
+        enqueue_job_connection(&connection, "compile_session", &session_id.to_string())?;
+        Ok(())
+    }
+
+    pub fn jobs(&self) -> Result<Vec<JobRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT id, job_type, status, attempt_count, next_retry_at, last_error FROM jobs ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let next_retry_at: String = row.get(4)?;
+            Ok((
+                id,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                next_retry_at,
+                row.get(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, job_type, status, attempt_count, next_retry_at, last_error) = row?;
+            Ok(JobRecord {
+                id: Uuid::parse_str(&id)?,
+                job_type,
+                status,
+                attempt_count,
+                next_retry_at: DateTime::parse_from_rfc3339(&next_retry_at)?.with_timezone(&Utc),
+                last_error,
+            })
+        })
+        .collect()
+    }
+
+    fn open(&self) -> Result<Connection> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(&self.path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+        Ok(connection)
+    }
+}
+
+fn create_session(
+    transaction: &Transaction<'_>,
+    event: &NormalizedEvent,
+    project_id: Option<&str>,
+    generation: u32,
+) -> Result<SessionRecord> {
+    let id = Uuid::now_v7();
+    transaction.execute(
+        "INSERT INTO sessions(id, client, external_session_id, project_id, generation, state, started_at, last_event_at, imported) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6, 0)",
+        params![
+            id.to_string(),
+            event.client,
+            event.external_session_id,
+            project_id,
+            generation,
+            event.timestamp.to_rfc3339()
+        ],
+    )?;
+    session_by_id(transaction, id)
+}
+
+fn latest_session(
+    transaction: &Transaction<'_>,
+    client: &str,
+    external_session_id: &str,
+) -> Result<Option<SessionRecord>> {
+    transaction
+        .query_row(
+            "SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1",
+            params![client, external_session_id],
+            session_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn session_by_id(connection: &Connection, id: Uuid) -> Result<SessionRecord> {
+    connection
+        .query_row(
+            "SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported FROM sessions WHERE id=?1",
+            [id.to_string()],
+            session_from_row,
+        )
+        .map_err(Into::into)
+}
+
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    let id: String = row.get(0)?;
+    let state: String = row.get(5)?;
+    let started_at: String = row.get(6)?;
+    let ended_at: Option<String> = row.get(7)?;
+    let last_event_at: String = row.get(8)?;
+    Ok(SessionRecord {
+        id: Uuid::parse_str(&id).map_err(sql_conversion_error)?,
+        client: row.get(1)?,
+        external_session_id: row.get(2)?,
+        project_id: row.get(3)?,
+        generation: row.get(4)?,
+        state: parse_session_state(&state).map_err(sql_conversion_error)?,
+        started_at: parse_timestamp(&started_at).map_err(sql_conversion_error)?,
+        ended_at: ended_at
+            .map(|value| parse_timestamp(&value))
+            .transpose()
+            .map_err(sql_conversion_error)?,
+        last_event_at: parse_timestamp(&last_event_at).map_err(sql_conversion_error)?,
+        markdown_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
+        imported: row.get(10)?,
+    })
+}
+
+fn event_exists(transaction: &Transaction<'_>, event_id: &str) -> Result<bool> {
+    Ok(transaction
+        .query_row(
+            "SELECT 1 FROM session_events WHERE event_id=?1",
+            [event_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn enqueue_job(transaction: &Transaction<'_>, job_type: &str, dedupe_key: &str) -> Result<()> {
+    enqueue_job_connection(transaction, job_type, dedupe_key)
+}
+
+fn enqueue_job_connection(connection: &Connection, job_type: &str, dedupe_key: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT OR IGNORE INTO jobs(id, job_type, dedupe_key, status, payload_json, next_retry_at, created_at, updated_at) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?5, ?5)",
+        params![
+            Uuid::now_v7().to_string(),
+            job_type,
+            dedupe_key,
+            serde_json::json!({ "id": dedupe_key }).to_string(),
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn observation_content(event: &NormalizedEvent) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(input) = &event.bounded_input {
+        parts.push(input.as_str());
+    }
+    if let Some(output) = &event.bounded_output {
+        parts.push(output.as_str());
+    }
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn state_after_event(current: SessionState, event: NormalizedEventKind) -> SessionState {
+    match event {
+        NormalizedEventKind::SessionEnded => SessionState::Finalized,
+        NormalizedEventKind::TurnStopped => SessionState::Idle,
+        _ => match current {
+            SessionState::Idle => SessionState::Open,
+            state => state,
+        },
+    }
+}
+
+fn event_kind(kind: NormalizedEventKind) -> &'static str {
+    match kind {
+        NormalizedEventKind::SessionStarted => "session-started",
+        NormalizedEventKind::UserPrompt => "user-prompt",
+        NormalizedEventKind::ToolCompleted => "tool-completed",
+        NormalizedEventKind::ContextCompacted => "context-compacted",
+        NormalizedEventKind::TurnStopped => "turn-stopped",
+        NormalizedEventKind::SessionEnded => "session-ended",
+    }
+}
+
+fn session_state(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Open => "open",
+        SessionState::Idle => "idle",
+        SessionState::Finalized => "finalized",
+    }
+}
+
+fn parse_session_state(value: &str) -> std::io::Result<SessionState> {
+    match value {
+        "open" => Ok(SessionState::Open),
+        "idle" => Ok(SessionState::Idle),
+        "finalized" => Ok(SessionState::Finalized),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid session state: {value}"),
+        )),
+    }
+}
+
+fn parse_timestamp(value: &str) -> std::result::Result<DateTime<Utc>, chrono::ParseError> {
+    DateTime::parse_from_rfc3339(value).map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn sql_conversion_error(error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+}
