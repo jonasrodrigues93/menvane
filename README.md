@@ -21,6 +21,17 @@ menvane connect codex
 menvane connect opencode
 ```
 
+Configure direct OpenAI inference before starting the daemon:
+
+```bash
+export OPENAI_API_KEY="..."
+menvane provider configure openai --model gpt-5.4
+menvane daemon restart
+menvane provider status
+```
+
+Persist `OPENAI_API_KEY` through your shell or secret manager. Menvane stores only the environment variable name, never the key value.
+
 The local UI is available at `http://127.0.0.1:47831/`. Integrations capture and recall automatically; no Skill, repository instruction file, or explicit memory prompt is required.
 
 ## Durable Recovery

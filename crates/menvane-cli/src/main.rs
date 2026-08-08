@@ -79,6 +79,24 @@ struct ProviderArgs {
 enum ProviderCommand {
     Status,
     Test,
+    Configure(ProviderConfigureArgs),
+}
+
+#[derive(Args)]
+struct ProviderConfigureArgs {
+    #[arg(value_enum)]
+    provider: ConfigurableProvider,
+    #[arg(long)]
+    model: String,
+    #[arg(long, default_value = "https://api.openai.com/v1")]
+    base_url: String,
+    #[arg(long, default_value = "OPENAI_API_KEY")]
+    api_key_env: String,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ConfigurableProvider {
+    Openai,
 }
 
 #[derive(Args)]
@@ -382,6 +400,19 @@ async fn main() -> Result<()> {
                     serde_json::to_string_pretty(&menvane.provider_test().await?)?
                 );
             }
+            ProviderCommand::Configure(configuration) => match configuration.provider {
+                ConfigurableProvider::Openai => {
+                    menvane.configure_openai(
+                        &configuration.model,
+                        &configuration.base_url,
+                        &configuration.api_key_env,
+                    )?;
+                    println!(
+                        "configured OpenAI model {}; restart the daemon to apply",
+                        configuration.model
+                    );
+                }
+            },
         },
         Command::Import(arguments) => {
             let scan = match arguments.client {

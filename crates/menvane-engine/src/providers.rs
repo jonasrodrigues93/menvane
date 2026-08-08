@@ -156,6 +156,51 @@ pub struct OpenRouterProvider {
     api_key_env: String,
 }
 
+pub struct OpenAIProvider {
+    compatible: OpenRouterProvider,
+}
+
+impl OpenAIProvider {
+    pub fn new(
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        api_key_env: impl Into<String>,
+    ) -> Self {
+        Self {
+            compatible: OpenRouterProvider::new(model, base_url, api_key_env),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAIProvider {
+    async fn generate_structured(
+        &self,
+        request: LlmRequest,
+        schema: JsonSchema,
+    ) -> Result<StructuredResponse, LlmError> {
+        let mut response = self.compatible.generate_structured(request, schema).await?;
+        response.provider = "openai".to_owned();
+        Ok(response)
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        self.compatible.health().await
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.compatible.capabilities()
+    }
+
+    fn name(&self) -> &'static str {
+        "openai"
+    }
+
+    fn model(&self) -> &str {
+        self.compatible.model()
+    }
+}
+
 impl OpenRouterProvider {
     pub fn new(
         model: impl Into<String>,
@@ -607,6 +652,62 @@ exit 1
                 .unwrap_err()
                 .kind,
             LlmErrorKind::Network
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_uses_its_own_api_key_and_reports_provider_identity() {
+        let key_name = "MENVANE_TEST_OPENAI_KEY";
+        unsafe { std::env::set_var(key_name, "openai-test-key") };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/chat/completions",
+            post(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    != Some("Bearer openai-test-key")
+                {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        axum::Json(json!({ "error": "missing key" })),
+                    );
+                }
+                (
+                    StatusCode::OK,
+                    axum::Json(
+                        json!({ "choices": [{ "message": { "content": "{\"ok\":true}" } }] }),
+                    ),
+                )
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let provider = OpenAIProvider::new("test-model", format!("http://{address}"), key_name);
+        let response = provider
+            .generate_structured(request(), schema())
+            .await
+            .unwrap();
+        assert_eq!(response.provider, "openai");
+        assert_eq!(response.model, "test-model");
+        assert_eq!(response.value, json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn openai_requires_configured_api_key_environment_variable() {
+        let provider = OpenAIProvider::new(
+            "test-model",
+            "https://api.openai.com/v1",
+            "MENVANE_UNSET_OPENAI_KEY",
+        );
+        assert_eq!(provider.health().await, ProviderHealth::MissingApiKey);
+        assert_eq!(
+            provider
+                .generate_structured(request(), schema())
+                .await
+                .unwrap_err()
+                .kind,
+            LlmErrorKind::Authentication
         );
     }
 

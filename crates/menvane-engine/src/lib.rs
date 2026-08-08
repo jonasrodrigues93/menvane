@@ -32,7 +32,7 @@ pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCo
 pub use decay::DecayEngine;
 pub use global_promoter::GlobalPromoter;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
-pub use providers::{CodexProvider, OpenRouterProvider, ProviderChain};
+pub use providers::{CodexProvider, OpenAIProvider, OpenRouterProvider, ProviderChain};
 pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
 pub use sanitizer::{CaptureSanitizer, CaptureSanitizerConfig};
 pub use session_engine::{CaptureOutcome, SessionEngine};
@@ -116,19 +116,19 @@ impl Default for LlmConfiguration {
 }
 
 fn default_llm_provider() -> String {
-    "codex".to_owned()
+    "openai".to_owned()
 }
 
 fn default_llm_model() -> String {
-    "default".to_owned()
+    "gpt-5.4".to_owned()
 }
 
 fn default_openrouter_url() -> String {
-    "https://openrouter.ai/api/v1".to_owned()
+    "https://api.openai.com/v1".to_owned()
 }
 
 fn default_openrouter_key_env() -> String {
-    "OPENROUTER_API_KEY".to_owned()
+    "OPENAI_API_KEY".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -542,6 +542,46 @@ impl Menvane {
         fs::rename(temporary, path)?;
         std::fs::File::open(&self.home)?.sync_all()?;
         Ok(())
+    }
+
+    pub fn configure_openai(&self, model: &str, base_url: &str, api_key_env: &str) -> Result<()> {
+        if model.trim().is_empty() {
+            bail!("OpenAI model cannot be empty");
+        }
+        if !base_url.starts_with("https://") && !base_url.starts_with("http://127.0.0.1") {
+            bail!("OpenAI base URL must use HTTPS or localhost HTTP");
+        }
+        if api_key_env.trim().is_empty()
+            || !api_key_env
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            bail!("API key environment variable name is invalid");
+        }
+        let mut configuration: toml::Table =
+            toml::from_str(&fs::read_to_string(self.home.join("config.toml"))?)?;
+        let llm = configuration
+            .entry("llm")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("llm configuration must be a table")?;
+        llm.insert(
+            "provider".to_owned(),
+            toml::Value::String("openai".to_owned()),
+        );
+        llm.insert(
+            "model".to_owned(),
+            toml::Value::String(model.trim().to_owned()),
+        );
+        llm.insert(
+            "base_url".to_owned(),
+            toml::Value::String(base_url.trim_end_matches('/').to_owned()),
+        );
+        llm.insert(
+            "api_key_env".to_owned(),
+            toml::Value::String(api_key_env.to_owned()),
+        );
+        self.update_configuration_text(&toml::to_string_pretty(&configuration)?)
     }
 
     pub fn integrations(&self) -> Result<Vec<IntegrationRecord>> {
@@ -1073,14 +1113,29 @@ fn provider_from_configuration(
             "codex",
             &configuration.model,
         ))),
+        "openai" => Ok(std::sync::Arc::new(OpenAIProvider::new(
+            &configuration.model,
+            &configuration.base_url,
+            &configuration.api_key_env,
+        ))),
         "openrouter" => {
             if configuration.model == "default" || configuration.model.trim().is_empty() {
                 bail!("OpenRouter requires an explicit model");
             }
+            let base_url = if configuration.base_url == "https://api.openai.com/v1" {
+                "https://openrouter.ai/api/v1"
+            } else {
+                &configuration.base_url
+            };
+            let api_key_env = if configuration.api_key_env == "OPENAI_API_KEY" {
+                "OPENROUTER_API_KEY"
+            } else {
+                &configuration.api_key_env
+            };
             Ok(std::sync::Arc::new(OpenRouterProvider::new(
                 &configuration.model,
-                &configuration.base_url,
-                &configuration.api_key_env,
+                base_url,
+                api_key_env,
             )))
         }
         provider => bail!("unsupported LLM provider: {provider}"),
