@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use menvane_domain::{NormalizedEvent, NormalizedEventKind, SessionState};
+use menvane_domain::{NormalizedEvent, NormalizedEventKind, ReinforcementSignal, SessionState};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
@@ -330,6 +330,37 @@ impl SessionRepository {
                 Utc::now().to_rfc3339()
             ],
         )? == 1)
+    }
+
+    pub fn record_access(&self, memory_id: Uuid, signal: ReinforcementSignal) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "INSERT INTO access_events(id, memory_id, signal, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                Uuid::now_v7().to_string(),
+                memory_id.to_string(),
+                signal.as_str(),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn meaningful_access(&self, memory_id: Uuid) -> Result<(u64, Option<DateTime<Utc>>)> {
+        let connection = self.open()?;
+        let (count, latest): (u64, Option<String>) = connection.query_row(
+            "SELECT COUNT(*), MAX(created_at) FROM access_events WHERE memory_id=?1 AND signal IN ('explicitly_read', 'successfully_applied')",
+            [memory_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((
+            count,
+            latest
+                .map(|value| {
+                    DateTime::parse_from_rfc3339(&value).map(|value| value.with_timezone(&Utc))
+                })
+                .transpose()?,
+        ))
     }
 
     fn open(&self) -> Result<Connection> {

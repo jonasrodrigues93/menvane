@@ -1,4 +1,5 @@
 mod compiler;
+mod decay;
 mod global_promoter;
 mod project_resolver;
 mod providers;
@@ -16,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use menvane_domain::{
     Applicability, JsonSchema, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryType,
-    NormalizedEvent, Project, ProviderHealth, Scope,
+    NormalizedEvent, Project, ProviderHealth, ReinforcementSignal, Scope,
 };
 use menvane_store::{
     IndexStore, JobRecord, MarkdownStore, SearchResult, SessionRepository, mark_forgotten,
@@ -25,6 +26,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
+pub use decay::DecayEngine;
 pub use global_promoter::GlobalPromoter;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
 pub use providers::{CodexProvider, OpenRouterProvider, ProviderChain};
@@ -228,14 +230,19 @@ impl Menvane {
             ScopeSelection::Project => RetrievalScope::Project,
             ScopeSelection::Global => RetrievalScope::Global,
         };
-        Retriever::new(&self.index).retrieve(
+        let results = Retriever::new(&self.index).retrieve(
             query,
             project.as_ref(),
             retrieval_scope,
             RetrievalMode::Explicit,
             include_sessions,
             limit,
-        )
+        )?;
+        for memory in &results {
+            self.sessions
+                .record_access(memory.id, ReinforcementSignal::Retrieved)?;
+        }
+        Ok(results)
     }
 
     pub fn recall(&self, cwd: &Path, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
@@ -251,7 +258,10 @@ impl Menvane {
     }
 
     pub fn read(&self, id: Uuid) -> Result<Memory> {
-        Ok(self.index.read_memory(&self.markdown, id)?.0)
+        let memory = self.index.read_memory(&self.markdown, id)?.0;
+        self.sessions
+            .record_access(id, ReinforcementSignal::ExplicitlyRead)?;
+        Ok(memory)
     }
 
     pub fn forget(&self, id: Uuid) -> Result<Memory> {
@@ -293,6 +303,8 @@ impl Menvane {
         let mut memories = Vec::new();
         for memory in Retriever::new(&self.index).briefing(&project, 20)? {
             if self.sessions.claim_injection(session_key, memory.id)? {
+                self.sessions
+                    .record_access(memory.id, ReinforcementSignal::Injected)?;
                 memories.push(memory);
             }
         }
@@ -323,6 +335,8 @@ impl Menvane {
         let mut memories = Vec::new();
         for memory in self.recall(cwd, prompt, 20)? {
             if self.sessions.claim_injection(session_key, memory.id)? {
+                self.sessions
+                    .record_access(memory.id, ReinforcementSignal::Injected)?;
                 memories.push(memory);
             }
             if memories.len() == 6 {
@@ -353,12 +367,16 @@ impl Menvane {
             return Ok(memory);
         }
         if success {
+            self.sessions
+                .record_access(id, ReinforcementSignal::SuccessfullyApplied)?;
             memory.metadata.successes = Some(memory.metadata.successes.unwrap_or(0) + 1);
             memory.metadata.last_verified_at = Some(Utc::now());
             if memory.metadata.successes.unwrap_or(0) >= 2 {
                 memory.metadata.status = menvane_domain::MemoryStatus::Active;
             }
         } else {
+            self.sessions
+                .record_access(id, ReinforcementSignal::FailedApplication)?;
             memory.metadata.failures = Some(memory.metadata.failures.unwrap_or(0) + 1);
         }
         if !memory.metadata.source_sessions.contains(&source_session) {
@@ -374,6 +392,45 @@ impl Menvane {
 
     pub fn promote_global_memories(&self) -> Result<Vec<Uuid>> {
         GlobalPromoter::new(self).promote()
+    }
+
+    pub fn gc(&self) -> Result<usize> {
+        let now = Utc::now();
+        let mut archived = 0;
+        for path in self.markdown.memory_files()? {
+            if path
+                .components()
+                .any(|component| component.as_os_str() == "archive")
+            {
+                continue;
+            }
+            let memory = self.markdown.parse_memory(&path)?;
+            if memory.metadata.memory_type != MemoryType::Session {
+                continue;
+            }
+            let ended = memory
+                .metadata
+                .ended_at
+                .unwrap_or(memory.metadata.updated_at);
+            let age_days = (now - ended).num_seconds().max(0) as f64 / 86_400.0;
+            let (access_count, last_access) =
+                self.sessions.meaningful_access(memory.metadata.id)?;
+            let days_since_access = last_access
+                .map(|access| (now - access).num_seconds().max(0) as f64 / 86_400.0)
+                .unwrap_or(age_days);
+            if age_days > 90.0
+                && DecayEngine::session_retention(age_days, access_count, days_since_access) < 0.15
+            {
+                let destination = self.markdown.archive_session(&path)?;
+                self.index.upsert_memory(&memory, &destination)?;
+                archived += 1;
+            }
+        }
+        if archived > 0 {
+            self.markdown
+                .commit(&format!("chore(sessions): archive {archived}"));
+        }
+        Ok(archived)
     }
 
     pub fn home(&self) -> &Path {

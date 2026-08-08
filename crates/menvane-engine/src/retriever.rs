@@ -4,6 +4,8 @@ use anyhow::Result;
 use menvane_domain::{Applicability, Project, ProjectTechnologies};
 use menvane_store::{IndexStore, SearchResult, SearchScope};
 
+use crate::DecayEngine;
+
 const RRF_K: f64 = 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +61,10 @@ impl<'a> Retriever<'a> {
         });
         for result in &mut results {
             let rrf = 1.0 / (RRF_K + result.fts_rank as f64);
-            result.score =
-                rrf * type_multiplier(&result.memory_type) * status_multiplier(&result.status);
+            result.score = rrf
+                * type_multiplier(&result.memory_type)
+                * status_multiplier(&result.status)
+                * DecayEngine::freshness(&result.memory_type, result.age_days);
         }
         results.sort_by(|left, right| right.score.total_cmp(&left.score));
         let mut seen = HashSet::new();

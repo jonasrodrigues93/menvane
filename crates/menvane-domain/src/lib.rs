@@ -9,4 +9,5 @@ pub use retrieval::{
     EmbeddingError, EmbeddingProvider, JsonSchema, LlmError, LlmErrorKind, LlmProvider, LlmRequest,
     ProviderCapabilities, ProviderHealth, StructuredResponse,
 };
+pub use session::ReinforcementSignal;
 pub use session::{NormalizedEvent, NormalizedEventKind, SessionState};

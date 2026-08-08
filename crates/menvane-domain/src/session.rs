@@ -20,6 +20,28 @@ pub enum SessionState {
     Finalized,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReinforcementSignal {
+    Retrieved,
+    Injected,
+    ExplicitlyRead,
+    SuccessfullyApplied,
+    FailedApplication,
+}
+
+impl ReinforcementSignal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retrieved => "retrieved",
+            Self::Injected => "injected",
+            Self::ExplicitlyRead => "explicitly_read",
+            Self::SuccessfullyApplied => "successfully_applied",
+            Self::FailedApplication => "failed_application",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NormalizedEvent {
     pub event_id: String,

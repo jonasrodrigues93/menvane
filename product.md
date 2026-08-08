@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 0.8.0
+Version: 0.9.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -121,3 +121,11 @@ Codex session start, user prompt, completed tool, pre- and post-compaction, stop
 `menvane connect opencode` preserves and extends the user OpenCode JSON configuration, registers the local Menvane MCP server, and installs one owned vanilla JavaScript plugin under the OpenCode configuration directory. The installer creates backups and is idempotent. Disconnect removes only the matching Menvane plugin URI, MCP entry, and unchanged owned plugin file.
 
 The plugin only forwards session, message, compaction, and completed-tool activity to `menvane hook opencode` and appends returned context before model dispatch. It contains no ranking, applicability, consolidation, compiler, or memory-domain logic. OpenCode payloads normalize into the same domain vocabulary and use the same daemon capture, retrieval, sanitization, trust boundary, and session lifecycle as Claude Code and Codex.
+
+## Decay And Maintenance
+
+Sessions use a 45-day time half-life plus meaningful-access reinforcement with a 60-day half-life. `menvane gc` archives a session only when it is older than 90 days and retention is below 0.15. Archived Markdown moves to `memory/archive/sessions`, remains durable, and is excluded from normal retrieval. Hard deletion is disabled.
+
+Facts and gotchas never disappear due to age and have a freshness floor of 0.50 with a 180-day half-life. Procedures never disappear due to age and have a 0.65 floor with a 365-day half-life. Decisions have no temporal decay and rank only by lifecycle status. Superseded and historical memories remain inspectable at lower rank.
+
+Menvane records retrieved, injected, explicitly read, successfully applied, and failed application as separate signals. Retrieval and injection do not validate memory. Explicit reads and successful applications are meaningful access; successful procedure application is the strongest positive verification and failed application remains negative evidence. This prevents popularity loops from simple repeated surfacing.

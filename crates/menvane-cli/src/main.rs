@@ -40,6 +40,7 @@ enum Command {
     Forget(ForgetArgs),
     Reindex,
     Doctor,
+    Gc,
     Mcp,
 }
 
@@ -429,6 +430,9 @@ async fn main() -> Result<()> {
             if !report.healthy() || !provider_healthy {
                 bail!("one or more doctor checks failed");
             }
+        }
+        Command::Gc => {
+            println!("archived {} sessions", menvane.gc()?);
         }
         Command::Mcp => {
             let cwd = std::env::current_dir()?;

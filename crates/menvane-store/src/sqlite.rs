@@ -76,6 +76,7 @@ pub struct SearchResult {
     pub excerpt: String,
     pub score: f64,
     pub fts_rank: usize,
+    pub age_days: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -143,10 +144,10 @@ impl IndexStore {
             SearchScope::Global => ("m.scope = 'global'", ""),
         };
         let sql = format!(
-            "SELECT m.id, m.type, m.scope, m.title, m.status, m.confidence, m.applicability_json, snippet(memory_fts, 2, '', '', ' … ', 24), -bm25(memory_fts) AS score
+            "SELECT m.id, m.type, m.scope, m.title, m.status, m.confidence, m.applicability_json, snippet(memory_fts, 2, '', '', ' … ', 24), -bm25(memory_fts) AS score, MAX(0, julianday('now') - julianday(m.updated_at))
              FROM memory_fts
              JOIN memories m ON m.id = memory_fts.id
-             WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten' AND (?4 OR m.type != 'session')
+             WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten' AND (?4 OR m.type != 'session') AND m.path NOT LIKE '%/archive/sessions/%'
              ORDER BY score DESC
              LIMIT ?3"
         );
@@ -185,6 +186,7 @@ impl IndexStore {
                     excerpt: row.get(7)?,
                     score: row.get(8)?,
                     fts_rank: 0,
+                    age_days: row.get(9)?,
                 })
             },
         )?;
@@ -211,9 +213,9 @@ impl IndexStore {
             SearchScope::Global => ("scope = 'global'", ""),
         };
         let sql = format!(
-            "SELECT id, type, scope, title, status, confidence, applicability_json, substr(body, 1, 500), 0.0
+            "SELECT id, type, scope, title, status, confidence, applicability_json, substr(body, 1, 500), 0.0, MAX(0, julianday('now') - julianday(updated_at))
              FROM memories
-             WHERE {scope_sql} AND status != 'forgotten' AND (?3 OR type != 'session')
+             WHERE {scope_sql} AND status != 'forgotten' AND (?3 OR type != 'session') AND path NOT LIKE '%/archive/sessions/%'
              ORDER BY updated_at DESC
              LIMIT ?2"
         );
@@ -247,6 +249,7 @@ impl IndexStore {
                     excerpt: row.get(7)?,
                     score: row.get(8)?,
                     fts_rank: 0,
+                    age_days: row.get(9)?,
                 })
             },
         )?;

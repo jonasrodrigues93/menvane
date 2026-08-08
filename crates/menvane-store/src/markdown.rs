@@ -125,6 +125,18 @@ impl MarkdownStore {
         Ok(files)
     }
 
+    pub fn archive_session(&self, path: &Path) -> Result<PathBuf> {
+        let filename = path.file_name().context("session path has no filename")?;
+        let destination = self.memory_root.join("archive/sessions").join(filename);
+        fs::create_dir_all(destination.parent().unwrap())?;
+        fs::rename(path, &destination)?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        File::open(destination.parent().unwrap())?.sync_all()?;
+        Ok(destination)
+    }
+
     pub fn commit(&self, message: &str) {
         if !self.memory_root.join(".git").exists() {
             return;
