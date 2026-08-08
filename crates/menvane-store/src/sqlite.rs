@@ -1,0 +1,371 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use menvane_domain::{Memory, MemoryStatus, Project};
+use rusqlite::{Connection, OptionalExtension, params};
+use uuid::Uuid;
+
+use crate::MarkdownStore;
+
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY
+);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    identity TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memories (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    project_id TEXT,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    path TEXT NOT NULL UNIQUE,
+    body TEXT NOT NULL,
+    applicability_json TEXT NOT NULL,
+    tags_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memories_scope_project ON memories(scope, project_id);
+CREATE INDEX IF NOT EXISTS memories_status ON memories(status);
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    id UNINDEXED,
+    title,
+    body,
+    tags,
+    applicability,
+    tokenize = 'unicode61'
+);
+"#;
+
+#[derive(Debug, Clone, Copy)]
+pub enum SearchScope<'a> {
+    Auto(&'a str),
+    Project(&'a str),
+    Global,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub id: Uuid,
+    pub memory_type: String,
+    pub scope: String,
+    pub title: String,
+    pub status: String,
+    pub confidence: f64,
+    pub excerpt: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexStore {
+    path: PathBuf,
+}
+
+impl IndexStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn initialize(&self) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute_batch(SCHEMA)?;
+        Ok(())
+    }
+
+    pub fn upsert_project(&self, project: &Project, path: &Path) -> Result<()> {
+        let connection = self.open_initialized()?;
+        insert_project(&connection, project, path)
+    }
+
+    pub fn upsert_memory(&self, memory: &Memory, path: &Path) -> Result<()> {
+        let mut connection = self.open_initialized()?;
+        let transaction = connection.transaction()?;
+        insert_memory(&transaction, memory, path)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn read_memory(&self, markdown: &MarkdownStore, id: Uuid) -> Result<(Memory, PathBuf)> {
+        let connection = self.open_initialized()?;
+        let path: Option<String> = connection
+            .query_row(
+                "SELECT path FROM memories WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let path = path.with_context(|| format!("memory not found: {id}"))?;
+        let path = PathBuf::from(path);
+        Ok((markdown.parse_memory(&path)?, path))
+    }
+
+    pub fn search(
+        &self,
+        query: &str,
+        scope: SearchScope<'_>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let fts_query = fts_query(query);
+        if fts_query.is_empty() {
+            bail!("search query must contain letters or numbers");
+        }
+        let connection = self.open_initialized()?;
+        let (scope_sql, project_id) = match scope {
+            SearchScope::Auto(project_id) => {
+                ("(m.scope = 'global' OR m.project_id = ?2)", project_id)
+            }
+            SearchScope::Project(project_id) => ("m.project_id = ?2", project_id),
+            SearchScope::Global => ("m.scope = 'global'", ""),
+        };
+        let sql = format!(
+            "SELECT m.id, m.type, m.scope, m.title, m.status, m.confidence, snippet(memory_fts, 2, '', '', ' … ', 24), -bm25(memory_fts) AS score
+             FROM memory_fts
+             JOIN memories m ON m.id = memory_fts.id
+             WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten'
+             ORDER BY score DESC
+             LIMIT ?3"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![fts_query, project_id, i64::try_from(limit)?],
+            |row| {
+                let id: String = row.get(0)?;
+                Ok(SearchResult {
+                    id: Uuid::parse_str(&id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            id.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    memory_type: row.get(1)?,
+                    scope: row.get(2)?,
+                    title: row.get(3)?,
+                    status: row.get(4)?,
+                    confidence: row.get(5)?,
+                    excerpt: row.get(6)?,
+                    score: row.get(7)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn memory_count(&self) -> Result<u64> {
+        let connection = self.open_initialized()?;
+        Ok(connection.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?)
+    }
+
+    pub fn project_count(&self) -> Result<u64> {
+        let connection = self.open_initialized()?;
+        Ok(connection.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))?)
+    }
+
+    pub fn fts5_available(&self) -> Result<bool> {
+        let connection = self.open_initialized()?;
+        let result = connection.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS menvane_fts_check USING fts5(value)",
+            [],
+        );
+        if result.is_ok() {
+            connection.execute("DROP TABLE menvane_fts_check", [])?;
+        }
+        Ok(result.is_ok())
+    }
+
+    pub fn reindex(&self, markdown: &MarkdownStore) -> Result<(usize, usize)> {
+        let temporary = self
+            .path
+            .with_extension(format!("reindex-{}", Uuid::now_v7()));
+        let connection = Connection::open(&temporary)?;
+        configure_connection(&connection, false)?;
+        connection.execute_batch(SCHEMA)?;
+        let project_files = markdown.project_files()?;
+        for path in &project_files {
+            let project = markdown.parse_project(path)?;
+            insert_project(&connection, &project, path)?;
+        }
+        let memory_files = markdown.memory_files()?;
+        for path in &memory_files {
+            let memory = markdown.parse_memory(path)?;
+            insert_memory(&connection, &memory, path)?;
+        }
+        connection.execute_batch("PRAGMA optimize;")?;
+        drop(connection);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{}", self.path.display(), suffix));
+            if sidecar.exists() {
+                fs::remove_file(sidecar)?;
+            }
+        }
+        fs::rename(&temporary, &self.path).with_context(|| {
+            format!(
+                "failed to replace {} with rebuilt index",
+                self.path.display()
+            )
+        })?;
+        self.initialize()?;
+        Ok((project_files.len(), memory_files.len()))
+    }
+
+    fn open(&self) -> Result<Connection> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(&self.path)?;
+        configure_connection(&connection, true)?;
+        Ok(connection)
+    }
+
+    fn open_initialized(&self) -> Result<Connection> {
+        let connection = self.open()?;
+        connection.execute_batch(SCHEMA)?;
+        Ok(connection)
+    }
+}
+
+fn configure_connection(connection: &Connection, wal: bool) -> Result<()> {
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    if wal {
+        connection.execute_batch("PRAGMA journal_mode = WAL;")?;
+    } else {
+        connection.execute_batch("PRAGMA journal_mode = DELETE;")?;
+    }
+    Ok(())
+}
+
+fn insert_project(connection: &Connection, project: &Project, path: &Path) -> Result<()> {
+    connection.execute(
+        "INSERT INTO projects(id, identity, name, path, metadata_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET identity=excluded.identity, name=excluded.name, path=excluded.path, metadata_json=excluded.metadata_json, updated_at=excluded.updated_at",
+        params![
+            project.id,
+            project.identity,
+            project.name,
+            path.to_string_lossy(),
+            serde_json::to_string(project)?,
+            project.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Result<()> {
+    let metadata = &memory.metadata;
+    connection.execute(
+        "DELETE FROM memory_fts WHERE id = ?1",
+        [metadata.id.to_string()],
+    )?;
+    connection.execute(
+        "INSERT INTO memories(id, type, scope, project_id, title, status, confidence, path, body, applicability_json, tags_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+         ON CONFLICT(id) DO UPDATE SET type=excluded.type, scope=excluded.scope, project_id=excluded.project_id, title=excluded.title, status=excluded.status, confidence=excluded.confidence, path=excluded.path, body=excluded.body, applicability_json=excluded.applicability_json, tags_json=excluded.tags_json, updated_at=excluded.updated_at",
+        params![
+            metadata.id.to_string(),
+            metadata.memory_type.to_string(),
+            metadata.scope.to_string(),
+            metadata.project_id,
+            memory.title,
+            metadata.status.to_string(),
+            metadata.confidence,
+            path.to_string_lossy(),
+            memory.body,
+            serde_json::to_string(&metadata.applies_to)?,
+            serde_json::to_string(&metadata.tags)?,
+            metadata.created_at.to_rfc3339(),
+            metadata.updated_at.to_rfc3339(),
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO memory_fts(id, title, body, tags, applicability) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            metadata.id.to_string(),
+            memory.title,
+            memory.body,
+            metadata.tags.join(" "),
+            [
+                metadata.applies_to.languages.join(" "),
+                metadata.applies_to.frameworks.join(" "),
+                metadata.applies_to.tools.join(" "),
+                metadata.applies_to.databases.join(" "),
+                metadata.applies_to.platforms.join(" "),
+            ]
+            .join(" "),
+        ],
+    )?;
+    Ok(())
+}
+
+fn fts_query(query: &str) -> String {
+    query
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+pub fn mark_forgotten(memory: &mut Memory) {
+    memory.metadata.status = MemoryStatus::Forgotten;
+    memory.metadata.updated_at = chrono::Utc::now();
+}
+
+#[cfg(test)]
+mod tests {
+    use menvane_domain::{Applicability, MemoryMetadata, MemoryType, Scope};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn forgotten_memories_are_not_searchable() {
+        let temporary = TempDir::new().unwrap();
+        let markdown = MarkdownStore::new(temporary.path());
+        markdown.initialize().unwrap();
+        let index = IndexStore::new(temporary.path().join("index.sqlite"));
+        index.initialize().unwrap();
+        let mut memory = Memory {
+            metadata: MemoryMetadata::new(
+                MemoryType::Fact,
+                Scope::Global,
+                None,
+                1.0,
+                Vec::new(),
+                Applicability::default(),
+            ),
+            title: "Durable rust fact".to_owned(),
+            body: "SQLite is derived.".to_owned(),
+        };
+        let path = markdown.write_memory(&memory, None).unwrap();
+        index.upsert_memory(&memory, &path).unwrap();
+        assert_eq!(
+            index
+                .search("durable", SearchScope::Global, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        mark_forgotten(&mut memory);
+        markdown.update_memory(&path, &memory).unwrap();
+        index.upsert_memory(&memory, &path).unwrap();
+        assert!(
+            index
+                .search("durable", SearchScope::Global, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

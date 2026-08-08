@@ -1,0 +1,17 @@
+[package]
+name = "menvane-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "menvane"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+menvane-domain = { path = "../menvane-domain" }
+menvane-engine = { path = "../menvane-engine" }
+serde_yaml.workspace = true
+uuid.workspace = true
