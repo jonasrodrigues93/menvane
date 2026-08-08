@@ -122,10 +122,19 @@ impl<'a> ClaudeHook<'a> {
     }
 
     pub fn handle(&self, event_name: &str, payload: Value) -> Result<Value> {
+        self.handle_client(event_name, payload, "claude-code")
+    }
+
+    pub(crate) fn handle_client(
+        &self,
+        event_name: &str,
+        payload: Value,
+        client: &str,
+    ) -> Result<Value> {
         if std::env::var("MENVANE_INTERNAL").as_deref() == Ok("1") {
             return Ok(json!({}));
         }
-        let event = normalize_event(event_name, &payload)?;
+        let event = normalize_event(event_name, &payload, client)?;
         let session_id = event.external_session_id.clone();
         let cwd = event.cwd.clone();
         let prompt = event.bounded_input.clone().unwrap_or_default();
@@ -179,12 +188,12 @@ impl<'a> ClaudeHook<'a> {
     }
 }
 
-fn normalize_event(event_name: &str, payload: &Value) -> Result<NormalizedEvent> {
+fn normalize_event(event_name: &str, payload: &Value, client: &str) -> Result<NormalizedEvent> {
     let kind = match event_name {
         "SessionStart" => NormalizedEventKind::SessionStarted,
         "UserPromptSubmit" => NormalizedEventKind::UserPrompt,
         "PostToolUse" => NormalizedEventKind::ToolCompleted,
-        "PreCompact" => NormalizedEventKind::ContextCompacted,
+        "PreCompact" | "PostCompact" => NormalizedEventKind::ContextCompacted,
         "Stop" => NormalizedEventKind::TurnStopped,
         "SessionEnd" => NormalizedEventKind::SessionEnded,
         _ => anyhow::bail!("unsupported Claude hook event: {event_name}"),
@@ -224,7 +233,7 @@ fn normalize_event(event_name: &str, payload: &Value) -> Result<NormalizedEvent>
     Ok(NormalizedEvent {
         event_id,
         kind,
-        client: "claude-code".to_owned(),
+        client: client.to_owned(),
         external_session_id,
         timestamp: Utc::now(),
         cwd,

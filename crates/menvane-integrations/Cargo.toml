@@ -17,6 +17,7 @@ menvane-server = { path = "../menvane-server" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

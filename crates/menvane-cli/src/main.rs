@@ -5,7 +5,9 @@ use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
-use menvane_integrations::{ClaudeHook, ClaudeInstaller, ClaudePaths, McpServer};
+use menvane_integrations::{
+    ClaudeHook, ClaudeInstaller, ClaudePaths, CodexHook, CodexInstaller, CodexPaths, McpServer,
+};
 use menvane_server::{
     DEFAULT_ADDRESS, DEFAULT_PORT, daemon_running, home_from_environment, serve, start_daemon,
     stop_daemon,
@@ -68,6 +70,7 @@ struct HookArgs {
 #[derive(Clone, Copy, ValueEnum)]
 enum Client {
     Claude,
+    Codex,
 }
 
 #[derive(Args)]
@@ -215,6 +218,20 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            Client::Codex => {
+                let installer =
+                    CodexInstaller::new(CodexPaths::discover()?, std::env::current_exe()?);
+                let changed = installer.connect()?;
+                menvane.set_integration_connected("codex", true)?;
+                println!(
+                    "Codex integration {}",
+                    if changed {
+                        "connected"
+                    } else {
+                        "already connected"
+                    }
+                );
+            }
         },
         Command::Disconnect(arguments) => match arguments.client {
             Client::Claude => {
@@ -231,6 +248,20 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            Client::Codex => {
+                let installer =
+                    CodexInstaller::new(CodexPaths::discover()?, std::env::current_exe()?);
+                let changed = installer.disconnect()?;
+                menvane.set_integration_connected("codex", false)?;
+                println!(
+                    "Codex integration {}",
+                    if changed {
+                        "disconnected"
+                    } else {
+                        "not connected"
+                    }
+                );
+            }
         },
         Command::Hook(arguments) => match arguments.client {
             Client::Claude => {
@@ -238,6 +269,14 @@ async fn main() -> Result<()> {
                 std::io::stdin().read_to_string(&mut input)?;
                 let payload = serde_json::from_str(&input)?;
                 let output = ClaudeHook::new(&menvane, std::env::current_exe()?)
+                    .handle(&arguments.event, payload)?;
+                println!("{}", serde_json::to_string(&output)?);
+            }
+            Client::Codex => {
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let payload = serde_json::from_str(&input)?;
+                let output = CodexHook::new(&menvane, std::env::current_exe()?)
                     .handle(&arguments.event, payload)?;
                 println!("{}", serde_json::to_string(&output)?);
             }

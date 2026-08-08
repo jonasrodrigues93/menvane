@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 0.6.0
+Version: 0.7.0
 
 Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -109,3 +109,9 @@ A first successful procedure is a candidate with one success and no failures. An
 Global promotion evaluates equivalent project procedures and gotchas. Execution-derived knowledge remains project-scoped until equivalent evidence exists in at least two independent projects. Promotion creates one active contextual global memory retaining source project identifiers, source sessions, successes, failures, confidence, and applicability. Source variants remain inspectable as historical evidence. Retrieval deduplicates project and global variants.
 
 Project-specific decisions are not candidates for global promotion. Explicit universal preferences may still be classified as global facts directly by the compiler.
+
+## Codex Agent Integration
+
+`menvane connect codex` merges a user-level MCP server and supported lifecycle hooks into `CODEX_HOME/config.toml`, defaulting to `~/.codex/config.toml`. It preserves unrelated models, servers, hooks, and settings, creates a backup before changes, enables supported hooks, and is idempotent. Disconnect removes only the matching Menvane MCP and hook commands. It never modifies `AGENTS.md`.
+
+Codex session start, user prompt, completed tool, pre- and post-compaction, stop, and session end payloads normalize into the shared event vocabulary. Capture is sanitized before daemon transport. Session start and user prompt hooks use the same bounded automatic recall and trust boundary as Claude Code. `MENVANE_INTERNAL=1` prevents provider inference from recursively creating Codex agent sessions.
