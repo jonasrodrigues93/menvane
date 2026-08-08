@@ -1,6 +1,7 @@
 mod compiler;
 mod decay;
 mod global_promoter;
+mod oauth_provider;
 mod project_resolver;
 mod providers;
 mod retriever;
@@ -31,8 +32,9 @@ use uuid::Uuid;
 pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
 pub use decay::DecayEngine;
 pub use global_promoter::GlobalPromoter;
+pub use oauth_provider::OpenAiOAuthProvider;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
-pub use providers::{CodexProvider, OpenAIProvider, OpenRouterProvider, ProviderChain};
+pub use providers::{CodexProvider, OpenAIApiProvider, OpenRouterProvider, ProviderChain};
 pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
 pub use sanitizer::{CaptureSanitizer, CaptureSanitizerConfig};
 pub use session_engine::{CaptureOutcome, SessionEngine};
@@ -101,6 +103,10 @@ struct LlmConfiguration {
     api_key_env: String,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    #[serde(default = "default_oauth_issuer")]
+    oauth_issuer: String,
+    #[serde(default = "default_oauth_endpoint")]
+    oauth_endpoint: String,
     #[serde(default)]
     fallback: Option<Box<LlmConfiguration>>,
 }
@@ -113,6 +119,8 @@ impl Default for LlmConfiguration {
             base_url: default_openrouter_url(),
             api_key_env: default_openrouter_key_env(),
             reasoning_effort: Some("medium".to_owned()),
+            oauth_issuer: default_oauth_issuer(),
+            oauth_endpoint: default_oauth_endpoint(),
             fallback: None,
         }
     }
@@ -123,7 +131,7 @@ fn default_llm_provider() -> String {
 }
 
 fn default_llm_model() -> String {
-    "gpt-5.4".to_owned()
+    "gpt-5.6-luna".to_owned()
 }
 
 fn default_openrouter_url() -> String {
@@ -132,6 +140,14 @@ fn default_openrouter_url() -> String {
 
 fn default_openrouter_key_env() -> String {
     "OPENAI_API_KEY".to_owned()
+}
+
+fn default_oauth_issuer() -> String {
+    "https://auth.openai.com".to_owned()
+}
+
+fn default_oauth_endpoint() -> String {
+    "https://chatgpt.com/backend-api/codex/responses".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -547,25 +563,9 @@ impl Menvane {
         Ok(())
     }
 
-    pub fn configure_openai(
-        &self,
-        model: &str,
-        base_url: &str,
-        api_key_env: &str,
-        reasoning_effort: Option<&str>,
-    ) -> Result<()> {
+    pub fn configure_openai(&self, model: &str, reasoning_effort: Option<&str>) -> Result<()> {
         if model.trim().is_empty() {
             bail!("OpenAI model cannot be empty");
-        }
-        if !base_url.starts_with("https://") && !base_url.starts_with("http://127.0.0.1") {
-            bail!("OpenAI base URL must use HTTPS or localhost HTTP");
-        }
-        if api_key_env.trim().is_empty()
-            || !api_key_env
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || character == '_')
-        {
-            bail!("API key environment variable name is invalid");
         }
         if reasoning_effort.is_some_and(|effort| {
             !matches!(effort, "minimal" | "low" | "medium" | "high" | "xhigh")
@@ -587,13 +587,15 @@ impl Menvane {
             "model".to_owned(),
             toml::Value::String(model.trim().to_owned()),
         );
+        llm.remove("base_url");
+        llm.remove("api_key_env");
         llm.insert(
-            "base_url".to_owned(),
-            toml::Value::String(base_url.trim_end_matches('/').to_owned()),
+            "oauth_issuer".to_owned(),
+            toml::Value::String(default_oauth_issuer()),
         );
         llm.insert(
-            "api_key_env".to_owned(),
-            toml::Value::String(api_key_env.to_owned()),
+            "oauth_endpoint".to_owned(),
+            toml::Value::String(default_oauth_endpoint()),
         );
         if let Some(reasoning_effort) = reasoning_effort {
             llm.insert(
@@ -604,6 +606,29 @@ impl Menvane {
             llm.remove("reasoning_effort");
         }
         self.update_configuration_text(&toml::to_string_pretty(&configuration)?)
+    }
+
+    pub async fn login_openai(&self) -> Result<()> {
+        OpenAiOAuthProvider::with_endpoints(
+            &self.home,
+            &self.config.llm.model,
+            self.config.llm.reasoning_effort.clone(),
+            &self.config.llm.oauth_issuer,
+            &self.config.llm.oauth_endpoint,
+        )
+        .login()
+        .await
+        .map_err(anyhow::Error::new)
+    }
+
+    pub fn logout_openai(&self) -> Result<()> {
+        OpenAiOAuthProvider::new(
+            &self.home,
+            &self.config.llm.model,
+            self.config.llm.reasoning_effort.clone(),
+        )
+        .logout()
+        .map_err(anyhow::Error::new)
     }
 
     pub fn integrations(&self) -> Result<Vec<IntegrationRecord>> {
@@ -835,13 +860,13 @@ impl Menvane {
     }
 
     pub fn configured_provider(&self) -> Result<std::sync::Arc<dyn LlmProvider>> {
-        let primary = provider_from_configuration(&self.config.llm)?;
+        let primary = provider_from_configuration(&self.config.llm, &self.home)?;
         let fallback = self
             .config
             .llm
             .fallback
             .as_deref()
-            .map(provider_from_configuration)
+            .map(|configuration| provider_from_configuration(configuration, &self.home))
             .transpose()?;
         Ok(std::sync::Arc::new(ProviderChain::new(primary, fallback)))
     }
@@ -1129,14 +1154,22 @@ fn format_memory_context(prefix: &str, memories: &[SearchResult], max_chars: usi
 
 fn provider_from_configuration(
     configuration: &LlmConfiguration,
+    home: &Path,
 ) -> Result<std::sync::Arc<dyn LlmProvider>> {
     match configuration.provider.as_str() {
         "codex" => Ok(std::sync::Arc::new(CodexProvider::new(
             "codex",
             &configuration.model,
         ))),
-        "openai" => Ok(std::sync::Arc::new(
-            OpenAIProvider::new(
+        "openai" => Ok(std::sync::Arc::new(OpenAiOAuthProvider::with_endpoints(
+            home,
+            &configuration.model,
+            configuration.reasoning_effort.clone(),
+            &configuration.oauth_issuer,
+            &configuration.oauth_endpoint,
+        ))),
+        "openai-api" => Ok(std::sync::Arc::new(
+            OpenAIApiProvider::new(
                 &configuration.model,
                 &configuration.base_url,
                 &configuration.api_key_env,

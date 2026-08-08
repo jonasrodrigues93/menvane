@@ -157,11 +157,11 @@ pub struct OpenRouterProvider {
     reasoning_effort: Option<String>,
 }
 
-pub struct OpenAIProvider {
+pub struct OpenAIApiProvider {
     compatible: OpenRouterProvider,
 }
 
-impl OpenAIProvider {
+impl OpenAIApiProvider {
     pub fn new(
         model: impl Into<String>,
         base_url: impl Into<String>,
@@ -179,7 +179,7 @@ impl OpenAIProvider {
 }
 
 #[async_trait]
-impl LlmProvider for OpenAIProvider {
+impl LlmProvider for OpenAIApiProvider {
     async fn generate_structured(
         &self,
         request: LlmRequest,
@@ -710,7 +710,7 @@ exit 1
             ),
         );
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let provider = OpenAIProvider::new("test-model", format!("http://{address}"), key_name)
+        let provider = OpenAIApiProvider::new("test-model", format!("http://{address}"), key_name)
             .with_reasoning_effort(Some("medium".to_owned()));
         let response = provider
             .generate_structured(request(), schema())
@@ -723,7 +723,7 @@ exit 1
 
     #[tokio::test]
     async fn openai_requires_configured_api_key_environment_variable() {
-        let provider = OpenAIProvider::new(
+        let provider = OpenAIApiProvider::new(
             "test-model",
             "https://api.openai.com/v1",
             "MENVANE_UNSET_OPENAI_KEY",

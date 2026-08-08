@@ -21,16 +21,16 @@ menvane connect codex
 menvane connect opencode
 ```
 
-Configure direct OpenAI inference before starting the daemon:
+Authorize ChatGPT Plus or Pro and configure OpenAI inference before starting the daemon:
 
 ```bash
-export OPENAI_API_KEY="..."
-menvane provider configure openai --model gpt-5.4 --reasoning-effort medium
+menvane provider configure openai --model gpt-5.6-luna --reasoning-effort medium
+menvane provider login openai
 menvane daemon restart
 menvane provider status
 ```
 
-Persist `OPENAI_API_KEY` through your shell or secret manager. Menvane stores only the environment variable name, never the key value.
+Authorization opens OpenAI in the system browser. Menvane stores its own refreshable credentials under `~/.menvane/oauth/` and never reads credentials from OpenCode or Codex. Run `menvane provider logout openai` to remove them.
 
 The local UI is available at `http://127.0.0.1:47831/`. Integrations capture and recall automatically; no Skill, repository instruction file, or explicit memory prompt is required.
 

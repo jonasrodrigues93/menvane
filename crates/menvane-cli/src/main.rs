@@ -80,6 +80,14 @@ enum ProviderCommand {
     Status,
     Test,
     Configure(ProviderConfigureArgs),
+    Login(ProviderAuthArgs),
+    Logout(ProviderAuthArgs),
+}
+
+#[derive(Args)]
+struct ProviderAuthArgs {
+    #[arg(value_enum)]
+    provider: ConfigurableProvider,
 }
 
 #[derive(Args)]
@@ -88,10 +96,6 @@ struct ProviderConfigureArgs {
     provider: ConfigurableProvider,
     #[arg(long)]
     model: String,
-    #[arg(long, default_value = "https://api.openai.com/v1")]
-    base_url: String,
-    #[arg(long, default_value = "OPENAI_API_KEY")]
-    api_key_env: String,
     #[arg(long, value_enum, default_value = "medium")]
     reasoning_effort: ReasoningEffort,
 }
@@ -427,14 +431,24 @@ async fn main() -> Result<()> {
                 ConfigurableProvider::Openai => {
                     menvane.configure_openai(
                         &configuration.model,
-                        &configuration.base_url,
-                        &configuration.api_key_env,
                         Some(configuration.reasoning_effort.as_str()),
                     )?;
                     println!(
                         "configured OpenAI model {}; restart the daemon to apply",
                         configuration.model
                     );
+                }
+            },
+            ProviderCommand::Login(authentication) => match authentication.provider {
+                ConfigurableProvider::Openai => {
+                    menvane.login_openai().await?;
+                    println!("OpenAI ChatGPT authorization completed");
+                }
+            },
+            ProviderCommand::Logout(authentication) => match authentication.provider {
+                ConfigurableProvider::Openai => {
+                    menvane.logout_openai()?;
+                    println!("OpenAI ChatGPT authorization removed");
                 }
             },
         },
