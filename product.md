@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.10.0
+Version: 1.11.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -45,7 +45,7 @@ Technology detection is deterministic and inspects known project files and depen
 
 ## Retrieval
 
-Retrieval uses SQLite FTS5 and Reciprocal Rank Fusion with `K = 60`. Procedures and decisions receive a 1.15 type multiplier, gotchas 1.10, facts 1.00, and sessions 0.75. Active, candidate, needs-validation, superseded, and historical statuses receive their defined lifecycle multipliers. Sessions are excluded unless explicitly requested.
+Retrieval uses SQLite FTS5 and Reciprocal Rank Fusion with `K = 60`. Explicit search retains its existing lexical behavior. Automatic prompt recall identifies the latest operational session by client and external session identifier, then retrieves the sanitized current prompt, active episode goal, active corrections, active constraints, and conversation root goal independently. It fuses those rankings by memory ID with weights `1.00`, `0.85`, `1.00`, `0.80`, and `0.35`, then applies bounded lifecycle, type, confidence, freshness, applicability, and scope multipliers. Current-project variants rank above equivalent global variants and title/type deduplication occurs after ranking. Dormant and previous episode goals do not provide recall queries. Procedures and decisions receive a 1.15 type multiplier, gotchas 1.10, facts 1.00, and sessions 0.75. Active, candidate, needs-validation, superseded, and historical statuses receive their defined lifecycle multipliers. Sessions are excluded unless explicitly requested.
 
 Automatic recall searches only the current project and global memory. Global universal memories are eligible everywhere. Global contextual memories are eligible only when every populated applicability dimension overlaps the current project's detected technologies. Explicit searches may inspect an otherwise incompatible contextual memory when the query names one of its technologies.
 
@@ -81,7 +81,7 @@ The REST foundation is under `/api/v1`. Health, normalized event ingestion, and 
 
 Claude hooks normalize client payloads before domain ingestion and ensure the daemon is running. Hooks originating from `MENVANE_INTERNAL=1` are ignored. Reliably attributed ignored paths are dropped and all capture is sanitized before local daemon transport.
 
-Session start injects a briefing of project identity, detected technologies, active decisions, critical gotchas, and high-confidence applicable global facts within 2,500 characters. User prompts retrieve at most six relevant project and applicable global memories within 6,000 characters. No external language-model request occurs on this path, and identical memories are not repeatedly injected into one external session.
+Session start injects a briefing of project identity, detected technologies, active decisions, critical gotchas, and high-confidence applicable global facts within 2,500 characters. User prompts use the intent-aware lexical recall path and retrieve at most six relevant project and applicable global memories within 6,000 characters. Recall diagnostics expose every intent query's rank and contribution plus every reranking multiplier. Recall prompts are sanitized and bounded before search; oversized client, session, and working-directory identifiers are rejected by the daemon. No external language-model request occurs on this path, and identical memories are not repeatedly injected into one external session.
 
 Injected memory is delimited as historical context and explicitly states that current user instructions and repository state are authoritative. Hook capture and recall require no memory instruction from the user.
 
@@ -155,7 +155,7 @@ Memory lists filter by physical scope, type, status, and technology. Detail view
 
 The search view uses the runtime retrieval engine and exposes FTS rank, RRF constant, freshness, and final score. The visual interface is fully local and uses embedded assets with minimal JavaScript only for progressive page arrival.
 
-REST endpoints under `/api/v1` cover health, projects, memories, sessions, imports, integrations, settings, jobs, providers, normalized events, and recall. HTTP handlers delegate to the same engine used by CLI, MCP, hooks, and UI.
+REST endpoints under `/api/v1` cover health, projects, memories, sessions, imports, integrations, settings, jobs, providers, normalized events, and recall. Recall accepts the integration client and external session identifier and returns bounded context with intent-ranking diagnostics. HTTP handlers delegate to the same engine used by CLI, MCP, hooks, and UI.
 
 ## Backup, Restore, And Distribution
 

@@ -228,6 +228,15 @@ pub struct PromptIntentHistory {
     pub replaced_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecallContext {
+    pub session: SessionRecord,
+    pub active_episode: Option<TaskEpisode>,
+    pub active_corrections: Vec<String>,
+    pub active_constraints: Vec<String>,
+    pub conversation_root_goal: Option<String>,
+}
+
 pub struct IngestResult {
     pub session: SessionRecord,
     pub inserted: bool,
@@ -445,6 +454,62 @@ impl SessionRepository {
     pub fn session(&self, id: Uuid) -> Result<SessionRecord> {
         let connection = self.open()?;
         session_by_id(&connection, id)
+    }
+
+    pub fn latest_session(
+        &self,
+        client: &str,
+        external_session_id: &str,
+    ) -> Result<Option<SessionRecord>> {
+        let connection = self.open()?;
+        latest_session_connection(&connection, client, external_session_id)
+    }
+
+    pub fn recall_context(
+        &self,
+        client: &str,
+        external_session_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<Option<RecallContext>> {
+        let connection = self.open()?;
+        let Some(session) = latest_session_connection(&connection, client, external_session_id)?
+        else {
+            return Ok(None);
+        };
+        let active_episode =
+            active_episode_connection(&connection, &session.conversation_key, project_id)?;
+        let Some(active_episode) = active_episode else {
+            return Ok(Some(RecallContext {
+                session,
+                active_episode: None,
+                active_corrections: Vec::new(),
+                active_constraints: Vec::new(),
+                conversation_root_goal: None,
+            }));
+        };
+        let prompts = episode_prompt_texts(&connection, active_episode.id)?;
+        let root_event_id =
+            conversation_root_event_id(&connection, &session.conversation_key, project_id)?;
+        let root_goal = root_event_id
+            .as_deref()
+            .map(|event_id| event_prompt_text(&connection, event_id))
+            .transpose()?
+            .flatten();
+        Ok(Some(RecallContext {
+            session,
+            active_episode: Some(active_episode),
+            active_corrections: prompts
+                .iter()
+                .filter(|(_, kind, _)| kind == "correction")
+                .map(|(_, _, prompt)| prompt.clone())
+                .collect(),
+            active_constraints: prompts
+                .iter()
+                .filter(|(_, kind, _)| kind == "constraint")
+                .map(|(_, _, prompt)| prompt.clone())
+                .collect(),
+            conversation_root_goal: root_goal,
+        }))
     }
 
     pub fn create_episode(
@@ -1106,6 +1171,100 @@ fn latest_session(
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn latest_session_connection(
+    connection: &Connection,
+    client: &str,
+    external_session_id: &str,
+) -> Result<Option<SessionRecord>> {
+    connection
+        .query_row(
+            "SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, conversation_key FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1",
+            params![client, external_session_id],
+            session_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn active_episode_connection(
+    connection: &Connection,
+    conversation_key: &str,
+    project_id: Option<&str>,
+) -> Result<Option<TaskEpisode>> {
+    connection
+        .query_row(
+            "SELECT id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at FROM task_episodes WHERE conversation_key=?1 AND state='active' AND project_id IS ?2 ORDER BY ordinal DESC, id DESC LIMIT 1",
+            params![conversation_key, project_id],
+            episode_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn conversation_root_event_id(
+    connection: &Connection,
+    conversation_key: &str,
+    project_id: Option<&str>,
+) -> Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT root_event_id FROM task_episodes WHERE conversation_key=?1 AND project_id IS ?2 ORDER BY ordinal, id LIMIT 1",
+            params![conversation_key, project_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn episode_prompt_texts(
+    connection: &Connection,
+    episode_id: Uuid,
+) -> Result<Vec<(String, String, String)>> {
+    let mut statement = connection.prepare(
+        "SELECT i.event_id, i.kind, e.payload_json FROM prompt_intents i JOIN session_events e ON e.event_id=i.event_id WHERE i.episode_id=?1 AND i.kind IN ('correction', 'constraint') ORDER BY i.classified_at, i.event_id",
+    )?;
+    let rows = statement.query_map([episode_id.to_string()], |row| {
+        let event_id: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let payload: String = row.get(2)?;
+        Ok((event_id, kind, payload))
+    })?;
+    let prompts = rows
+        .map(|row| {
+            let (event_id, kind, payload) = row?;
+            let event: NormalizedEvent = serde_json::from_str(&payload).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok::<_, rusqlite::Error>((event_id, kind, event.bounded_input.unwrap_or_default()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(prompts
+        .into_iter()
+        .filter(|(_, _, text)| !text.trim().is_empty())
+        .collect())
+}
+
+fn event_prompt_text(connection: &Connection, event_id: &str) -> Result<Option<String>> {
+    let payload: Option<String> = connection
+        .query_row(
+            "SELECT payload_json FROM session_events WHERE event_id=?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    payload
+        .map(|payload| {
+            let event: NormalizedEvent = serde_json::from_str(&payload)?;
+            Ok(event.bounded_input.filter(|text| !text.trim().is_empty()))
+        })
+        .transpose()
+        .map(|value| value.flatten())
 }
 
 fn session_by_id(connection: &Connection, id: Uuid) -> Result<SessionRecord> {

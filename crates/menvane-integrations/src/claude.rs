@@ -137,8 +137,12 @@ impl<'a> ClaudeHook<'a> {
         let event = normalize_event(event_name, &payload, client)?;
         let session_id = event.external_session_id.clone();
         let cwd = event.cwd.clone();
-        let prompt = event.bounded_input.clone().unwrap_or_default();
-        if let Some(event) = self.menvane.sanitize_event(event)? {
+        let sanitized_event = self.menvane.sanitize_event(event)?;
+        let prompt = sanitized_event
+            .as_ref()
+            .and_then(|event| event.bounded_input.clone())
+            .unwrap_or_default();
+        if let Some(event) = sanitized_event {
             self.ensure_daemon()?;
             post_json("/api/v1/events", &serde_json::to_value(event)?)?;
         }
@@ -154,6 +158,7 @@ impl<'a> ClaudeHook<'a> {
         let response = post_json(
             "/api/v1/recall",
             &json!({
+                "client": client,
                 "cwd": cwd,
                 "session_id": session_id,
                 "kind": recall_kind,

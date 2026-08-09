@@ -41,8 +41,16 @@ pub use intent_engine::{
 pub use oauth_provider::OpenAiOAuthProvider;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
 pub use providers::{CodexProvider, OpenAIApiProvider, OpenRouterProvider, ProviderChain};
+pub use retriever::{
+    ACTIVE_CONSTRAINT_WEIGHT, ACTIVE_CORRECTION_WEIGHT, ACTIVE_EPISODE_GOAL_WEIGHT,
+    CONVERSATION_ROOT_GOAL_WEIGHT, CURRENT_PROMPT_WEIGHT, RETRIEVAL_RRF_K, RecallDiagnostics,
+    RecallQueryDiagnostic, RecallResultDiagnostic, RecallSourceDiagnostic,
+};
 pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
-pub use sanitizer::{CaptureSanitizer, CaptureSanitizerConfig};
+pub use sanitizer::{
+    CaptureSanitizer, CaptureSanitizerConfig, MAX_RECALL_CWD_BYTES, MAX_RECALL_IDENTIFIER_BYTES,
+    MAX_RECALL_PROMPT_BYTES,
+};
 pub use session_engine::{CaptureOutcome, SessionEngine, is_session_worth_compiling};
 pub use technology_detector::TechnologyDetector;
 
@@ -54,6 +62,11 @@ pub struct WriteMemory {
     pub confidence: f64,
     pub tags: Vec<String>,
     pub applies_to: Applicability,
+}
+
+pub struct PromptRecall {
+    pub results: Vec<SearchResult>,
+    pub diagnostics: RecallDiagnostics,
 }
 
 pub struct DoctorReport {
@@ -319,6 +332,55 @@ impl Menvane {
         )
     }
 
+    pub fn prompt_recall(
+        &self,
+        cwd: &Path,
+        client: &str,
+        external_session_id: &str,
+        prompt: &str,
+        limit: usize,
+    ) -> Result<PromptRecall> {
+        let prompt = CaptureSanitizer::new(self.config.capture.clone())?.sanitize_prompt(prompt);
+        if prompt.trim().is_empty() {
+            return Ok(PromptRecall {
+                results: Vec::new(),
+                diagnostics: RecallDiagnostics {
+                    rrf_k: RETRIEVAL_RRF_K,
+                    queries: Vec::new(),
+                    results: Vec::new(),
+                },
+            });
+        }
+        let project = self.ensure_project(cwd)?;
+        let Some(context) = self.sessions.recall_context(
+            client,
+            external_session_id,
+            project.as_ref().map(|value| value.id.as_str()),
+        )?
+        else {
+            let (results, diagnostics) = Retriever::new(&self.index).retrieve_intent(
+                &prompt,
+                None,
+                project.as_ref(),
+                limit,
+            )?;
+            return Ok(PromptRecall {
+                results,
+                diagnostics,
+            });
+        };
+        let (results, diagnostics) = Retriever::new(&self.index).retrieve_intent(
+            &prompt,
+            Some(&context),
+            project.as_ref(),
+            limit,
+        )?;
+        Ok(PromptRecall {
+            results,
+            diagnostics,
+        })
+    }
+
     pub fn read(&self, id: Uuid) -> Result<Memory> {
         let memory = self.index.read_memory(&self.markdown, id)?.0;
         self.sessions
@@ -418,11 +480,12 @@ impl Menvane {
     }
 
     pub fn prompt_context(&self, cwd: &Path, prompt: &str, session_key: &str) -> Result<String> {
+        let prompt = CaptureSanitizer::new(self.config.capture.clone())?.sanitize_prompt(prompt);
         if prompt.trim().is_empty() {
             return Ok(String::new());
         }
         let mut memories = Vec::new();
-        for memory in self.recall(cwd, prompt, 20)? {
+        for memory in self.recall(cwd, &prompt, 20)? {
             if self.sessions.claim_injection(session_key, memory.id)? {
                 self.sessions
                     .record_access(memory.id, ReinforcementSignal::Injected)?;
@@ -433,6 +496,32 @@ impl Menvane {
             }
         }
         Ok(format_memory_context("", &memories, 6_000))
+    }
+
+    pub fn prompt_context_for_session(
+        &self,
+        cwd: &Path,
+        client: &str,
+        external_session_id: &str,
+        prompt: &str,
+        session_key: &str,
+    ) -> Result<(String, RecallDiagnostics)> {
+        let recall = self.prompt_recall(cwd, client, external_session_id, prompt, 20)?;
+        let mut memories = Vec::new();
+        for memory in recall.results {
+            if self.sessions.claim_injection(session_key, memory.id)? {
+                self.sessions
+                    .record_access(memory.id, ReinforcementSignal::Injected)?;
+                memories.push(memory);
+            }
+            if memories.len() == 6 {
+                break;
+            }
+        }
+        Ok((
+            format_memory_context("", &memories, 6_000),
+            recall.diagnostics,
+        ))
     }
 
     pub fn set_integration_connected(&self, client: &str, connected: bool) -> Result<()> {

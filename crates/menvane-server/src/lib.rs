@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use fs2::FileExt;
 use menvane_domain::NormalizedEvent;
-use menvane_engine::{CaptureOutcome, Menvane};
+use menvane_engine::{CaptureOutcome, MAX_RECALL_CWD_BYTES, MAX_RECALL_IDENTIFIER_BYTES, Menvane};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -243,6 +243,7 @@ async fn api_search(
 
 #[derive(Deserialize)]
 struct RecallRequest {
+    client: String,
     cwd: String,
     session_id: String,
     kind: String,
@@ -254,14 +255,60 @@ async fn recall(
     State(menvane): State<Arc<Menvane>>,
     Json(request): Json<RecallRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    validate_recall_request(&request)?;
     let cwd = std::path::Path::new(&request.cwd);
-    let context = match request.kind.as_str() {
-        "session-start" => menvane.session_briefing(cwd, &request.session_id),
-        "user-prompt" => menvane.prompt_context(cwd, &request.prompt, &request.session_id),
-        _ => Err(anyhow::anyhow!("unsupported recall kind: {}", request.kind)),
+    let (context, diagnostics) = match request.kind.as_str() {
+        "session-start" => (
+            menvane
+                .session_briefing(cwd, &request.session_id)
+                .map_err(internal_server_error)?,
+            None,
+        ),
+        "user-prompt" => {
+            let (context, diagnostics) = menvane
+                .prompt_context_for_session(
+                    cwd,
+                    &request.client,
+                    &request.session_id,
+                    &request.prompt,
+                    &request.session_id,
+                )
+                .map_err(internal_server_error)?;
+            (context, Some(diagnostics))
+        }
+        _ => {
+            return Err(bad_request(format!(
+                "unsupported recall kind: {}",
+                request.kind
+            )));
+        }
+    };
+    Ok(Json(
+        json!({ "context": context, "diagnostics": diagnostics }),
+    ))
+}
+
+fn validate_recall_request(request: &RecallRequest) -> Result<(), (StatusCode, Json<Value>)> {
+    for (name, value, max_bytes) in [
+        (
+            "client",
+            request.client.as_str(),
+            MAX_RECALL_IDENTIFIER_BYTES,
+        ),
+        (
+            "session_id",
+            request.session_id.as_str(),
+            MAX_RECALL_IDENTIFIER_BYTES,
+        ),
+        ("cwd", request.cwd.as_str(), MAX_RECALL_CWD_BYTES),
+    ] {
+        if value.is_empty() || value.len() > max_bytes || value.contains('\0') {
+            return Err(bad_request(format!(
+                "recall {name} is invalid or too large"
+            )));
+        }
     }
-    .map_err(internal_server_error)?;
-    Ok(Json(json!({ "context": context })))
+    Ok(())
 }
 
 fn internal_server_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
@@ -269,6 +316,10 @@ fn internal_server_error(error: anyhow::Error) -> (StatusCode, Json<Value>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": error.to_string() })),
     )
+}
+
+fn bad_request(message: String) -> (StatusCode, Json<Value>) {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message })))
 }
 
 fn acquire_lock(home: &std::path::Path) -> Result<File> {
@@ -407,6 +458,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn recall_rejects_oversized_identifiers_and_cwd() {
+        let temporary = TempDir::new().unwrap();
+        let state = Arc::new(Menvane::new(temporary.path().join("home")).unwrap());
+        let router = app(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/recall")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "client": "c".repeat(MAX_RECALL_IDENTIFIER_BYTES + 1),
+                    "cwd": "/tmp",
+                    "session_id": "session",
+                    "kind": "user-prompt",
+                    "prompt": "bounded"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/recall")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "client": "client",
+                    "cwd": "/".to_owned() + &"c".repeat(MAX_RECALL_CWD_BYTES),
+                    "session_id": "session",
+                    "kind": "user-prompt",
+                    "prompt": "bounded"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     async fn post_event(router: Router, event: &NormalizedEvent) -> Value {

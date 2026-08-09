@@ -6,6 +6,11 @@ use menvane_domain::{
 use menvane_store::{SessionRecord, SessionRepository};
 use serde::Serialize;
 
+use crate::retriever::{
+    ACTIVE_CONSTRAINT_WEIGHT, ACTIVE_CORRECTION_WEIGHT, ACTIVE_EPISODE_GOAL_WEIGHT,
+    CONVERSATION_ROOT_GOAL_WEIGHT, CURRENT_PROMPT_WEIGHT,
+};
+
 pub const CLASSIFIER_VERSION: &str = "deterministic-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -29,12 +34,12 @@ pub struct ClassifierDiagnostics {
 impl Default for ClassifierWeights {
     fn default() -> Self {
         Self {
-            current_prompt: 1.00,
-            current_correction: 1.00,
-            active_episode_goal: 0.85,
-            active_constraints: 0.80,
+            current_prompt: CURRENT_PROMPT_WEIGHT,
+            current_correction: ACTIVE_CORRECTION_WEIGHT,
+            active_episode_goal: ACTIVE_EPISODE_GOAL_WEIGHT,
+            active_constraints: ACTIVE_CONSTRAINT_WEIGHT,
             refinements: 0.70,
-            conversation_root_goal: 0.35,
+            conversation_root_goal: CONVERSATION_ROOT_GOAL_WEIGHT,
             previous_episodes: 0.10,
             operational_prompts: 0.05,
         }

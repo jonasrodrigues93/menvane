@@ -3,6 +3,10 @@ use menvane_domain::NormalizedEvent;
 use regex::Regex;
 use serde::Deserialize;
 
+pub const MAX_RECALL_PROMPT_BYTES: usize = 16_384;
+pub const MAX_RECALL_IDENTIFIER_BYTES: usize = 512;
+pub const MAX_RECALL_CWD_BYTES: usize = 4_096;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaptureSanitizerConfig {
     #[serde(default = "default_prompt_bytes")]
@@ -63,7 +67,7 @@ impl CaptureSanitizer {
         {
             return None;
         }
-        let prompt_limit = self.config.max_prompt_bytes;
+        let prompt_limit = self.config.max_prompt_bytes.min(MAX_RECALL_PROMPT_BYTES);
         let input_limit = self.config.max_tool_input_bytes;
         let output_limit = self.config.max_tool_output_bytes;
         event.bounded_input = event.bounded_input.map(|value| {
@@ -78,6 +82,13 @@ impl CaptureSanitizer {
             .bounded_output
             .map(|value| self.clean(&value, output_limit));
         Some(event)
+    }
+
+    pub fn sanitize_prompt(&self, value: &str) -> String {
+        self.clean(
+            value,
+            self.config.max_prompt_bytes.min(MAX_RECALL_PROMPT_BYTES),
+        )
     }
 
     fn path_is_ignored(&self, path: &str) -> bool {
@@ -105,11 +116,16 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
     }
-    let mut boundary = max_bytes;
+    let marker = "\n[TRUNCATED]";
+    if max_bytes <= marker.len() {
+        return marker[..max_bytes].to_owned();
+    }
+    let content_limit = max_bytes.saturating_sub(marker.len());
+    let mut boundary = content_limit;
     while !value.is_char_boundary(boundary) {
         boundary -= 1;
     }
-    format!("{}\n[TRUNCATED]", &value[..boundary])
+    format!("{}{}", &value[..boundary], marker)
 }
 
 fn default_prompt_bytes() -> usize {
