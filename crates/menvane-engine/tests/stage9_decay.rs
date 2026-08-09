@@ -43,6 +43,10 @@ fn old_irrelevant_session_is_archived_but_remains_reindexable() {
             None,
         ))
         .unwrap();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(menvane.process_next_job())
+        .unwrap();
     assert_eq!(menvane.gc().unwrap(), 1);
     assert!(
         menvane

@@ -31,7 +31,7 @@ pub async fn serve(menvane: Menvane, address: &str, port: u16) -> Result<()> {
         loop {
             interval.tick().await;
             let _ = maintenance.finalize_idle_sessions();
-            let _ = maintenance.process_next_compilation().await;
+            let _ = maintenance.process_next_job().await;
         }
     });
     let socket: SocketAddr = format!("{address}:{port}").parse()?;
@@ -116,7 +116,6 @@ async fn ingest_event(
         CaptureOutcome::Dropped => "dropped",
         CaptureOutcome::Duplicate => "duplicate",
         CaptureOutcome::Stored => "stored",
-        CaptureOutcome::Finalized => "finalized",
     };
     Ok(Json(json!({ "outcome": outcome })))
 }
@@ -134,7 +133,10 @@ async fn jobs(
                     "status": job.status,
                     "attempt_count": job.attempt_count,
                     "next_retry_at": job.next_retry_at,
-                    "last_error": job.last_error
+                    "last_error": job.last_error,
+                    "owner": job.owner,
+                    "lease_started_at": job.lease_started_at,
+                    "lease_until": job.lease_until
                 })
             })
             .collect(),

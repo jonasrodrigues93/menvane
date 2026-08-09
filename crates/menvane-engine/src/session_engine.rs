@@ -5,7 +5,7 @@ use chrono::{Duration, Utc};
 use menvane_domain::{
     Applicability, Memory, MemoryMetadata, MemoryType, NormalizedEvent, NormalizedEventKind, Scope,
 };
-use menvane_store::SessionRecord;
+use menvane_store::{JobRecord, SessionRecord};
 
 use crate::Menvane;
 
@@ -14,7 +14,6 @@ pub enum CaptureOutcome {
     Dropped,
     Duplicate,
     Stored,
-    Finalized,
 }
 
 pub struct SessionEngine<'a> {
@@ -36,12 +35,7 @@ impl<'a> SessionEngine<'a> {
         if !result.inserted {
             return Ok(CaptureOutcome::Duplicate);
         }
-        if result.should_finalize {
-            self.finalize_session(&result.session)?;
-            Ok(CaptureOutcome::Finalized)
-        } else {
-            Ok(CaptureOutcome::Stored)
-        }
+        Ok(CaptureOutcome::Stored)
     }
 
     pub fn finalize_idle(&self, idle_seconds: u64) -> Result<usize> {
@@ -50,14 +44,29 @@ impl<'a> SessionEngine<'a> {
             .menvane
             .sessions
             .finalize_idle_before(Utc::now() - Duration::seconds(seconds))?;
-        for session in &sessions {
-            self.finalize_session(session)?;
-        }
         Ok(sessions.len())
     }
 
-    fn finalize_session(&self, session: &SessionRecord) -> Result<()> {
-        if session.markdown_path.is_some() {
+    pub fn finalize_job(&self, job: &JobRecord) -> Result<()> {
+        let session_id = job.dedupe_key.parse()?;
+        let session = self.menvane.sessions.session(session_id)?;
+        self.finalize_session(&session, job)
+    }
+
+    fn finalize_session(&self, session: &SessionRecord, job: &JobRecord) -> Result<()> {
+        if let Some(path) = &session.markdown_path {
+            let memory = self
+                .menvane
+                .index
+                .read_memory(&self.menvane.markdown, session.id)?
+                .0;
+            self.menvane.sessions.mark_finalized(
+                session.id,
+                path,
+                is_session_worth_compiling(&memory),
+                job.id,
+                job.owner.as_deref().unwrap_or_default(),
+            )?;
             return Ok(());
         }
         let events = self.menvane.sessions.events(session.id)?;
@@ -113,6 +122,8 @@ impl<'a> SessionEngine<'a> {
             session.id,
             &path,
             is_session_worth_compiling(&memory),
+            job.id,
+            job.owner.as_deref().unwrap_or_default(),
         )?;
         self.menvane
             .markdown

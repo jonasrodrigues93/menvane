@@ -136,6 +136,56 @@ fn reindex_replaces_only_the_derived_index() {
 }
 
 #[test]
+fn stale_running_jobs_are_recovered_and_released_atomically() {
+    let temporary = TempDir::new().unwrap();
+    let repository = SessionRepository::new(temporary.path().join("state.sqlite"));
+    repository.initialize().unwrap();
+    repository
+        .ingest(
+            &event(
+                "stale-start",
+                "stale-session",
+                NormalizedEventKind::SessionStarted,
+                Path::new("/tmp/menvane-stale-project"),
+            ),
+            None,
+        )
+        .unwrap();
+    repository
+        .ingest(
+            &event(
+                "stale-end",
+                "stale-session",
+                NormalizedEventKind::SessionEnded,
+                Path::new("/tmp/menvane-stale-project"),
+            ),
+            None,
+        )
+        .unwrap();
+    let claimed_at = Utc::now();
+    let first = repository
+        .claim_job_at("crashed-worker", 30, claimed_at)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.status, "running");
+    assert_eq!(first.owner.as_deref(), Some("crashed-worker"));
+    let recovered = repository
+        .claim_job_at(
+            "restarted-worker",
+            30,
+            claimed_at + chrono::Duration::seconds(31),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.id, first.id);
+    assert_eq!(recovered.owner.as_deref(), Some("restarted-worker"));
+    assert_eq!(
+        recovered.lease_started_at,
+        Some(claimed_at + chrono::Duration::seconds(31))
+    );
+}
+
+#[test]
 fn backup_restore_round_trips_index_and_state_databases() {
     let temporary = TempDir::new().unwrap();
     let home = temporary.path().join("home");

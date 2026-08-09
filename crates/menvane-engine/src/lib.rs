@@ -80,6 +80,7 @@ pub struct Menvane {
     index: IndexStore,
     sessions: SessionRepository,
     config: MenvaneConfig,
+    worker_owner: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +89,8 @@ struct MenvaneConfig {
     capture: CaptureSanitizerConfig,
     #[serde(default)]
     sessions: SessionConfiguration,
+    #[serde(default)]
+    jobs: JobConfiguration,
     #[serde(default)]
     llm: LlmConfiguration,
 }
@@ -169,6 +172,24 @@ fn default_idle_finalize_seconds() -> u64 {
     120
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct JobConfiguration {
+    #[serde(default = "default_job_lease_timeout_seconds")]
+    lease_timeout_seconds: u64,
+}
+
+impl Default for JobConfiguration {
+    fn default() -> Self {
+        Self {
+            lease_timeout_seconds: default_job_lease_timeout_seconds(),
+        }
+    }
+}
+
+fn default_job_lease_timeout_seconds() -> u64 {
+    300
+}
+
 impl Menvane {
     pub fn from_environment() -> Result<Self> {
         let home = match env::var_os("MENVANE_HOME") {
@@ -196,6 +217,7 @@ impl Menvane {
             index,
             sessions,
             config,
+            worker_owner: Uuid::now_v7().to_string(),
         })
     }
 
@@ -827,14 +849,28 @@ impl Menvane {
     }
 
     pub async fn process_next_compilation(&self) -> Result<bool> {
-        let Some(job) = self.sessions.claim_compile_job()? else {
+        self.process_next_job().await
+    }
+
+    pub async fn process_next_job(&self) -> Result<bool> {
+        let Some(job) = self
+            .sessions
+            .claim_job(&self.worker_owner, self.config.jobs.lease_timeout_seconds)?
+        else {
             return Ok(false);
         };
-        let session_id = Uuid::parse_str(&job.dedupe_key)?;
         let result = async {
+            if job.job_type == "finalize_session" {
+                SessionEngine::new(self).finalize_job(&job)?;
+                return Ok(None);
+            }
+            if job.job_type != "compile_session" {
+                bail!("unsupported job type: {}", job.job_type);
+            }
+            let session_id = Uuid::parse_str(&job.dedupe_key)?;
             let session = self.index.read_memory(&self.markdown, session_id)?.0;
             if !is_session_worth_compiling(&session) {
-                return Ok((Vec::new(), "skipped".to_owned()));
+                return Ok(Some("skipped".to_owned()));
             }
             let events = self.sessions.events(session_id)?;
             let (cwd, technology_profile) =
@@ -896,30 +932,41 @@ impl Menvane {
                 })
                 .filter_map(|event| event.tool_family.clone())
                 .collect();
-            self.compile_and_store(
-                &cwd,
-                CompilationInput {
-                    session_summary: session.body,
-                    important_prompts,
-                    important_tool_events,
-                    errors,
-                    decisions: Vec::new(),
-                    validation_results,
-                    existing_related_memories: Vec::new(),
-                    technology_profile,
-                    source_session: Some(session_id),
-                },
-            )
-            .await
+            let (_, provider) = self
+                .compile_and_store(
+                    &cwd,
+                    CompilationInput {
+                        session_summary: session.body,
+                        important_prompts,
+                        important_tool_events,
+                        errors,
+                        decisions: Vec::new(),
+                        validation_results,
+                        existing_related_memories: Vec::new(),
+                        technology_profile,
+                        source_session: Some(session_id),
+                    },
+                )
+                .await?;
+            Ok(Some(provider))
         }
         .await;
         match result {
-            Ok((_, provider)) => {
-                self.sessions.finish_job(job.id, Some(&provider), None)?;
+            Ok(provider) => {
+                self.sessions.finish_job(
+                    job.id,
+                    job.owner.as_deref().unwrap_or_default(),
+                    provider.as_deref(),
+                    None,
+                )?;
             }
             Err(error) => {
-                self.sessions
-                    .finish_job(job.id, None, Some(&error.to_string()))?;
+                self.sessions.finish_job(
+                    job.id,
+                    job.owner.as_deref().unwrap_or_default(),
+                    None,
+                    Some(&error.to_string()),
+                )?;
             }
         }
         Ok(true)
@@ -948,6 +995,25 @@ impl Menvane {
         candidate: CompiledMemory,
         source_session: Option<Uuid>,
     ) -> Result<Uuid> {
+        if let Some(memory) = self.all_memories()?.into_iter().find(|memory| {
+            memory.metadata.memory_type == candidate.memory_type
+                && memory.metadata.scope == candidate.scope
+                && normalize_markdown(&memory.body) == normalize_markdown(&candidate.body)
+                && (memory.title.eq_ignore_ascii_case(&candidate.title)
+                    || source_session.is_some_and(|source_session| {
+                        memory.metadata.source_sessions.contains(&source_session)
+                    }))
+        }) {
+            let (mut memory, path) = self.index.read_memory(&self.markdown, memory.metadata.id)?;
+            if let Some(source_session) = source_session
+                && !memory.metadata.source_sessions.contains(&source_session)
+            {
+                memory.metadata.source_sessions.push(source_session);
+                self.markdown.update_memory(&path, &memory)?;
+                self.index.upsert_memory(&memory, &path)?;
+            }
+            return Ok(memory.metadata.id);
+        }
         let scope = match candidate.scope {
             Scope::Global => ScopeSelection::Global,
             Scope::Project => ScopeSelection::Project,
@@ -1369,4 +1435,45 @@ fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use menvane_domain::{Applicability, MemoryType, Scope};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn repeated_compilation_storage_reuses_source_session_memory() {
+        let temporary = TempDir::new().unwrap();
+        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+        let source_session = Uuid::from_u128(41);
+        let candidate = CompiledMemory {
+            memory_type: MemoryType::Fact,
+            title: "Retry-safe compilation".to_owned(),
+            scope: Scope::Global,
+            scope_confidence: 1.0,
+            confidence: 0.9,
+            applies_to: Applicability::default(),
+            body: "The same compilation result is applied once.".to_owned(),
+            evidence: vec!["event-1".to_owned()],
+        };
+        let first = menvane
+            .store_compiled_memory(temporary.path(), candidate.clone(), Some(source_session))
+            .unwrap();
+        let second = menvane
+            .store_compiled_memory(temporary.path(), candidate, Some(source_session))
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            menvane
+                .all_memories()
+                .unwrap()
+                .into_iter()
+                .filter(|memory| memory.metadata.id == first)
+                .count(),
+            1
+        );
+    }
 }

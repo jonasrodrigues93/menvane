@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.7.0
+Version: 1.8.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -63,15 +63,15 @@ Clients send a normalized vocabulary of session-started, user-prompt, tool-compl
 
 Capture removes authentication headers, likely API keys and tokens, bounds prompts and tool inputs and outputs, and drops reliably attributed ignored paths before persistence. Default limits are 16,384 bytes for prompts and 4,096 bytes for tool input and output. Default ignored paths include environment files, secret directories, and SSH directories. Menvane never captures private model reasoning.
 
-Sessions are open, idle, or finalized. Session end finalizes immediately. Turn stop marks idle, and idle sessions finalize after 120 seconds by default. Events arriving after finalization reuse the external session identifier in a new generation and process only new evidence.
+Sessions are open, idle, or finalized. Session end queues deterministic finalization without waiting for background work. Turn stop marks idle, and idle sessions queue finalization after 120 seconds by default. Events arriving after finalization reuse the external session identifier in a new generation and process only new evidence.
 
-Finalization writes concise episodic Markdown containing the goal, outcome, important actions, explicit deterministic evidence, errors, validation, and involved files. It does not copy complete transcripts or tool outputs. Finalization is idempotent and queues compilation without requiring an available language-model provider.
+Finalization writes concise episodic Markdown containing the goal, outcome, important actions, explicit deterministic evidence, errors, validation, and involved files. It does not copy complete transcripts or tool outputs. Finalization is asynchronous, idempotent, and recoverable through the daemon worker; it queues compilation without requiring an available language-model provider.
 
 ## Daemon And REST
 
 `menvane serve` runs the Axum daemon on `127.0.0.1:47831` by default. A per-home process lock prevents duplicate daemons. `menvane daemon start`, `stop`, `restart`, and `status` manage the background process.
 
-The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, and error fields; capture does not wait for compiler work.
+The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, error fields, an owner, and a configurable 300-second lease timeout by default. The daemon worker claims finalization and compilation jobs, recovers expired leases after restart, and retries both paths idempotently; capture does not wait for background work.
 
 ## Claude Code Integration
 
@@ -159,7 +159,7 @@ REST endpoints under `/api/v1` cover health, projects, memories, sessions, impor
 
 `menvane backup <path>` creates a new backup directory containing the complete Markdown memory repository, non-secret configuration, consistent SQLite online backups of both `index.sqlite` and `state.sqlite`, and a checksummed manifest. Existing destinations are never overwritten. `menvane restore <path> --confirm` verifies every checksum, configuration, Markdown frontmatter, and both SQLite databases independently before staging and replacing current state. Restore refuses to run while a daemon PID is present and never replaces state without explicit confirmation.
 
-Daemon startup uses one process lock per Menvane home, graceful shutdown, idle-session recovery, WAL, bounded waits, and idempotent event and job keys. Atomic Markdown writes and derived-index reindex permit reconciliation after interrupted index updates without removing operational state. Git durable-history writes are serialized independently from concurrent capture.
+Daemon startup uses one process lock per Menvane home, graceful shutdown, idle-session recovery, WAL, bounded waits, leased job ownership, and idempotent event and job keys. Atomic Markdown writes and derived-index reindex permit reconciliation after interrupted index updates without removing operational state. Git durable-history writes are serialized independently from concurrent capture.
 
 Release builds target Linux, macOS, and WSL as Linux. The repository CI runs formatting, Clippy, all tests, and release builds without real Codex authentication, OpenRouter credentials, or paid APIs. Runtime provider status may use local non-paid health interfaces; deterministic fake providers and mock servers cover CI behavior.
 

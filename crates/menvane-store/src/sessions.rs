@@ -177,6 +177,9 @@ pub struct JobRecord {
     pub next_retry_at: DateTime<Utc>,
     pub last_error: Option<String>,
     pub dedupe_key: String,
+    pub owner: Option<String>,
+    pub lease_started_at: Option<DateTime<Utc>>,
+    pub lease_until: Option<DateTime<Utc>>,
 }
 
 pub struct IntegrationRecord {
@@ -335,27 +338,36 @@ impl SessionRepository {
         session_id: Uuid,
         markdown_path: &Path,
         enqueue_compile: bool,
+        job_id: Uuid,
+        owner: &str,
     ) -> Result<()> {
-        let connection = self.open()?;
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339();
-        connection.execute(
+        transaction.execute(
             "UPDATE sessions SET markdown_path=?1 WHERE id=?2",
             params![markdown_path.to_string_lossy(), session_id.to_string()],
         )?;
-        connection.execute(
-            "UPDATE jobs SET status='completed', updated_at=?1 WHERE job_type='finalize_session' AND dedupe_key=?2",
-            params![now, session_id.to_string()],
+        transaction.execute(
+            "UPDATE jobs SET status='completed', owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE id=?2 AND status='running' AND owner=?3",
+            params![now, job_id.to_string(), owner],
         )?;
         if enqueue_compile {
-            enqueue_job_connection(&connection, "compile_session", &session_id.to_string())?;
+            enqueue_job(&transaction, "compile_session", &session_id.to_string())?;
         }
+        transaction.commit()?;
         Ok(())
+    }
+
+    pub fn session(&self, id: Uuid) -> Result<SessionRecord> {
+        let connection = self.open()?;
+        session_by_id(&connection, id)
     }
 
     pub fn jobs(&self) -> Result<Vec<JobRecord>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT id, job_type, status, attempt_count, next_retry_at, last_error, dedupe_key FROM jobs ORDER BY created_at",
+            "SELECT id, job_type, status, attempt_count, next_retry_at, last_error, dedupe_key, owner, lease_started_at, lease_until FROM jobs ORDER BY created_at",
         )?;
         let rows = statement.query_map([], |row| {
             let id: String = row.get(0)?;
@@ -368,10 +380,24 @@ impl SessionRepository {
                 next_retry_at,
                 row.get(5)?,
                 row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
             ))
         })?;
         rows.map(|row| {
-            let (id, job_type, status, attempt_count, next_retry_at, last_error, dedupe_key) = row?;
+            let (
+                id,
+                job_type,
+                status,
+                attempt_count,
+                next_retry_at,
+                last_error,
+                dedupe_key,
+                owner,
+                lease_started_at,
+                lease_until,
+            ) = row?;
             Ok(JobRecord {
                 id: Uuid::parse_str(&id)?,
                 job_type,
@@ -380,6 +406,9 @@ impl SessionRepository {
                 next_retry_at: DateTime::parse_from_rfc3339(&next_retry_at)?.with_timezone(&Utc),
                 last_error,
                 dedupe_key,
+                owner,
+                lease_started_at: parse_optional_timestamp(lease_started_at)?,
+                lease_until: parse_optional_timestamp(lease_until)?,
             })
         })
         .collect()
@@ -401,13 +430,28 @@ impl SessionRepository {
         Ok(())
     }
 
-    pub fn claim_compile_job(&self) -> Result<Option<JobRecord>> {
+    pub fn claim_job(&self, owner: &str, lease_timeout_seconds: u64) -> Result<Option<JobRecord>> {
+        self.claim_job_at(owner, lease_timeout_seconds, Utc::now())
+    }
+
+    pub fn claim_job_at(
+        &self,
+        owner: &str,
+        lease_timeout_seconds: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<JobRecord>> {
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_text = now.to_rfc3339();
+        let lease_until = now + chrono::Duration::seconds(i64::try_from(lease_timeout_seconds)?);
+        transaction.execute(
+            "UPDATE jobs SET status='pending', owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE status='running' AND (lease_until IS NULL OR lease_until <= ?1)",
+            [&now_text],
+        )?;
         let id: Option<String> = transaction
             .query_row(
-                "SELECT id FROM jobs WHERE job_type='compile_session' AND status='pending' AND next_retry_at <= ?1 ORDER BY created_at LIMIT 1",
-                [Utc::now().to_rfc3339()],
+                "SELECT id FROM jobs WHERE status='pending' AND next_retry_at <= ?1 ORDER BY CASE WHEN job_type='finalize_session' THEN 0 ELSE 1 END, created_at LIMIT 1",
+                [&now_text],
                 |row| row.get(0),
             )
             .optional()?;
@@ -416,13 +460,24 @@ impl SessionRepository {
             return Ok(None);
         };
         transaction.execute(
-            "UPDATE jobs SET status='running', attempt_count=attempt_count+1, updated_at=?1 WHERE id=?2",
-            params![Utc::now().to_rfc3339(), id],
+            "UPDATE jobs SET status='running', owner=?1, lease_started_at=?2, lease_until=?3, attempt_count=attempt_count+1, updated_at=?2 WHERE id=?4 AND status='pending'",
+            params![owner, now_text, lease_until.to_rfc3339(), id],
         )?;
         let job = transaction.query_row(
-            "SELECT id, job_type, status, attempt_count, next_retry_at, last_error, dedupe_key FROM jobs WHERE id=?1",
+            "SELECT id, job_type, status, attempt_count, next_retry_at, last_error, dedupe_key, owner, lease_started_at, lease_until FROM jobs WHERE id=?1",
             [&id],
-            |row| Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, String>(4)?, row.get(5)?, row.get(6)?)),
+            |row| Ok((
+                row.get::<_, String>(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, String>(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            )),
         )?;
         transaction.commit()?;
         Ok(Some(JobRecord {
@@ -433,16 +488,30 @@ impl SessionRepository {
             next_retry_at: DateTime::parse_from_rfc3339(&job.4)?.with_timezone(&Utc),
             last_error: job.5,
             dedupe_key: job.6,
+            owner: job.7,
+            lease_started_at: parse_optional_timestamp(job.8)?,
+            lease_until: parse_optional_timestamp(job.9)?,
         }))
     }
 
-    pub fn finish_job(&self, id: Uuid, provider: Option<&str>, error: Option<&str>) -> Result<()> {
+    pub fn finish_job(
+        &self,
+        id: Uuid,
+        owner: &str,
+        provider: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
         let connection = self.open()?;
-        let job = connection.query_row(
-            "SELECT attempt_count FROM jobs WHERE id=?1",
-            [id.to_string()],
-            |row| row.get::<_, u32>(0),
-        )?;
+        let job: Option<u32> = connection
+            .query_row(
+                "SELECT attempt_count FROM jobs WHERE id=?1 AND status='running' AND owner=?2",
+                params![id.to_string(), owner],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(job) = job else {
+            return Ok(());
+        };
         let (status, next_retry_at) = if error.is_none() {
             ("completed", Utc::now())
         } else if job < 5 {
@@ -452,8 +521,8 @@ impl SessionRepository {
             ("failed", Utc::now())
         };
         connection.execute(
-            "UPDATE jobs SET status=?1, next_retry_at=?2, last_error=?3, provider=?4, updated_at=?5 WHERE id=?6",
-            params![status, next_retry_at.to_rfc3339(), error, provider, Utc::now().to_rfc3339(), id.to_string()],
+            "UPDATE jobs SET status=?1, next_retry_at=?2, last_error=?3, provider=?4, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?5 WHERE id=?6 AND status='running' AND owner=?7",
+            params![status, next_retry_at.to_rfc3339(), error, provider, Utc::now().to_rfc3339(), id.to_string(), owner],
         )?;
         Ok(())
     }
@@ -788,6 +857,10 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
         migrate_to_version_2(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (2)", [])?;
     }
+    if current < 3 {
+        migrate_to_version_3(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (3)", [])?;
+    }
     Ok(())
 }
 
@@ -868,6 +941,28 @@ fn migrate_to_version_2(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_version_3(connection: &Connection) -> Result<()> {
+    for column in ["owner", "lease_started_at", "lease_until"] {
+        let exists: Option<()> = connection
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('jobs') WHERE name=?1",
+                [column],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if exists.is_none() {
+            connection.execute(&format!("ALTER TABLE jobs ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+    connection.execute(
+        "UPDATE jobs
+         SET status='pending', owner=NULL, lease_started_at=NULL, lease_until=NULL
+         WHERE status='running'",
+        [],
+    )?;
+    Ok(())
+}
+
 fn state_after_event(current: SessionState, event: NormalizedEventKind) -> SessionState {
     match event {
         NormalizedEventKind::SessionEnded => SessionState::Finalized,
@@ -912,6 +1007,12 @@ fn parse_session_state(value: &str) -> std::io::Result<SessionState> {
 
 fn parse_timestamp(value: &str) -> std::result::Result<DateTime<Utc>, chrono::ParseError> {
     DateTime::parse_from_rfc3339(value).map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn parse_optional_timestamp(
+    value: Option<String>,
+) -> std::result::Result<Option<DateTime<Utc>>, chrono::ParseError> {
+    value.map(|value| parse_timestamp(&value)).transpose()
 }
 
 fn sql_conversion_error(error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {

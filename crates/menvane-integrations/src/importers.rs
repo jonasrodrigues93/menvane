@@ -490,6 +490,10 @@ mod tests {
             menvane.import_session(scan.sessions[0].clone()).unwrap(),
             ImportOutcome::AlreadyImported
         );
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(menvane.process_next_job())
+            .unwrap();
         let results = menvane
             .search_with_sessions(
                 &project,
