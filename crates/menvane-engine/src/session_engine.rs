@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration as StdDuration;
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
@@ -34,8 +36,33 @@ impl<'a> SessionEngine<'a> {
             .sessions
             .ingest(&event, project.as_ref().map(|project| project.id.as_str()))?;
         IntentEngine::new(&self.menvane.sessions).classify(&event, &result.session)?;
+        let episode_id = self
+            .menvane
+            .sessions
+            .associate_event_with_active_episode(&event.event_id)?;
         if !result.inserted {
             return Ok(CaptureOutcome::Duplicate);
+        }
+        if let Some(episode_id) = episode_id
+            && let Some(debounce) = checkpoint_debounce(
+                &event,
+                self.menvane
+                    .config
+                    .handoff
+                    .nonvalidation_tool_debounce_seconds,
+            )
+        {
+            if debounce.is_zero() {
+                self.menvane
+                    .sessions
+                    .mark_handoff_dirty(episode_id, debounce)?;
+            } else {
+                self.menvane.sessions.mark_handoff_dirty_at(
+                    episode_id,
+                    debounce,
+                    event.timestamp,
+                )?;
+            }
         }
         Ok(CaptureOutcome::Stored)
     }
@@ -46,6 +73,21 @@ impl<'a> SessionEngine<'a> {
             .menvane
             .sessions
             .finalize_idle_before(Utc::now() - Duration::seconds(seconds))?;
+        let mut episodes = BTreeSet::new();
+        for session in &sessions {
+            for event in self
+                .menvane
+                .sessions
+                .episode_events_for_session(session.id)?
+            {
+                episodes.insert(event);
+            }
+        }
+        for episode_id in episodes {
+            self.menvane
+                .sessions
+                .mark_handoff_dirty(episode_id, StdDuration::ZERO)?;
+        }
         Ok(sessions.len())
     }
 
@@ -132,6 +174,32 @@ impl<'a> SessionEngine<'a> {
             .commit(&format!("feat(session): finalize {}", session.id));
         Ok(())
     }
+}
+
+fn checkpoint_debounce(event: &NormalizedEvent, nonvalidation_seconds: u64) -> Option<StdDuration> {
+    match event.kind {
+        NormalizedEventKind::UserPrompt => event
+            .bounded_input
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|_| StdDuration::ZERO),
+        NormalizedEventKind::ToolCompleted => Some(
+            if event.tool_family.as_deref().is_some_and(is_validation_tool) {
+                StdDuration::ZERO
+            } else {
+                StdDuration::from_secs(nonvalidation_seconds)
+            },
+        ),
+        NormalizedEventKind::ContextCompacted
+        | NormalizedEventKind::TurnStopped
+        | NormalizedEventKind::SessionEnded => Some(StdDuration::ZERO),
+        NormalizedEventKind::SessionStarted => None,
+    }
+}
+
+fn is_validation_tool(tool: &str) -> bool {
+    let tool = tool.to_ascii_lowercase();
+    tool.contains("test") || tool.contains("build") || tool.contains("check")
 }
 
 fn session_title(session: &SessionRecord, events: &[NormalizedEvent]) -> String {

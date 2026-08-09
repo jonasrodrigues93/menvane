@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS session_events (
     FOREIGN KEY(session_id) REFERENCES sessions(id)
 );
 CREATE INDEX IF NOT EXISTS session_events_session ON session_events(session_id, timestamp, event_id);
+CREATE TABLE IF NOT EXISTS event_episode_links (
+    event_id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES session_events(event_id),
+    FOREIGN KEY(episode_id) REFERENCES task_episodes(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS event_episode_links_episode ON event_episode_links(episode_id, event_id);
 CREATE TABLE IF NOT EXISTS observations (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -226,7 +234,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_state (
     last_checkpoint_at TEXT,
     revision INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
-    FOREIGN KEY(episode_id) REFERENCES task_episodes(id)
+    FOREIGN KEY(episode_id) REFERENCES task_episodes(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS operational_migration_markers (
     migration TEXT NOT NULL,
@@ -299,6 +307,7 @@ const OPERATIONAL_TABLES: &[(&str, &str)] = &[
         "task_episodes",
         "id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at",
     ),
+    ("event_episode_links", "event_id, episode_id, linked_at"),
     (
         "prompt_intents",
         "event_id, episode_id, conversation_key, kind, confidence, weight, classifier_version, source, classified_at",
@@ -339,6 +348,16 @@ pub struct SessionRecord {
     pub markdown_path: Option<PathBuf>,
     pub imported: bool,
     pub conversation_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EpisodeEvent {
+    pub event: NormalizedEvent,
+    pub session_id: Uuid,
+    pub generation: u32,
+    pub client: String,
+    pub external_session_id: String,
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -556,6 +575,108 @@ impl SessionRepository {
         )?;
         let rows = statement.query_map([session_id.to_string()], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn associate_event_with_active_episode(&self, event_id: &str) -> Result<Option<Uuid>> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let event: Option<(String, Option<String>, String)> = transaction
+            .query_row(
+                "SELECT s.conversation_key, s.project_id, s.id FROM session_events e JOIN sessions s ON s.id=e.session_id WHERE e.event_id=?1",
+                [event_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((conversation_key, project_id, _session_id)) = event else {
+            return Ok(None);
+        };
+        let episode: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM task_episodes WHERE conversation_key=?1 AND project_id IS ?2 AND state='active' ORDER BY ordinal DESC, id DESC LIMIT 1",
+                params![conversation_key, project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(episode_id) = episode else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute(
+            "INSERT OR IGNORE INTO event_episode_links(event_id, episode_id, linked_at) VALUES (?1, ?2, ?3)",
+            params![event_id, episode_id, Utc::now().to_rfc3339()],
+        )?;
+        let linked: String = transaction.query_row(
+            "SELECT episode_id FROM event_episode_links WHERE event_id=?1",
+            [event_id],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(Some(Uuid::parse_str(&linked)?))
+    }
+
+    pub fn event_episode(&self, event_id: &str) -> Result<Option<Uuid>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT episode_id FROM event_episode_links WHERE event_id=?1",
+                [event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn episode_events(&self, episode_id: Uuid) -> Result<Vec<EpisodeEvent>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT e.payload_json, s.id, s.generation, s.client, s.external_session_id, s.project_id FROM event_episode_links l JOIN session_events e ON e.event_id=l.event_id JOIN sessions s ON s.id=e.session_id WHERE l.episode_id=?1 ORDER BY e.timestamp, e.event_id",
+        )?;
+        let rows = statement.query_map([episode_id.to_string()], |row| {
+            let payload: String = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let event = serde_json::from_str(&payload).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok((
+                event,
+                session_id,
+                row.get::<_, u32>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (event, session_id, generation, client, external_session_id, project_id) = row?;
+            Ok(EpisodeEvent {
+                event,
+                session_id: Uuid::parse_str(&session_id).map_err(sql_conversion_error)?,
+                generation,
+                client,
+                external_session_id,
+                project_id,
+            })
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()
+        .map_err(Into::into)
+    }
+
+    pub fn episode_events_for_session(&self, session_id: Uuid) -> Result<Vec<Uuid>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT l.episode_id FROM event_episode_links l JOIN session_events e ON e.event_id=l.event_id WHERE e.session_id=?1 ORDER BY l.episode_id",
+        )?;
+        let rows = statement.query_map([session_id.to_string()], |row| {
+            let episode_id: String = row.get(0)?;
+            Uuid::parse_str(&episode_id).map_err(sql_conversion_error)
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn finalize_idle_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<SessionRecord>> {
@@ -859,20 +980,21 @@ impl SessionRepository {
         if let Some(current_id) = current_id {
             let current = handoff_by_id(&transaction, Uuid::parse_str(&current_id)?)?;
             if current.id == handoff.id {
-                let mut comparable = handoff.clone();
-                comparable.created_at = current.created_at;
-                if current.status == HandoffStatus::Consumed {
-                    comparable.status = HandoffStatus::Consumed;
+                let mut next = handoff.clone();
+                next.created_at = current.created_at;
+                if current.status == HandoffStatus::Consumed
+                    && same_handoff_content(&current, &next)
+                {
+                    transaction.commit()?;
+                    return Ok(current);
                 }
-                if current == comparable {
+                if current == next {
                     transaction.commit()?;
                     return Ok(current);
                 }
                 if !is_current_handoff_status(current.status) {
                     bail!("terminal handoff cannot be updated");
                 }
-                let mut next = comparable;
-                next.created_at = current.created_at;
                 store_handoff_revision(&transaction, &current)?;
                 update_handoff(
                     &transaction,
@@ -1114,6 +1236,34 @@ impl SessionRepository {
         Ok(state)
     }
 
+    pub fn requeue_checkpoint_job(&self, episode_id: Uuid) -> Result<()> {
+        let connection = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "UPDATE jobs SET status='pending', next_retry_at=?1, last_error=NULL, provider=NULL, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE job_type='checkpoint_handoff' AND dedupe_key=?2 AND status IN ('completed', 'failed')",
+            params![now, episode_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn prepare_checkpoint_flush(&self) -> Result<()> {
+        let connection = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "UPDATE jobs SET status='pending', next_retry_at=?1, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE job_type='checkpoint_handoff' AND status IN ('pending', 'running')",
+            [&now],
+        )?;
+        connection.execute(
+            "UPDATE jobs SET status='pending', attempt_count=0, next_retry_at=?1, last_error=NULL, provider=NULL, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE job_type='checkpoint_handoff' AND status IN ('completed', 'failed') AND EXISTS (SELECT 1 FROM checkpoint_state WHERE dirty=1 AND episode_id=jobs.dedupe_key)",
+            [&now],
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO jobs(id, job_type, dedupe_key, status, payload_json, next_retry_at, created_at, updated_at) SELECT lower(hex(randomblob(16))), 'checkpoint_handoff', episode_id, 'pending', json_object('episode_id', episode_id), ?1, ?1, ?1 FROM checkpoint_state WHERE dirty=1",
+            [&now],
+        )?;
+        Ok(())
+    }
+
     pub fn consume_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
         self.update_handoff_lifecycle(id, HandoffStatus::Consumed)
     }
@@ -1345,6 +1495,25 @@ impl SessionRepository {
         lease_timeout_seconds: u64,
         now: DateTime<Utc>,
     ) -> Result<Option<JobRecord>> {
+        self.claim_job_at_with_type(owner, lease_timeout_seconds, now, None)
+    }
+
+    pub fn claim_job_of_type(
+        &self,
+        owner: &str,
+        lease_timeout_seconds: u64,
+        job_type: &str,
+    ) -> Result<Option<JobRecord>> {
+        self.claim_job_at_with_type(owner, lease_timeout_seconds, Utc::now(), Some(job_type))
+    }
+
+    fn claim_job_at_with_type(
+        &self,
+        owner: &str,
+        lease_timeout_seconds: u64,
+        now: DateTime<Utc>,
+        job_type: Option<&str>,
+    ) -> Result<Option<JobRecord>> {
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now_text = now.to_rfc3339();
@@ -1353,13 +1522,23 @@ impl SessionRepository {
             "UPDATE jobs SET status='pending', owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE status='running' AND (lease_until IS NULL OR lease_until <= ?1)",
             [&now_text],
         )?;
-        let id: Option<String> = transaction
-            .query_row(
-                "SELECT id FROM jobs WHERE status='pending' AND next_retry_at <= ?1 ORDER BY CASE WHEN job_type='finalize_session' THEN 0 ELSE 1 END, created_at LIMIT 1",
-                [&now_text],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let id: Option<String> = if let Some(job_type) = job_type {
+            transaction
+                .query_row(
+                    "SELECT id FROM jobs WHERE status='pending' AND job_type=?2 AND next_retry_at <= ?1 ORDER BY created_at LIMIT 1",
+                    params![now_text, job_type],
+                    |row| row.get(0),
+                )
+                .optional()?
+        } else {
+            transaction
+                .query_row(
+                    "SELECT id FROM jobs WHERE status='pending' AND next_retry_at <= ?1 ORDER BY CASE WHEN job_type='finalize_session' THEN 0 ELSE 1 END, created_at LIMIT 1",
+                    [&now_text],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
         let Some(id) = id else {
             transaction.commit()?;
             return Ok(None);
@@ -1991,11 +2170,18 @@ fn validate_handoff_event(
     }
     let assigned_episode: Option<String> = transaction
         .query_row(
-            "SELECT episode_id FROM prompt_intents WHERE event_id=?1",
+            "SELECT episode_id FROM event_episode_links WHERE event_id=?1",
             [event_id],
             |row| row.get(0),
         )
-        .optional()?;
+        .optional()?
+        .or(transaction
+            .query_row(
+                "SELECT episode_id FROM prompt_intents WHERE event_id=?1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .optional()?);
     let episode_id = handoff.episode_id.to_string();
     if assigned_episode
         .as_deref()
@@ -2195,6 +2381,16 @@ fn is_current_handoff_status(status: HandoffStatus) -> bool {
         status,
         HandoffStatus::Active | HandoffStatus::Ready | HandoffStatus::Consumed
     )
+}
+
+fn same_handoff_content(left: &TaskHandoff, right: &TaskHandoff) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.status = HandoffStatus::Active;
+    right.status = HandoffStatus::Active;
+    left.created_at = right.created_at;
+    left.updated_at = right.updated_at;
+    left == right
 }
 
 fn handoff_status(status: HandoffStatus) -> &'static str {
@@ -2494,6 +2690,10 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
         migrate_to_version_8(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (8)", [])?;
     }
+    if current < 9 {
+        migrate_to_version_9(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (9)", [])?;
+    }
     Ok(())
 }
 
@@ -2753,7 +2953,7 @@ fn migrate_to_version_7(connection: &Connection) -> Result<()> {
              last_checkpoint_at TEXT,
              revision INTEGER NOT NULL DEFAULT 0,
              updated_at TEXT NOT NULL,
-             FOREIGN KEY(episode_id) REFERENCES task_episodes(id)
+             FOREIGN KEY(episode_id) REFERENCES task_episodes(id) ON DELETE CASCADE
          );",
     )?;
     Ok(())
@@ -2773,6 +2973,20 @@ fn migrate_to_version_8(connection: &Connection) -> Result<()> {
             [],
         )?;
     }
+    Ok(())
+}
+
+fn migrate_to_version_9(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS event_episode_links (
+             event_id TEXT PRIMARY KEY,
+             episode_id TEXT NOT NULL,
+             linked_at TEXT NOT NULL,
+             FOREIGN KEY(event_id) REFERENCES session_events(event_id),
+             FOREIGN KEY(episode_id) REFERENCES task_episodes(id) ON DELETE CASCADE
+         );
+         CREATE INDEX IF NOT EXISTS event_episode_links_episode ON event_episode_links(episode_id, event_id);",
+    )?;
     Ok(())
 }
 

@@ -32,6 +32,26 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
             None,
         )
         .unwrap();
+    let prompt = legacy
+        .ingest(
+            &event(
+                "prompt",
+                "legacy-session",
+                NormalizedEventKind::UserPrompt,
+                Path::new("/tmp/menvane-test-project"),
+            ),
+            None,
+        )
+        .unwrap();
+    let episode = legacy
+        .create_episode(prompt.session.id, "prompt", "legacy linked episode")
+        .unwrap();
+    assert_eq!(
+        legacy
+            .associate_event_with_active_episode("prompt")
+            .unwrap(),
+        Some(episode.id)
+    );
     legacy
         .ingest(
             &event(
@@ -76,25 +96,31 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
             "{table}"
         );
     }
-    assert_eq!(row_count(&state_path, "operational_migration_markers"), 19);
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 20);
     assert!(has_table(&home.join("index.sqlite"), "sessions"));
     assert_eq!(
         SessionRepository::new(&state_path)
             .events(first.session.id)
             .unwrap()
             .len(),
-        2
+        3
     );
     drop(menvane);
 
     let reopened = Menvane::new(&home).unwrap();
-    assert_eq!(row_count(&state_path, "operational_migration_markers"), 19);
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 20);
     assert_eq!(
         SessionRepository::new(&state_path)
             .events(first.session.id)
             .unwrap()
             .len(),
-        2
+        3
+    );
+    assert_eq!(
+        SessionRepository::new(&state_path)
+            .event_episode("prompt")
+            .unwrap(),
+        Some(episode.id)
     );
     drop(reopened);
 }
@@ -344,10 +370,11 @@ fn backup_restore_round_trips_index_and_state_databases() {
     assert_eq!(menvane.read(retained).unwrap().title, "Backup retained");
 }
 
-fn operational_tables() -> [&'static str; 19] {
+fn operational_tables() -> [&'static str; 20] {
     [
         "sessions",
         "session_events",
+        "event_episode_links",
         "observations",
         "jobs",
         "imports",

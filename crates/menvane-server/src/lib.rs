@@ -26,12 +26,13 @@ pub async fn serve(menvane: Menvane, address: &str, port: u16) -> Result<()> {
     fs::write(home.join("daemon.pid"), std::process::id().to_string())?;
     let state = Arc::new(menvane);
     let maintenance = Arc::clone(&state);
+    let worker = Arc::clone(&maintenance);
     let maintenance_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let _ = maintenance.finalize_idle_sessions();
-            let _ = maintenance.process_next_job().await;
+            let _ = worker.finalize_idle_sessions();
+            let _ = worker.process_next_job().await;
         }
     });
     let socket: SocketAddr = format!("{address}:{port}").parse()?;
@@ -40,6 +41,7 @@ pub async fn serve(menvane: Menvane, address: &str, port: u16) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await;
     maintenance_task.abort();
+    let _ = maintenance.flush_dirty_checkpoints().await;
     let _ = fs::remove_file(home.join("daemon.pid"));
     drop(lock);
     result.map_err(Into::into)

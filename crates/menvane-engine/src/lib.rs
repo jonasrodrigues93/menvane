@@ -1,6 +1,7 @@
 mod compiler;
 mod decay;
 mod global_promoter;
+mod handoff;
 mod intent_engine;
 mod oauth_provider;
 mod project_resolver;
@@ -22,7 +23,7 @@ use fs2::FileExt;
 use menvane_domain::{
     Applicability, JsonSchema, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryType,
     NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, PromptIntent, ProviderHealth,
-    ReinforcementSignal, Scope, TaskEpisode,
+    ReinforcementSignal, Scope, TaskEpisode, TaskHandoff,
 };
 pub use menvane_store::mark_forgotten;
 pub use menvane_store::{
@@ -36,6 +37,7 @@ use uuid::Uuid;
 pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
 pub use decay::DecayEngine;
 pub use global_promoter::GlobalPromoter;
+pub use handoff::HandoffGenerator;
 pub use intent_engine::{
     CLASSIFIER_VERSION, ClassifierDiagnostics, ClassifierWeights, IntentEngine,
 };
@@ -110,6 +112,8 @@ struct MenvaneConfig {
     capture: CaptureSanitizerConfig,
     #[serde(default)]
     sessions: SessionConfiguration,
+    #[serde(default)]
+    handoff: HandoffConfiguration,
     #[serde(default)]
     jobs: JobConfiguration,
     #[serde(default)]
@@ -191,6 +195,24 @@ impl Default for SessionConfiguration {
 
 fn default_idle_finalize_seconds() -> u64 {
     120
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HandoffConfiguration {
+    #[serde(default = "default_handoff_debounce_seconds")]
+    nonvalidation_tool_debounce_seconds: u64,
+}
+
+impl Default for HandoffConfiguration {
+    fn default() -> Self {
+        Self {
+            nonvalidation_tool_debounce_seconds: default_handoff_debounce_seconds(),
+        }
+    }
+}
+
+fn default_handoff_debounce_seconds() -> u64 {
+    2
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -446,6 +468,16 @@ impl Menvane {
         project_id: Option<&str>,
     ) -> Result<Vec<PromptIntent>> {
         IntentEngine::new(&self.sessions).intents(conversation_key, project_id)
+    }
+
+    pub fn handoffs(&self, cwd: &Path) -> Result<Vec<TaskHandoff>> {
+        let project_id = self.ensure_project(cwd)?.map(|project| project.id);
+        self.sessions
+            .list_handoffs(project_id.as_deref(), None, 100)
+    }
+
+    pub fn consume_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
+        self.sessions.consume_handoff(id)
     }
 
     pub fn classifier_diagnostics(&self) -> ClassifierDiagnostics {
@@ -1153,6 +1185,10 @@ impl Menvane {
             return Ok(false);
         };
         let result = async {
+            if job.job_type == "checkpoint_handoff" {
+                self.process_checkpoint_job(&job)?;
+                return Ok(None);
+            }
             if job.job_type == "finalize_session" {
                 SessionEngine::new(self).finalize_job(&job)?;
                 return Ok(None);
@@ -1252,6 +1288,12 @@ impl Menvane {
                     provider.as_deref(),
                     None,
                 )?;
+                if job.job_type == "checkpoint_handoff" {
+                    let episode_id = Uuid::parse_str(&job.dedupe_key)?;
+                    if self.sessions.checkpoint_state(episode_id)?.dirty {
+                        self.sessions.requeue_checkpoint_job(episode_id)?;
+                    }
+                }
             }
             Err(error) => {
                 self.sessions.finish_job(
@@ -1263,6 +1305,65 @@ impl Menvane {
             }
         }
         Ok(true)
+    }
+
+    fn process_checkpoint_job(&self, job: &JobRecord) -> Result<()> {
+        let episode_id = Uuid::parse_str(&job.dedupe_key)?;
+        let state = self.sessions.checkpoint_state(episode_id)?;
+        if state.dirty {
+            HandoffGenerator::new(self).generate(episode_id)?;
+            self.sessions.complete_checkpoint_if_unchanged(
+                episode_id,
+                state.updated_at,
+                state.revision,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub async fn process_next_checkpoint_job(&self) -> Result<bool> {
+        let Some(job) = self.sessions.claim_job_of_type(
+            &self.worker_owner,
+            self.config.jobs.lease_timeout_seconds,
+            "checkpoint_handoff",
+        )?
+        else {
+            return Ok(false);
+        };
+        let result = self.process_checkpoint_job(&job);
+        match result {
+            Ok(()) => {
+                self.sessions.finish_job(
+                    job.id,
+                    job.owner.as_deref().unwrap_or_default(),
+                    None,
+                    None,
+                )?;
+                if self
+                    .sessions
+                    .checkpoint_state(job.dedupe_key.parse()?)?
+                    .dirty
+                {
+                    self.sessions
+                        .requeue_checkpoint_job(job.dedupe_key.parse()?)?;
+                }
+            }
+            Err(error) => {
+                self.sessions.finish_job(
+                    job.id,
+                    job.owner.as_deref().unwrap_or_default(),
+                    None,
+                    Some(&error.to_string()),
+                )?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn flush_dirty_checkpoints(&self) -> Result<()> {
+        self.sessions.prepare_checkpoint_flush()?;
+        while self.process_next_checkpoint_job().await? {}
+        Ok(())
     }
 
     fn is_validation_tool(tool: &str) -> bool {

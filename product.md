@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.13.0
+Version: 1.14.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -69,11 +69,17 @@ Each conversation can contain multiple task episodes spanning session generation
 
 Finalization writes concise episodic Markdown containing the goal, outcome, important actions, explicit deterministic evidence, errors, validation, and involved files. It does not copy complete transcripts or tool outputs. Finalization is asynchronous, idempotent, and recoverable through the daemon worker; it queues compilation without requiring an available language-model provider.
 
+Meaningful captured progress is associated with the active task episode through an idempotent operational link. Episode evidence continues across session generations only for the same conversation and project identity; unrelated episodes and projects remain isolated. Tool progress marks checkpoint state dirty with debounce, while compaction, validation state changes, turn stops, session ends, idle finalization, and lifecycle boundaries request immediate checkpoint work. Capture does not wait for checkpoint generation.
+
+An automatic handoff is one current, versioned operational artifact per episode. It contains bounded deterministic project, conversation, session, client, goal, state, work, blockers, changed-file, decision, validation, source-event, repository fingerprint, and optional relevant-memory references. Repository facts override prior handoff text. Full diffs, tool dumps, environment values, credentials, and private reasoning are never stored. Git fingerprints are optional when Git is unavailable. Handoff generation works without a language-model provider and preserves the artifact identifier and creation time on update.
+
+The generated configuration contains `[handoff].nonvalidation_tool_debounce_seconds = 2`. This setting debounces non-validation tool progress; validation tools and lifecycle events enqueue immediate checkpoint work.
+
 ## Daemon And REST
 
 `menvane serve` runs the Axum daemon on `127.0.0.1:47831` by default. A per-home process lock prevents duplicate daemons. `menvane daemon start`, `stop`, `restart`, and `status` manage the background process.
 
-The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, error fields, an owner, and a configurable 300-second lease timeout by default. The daemon worker claims finalization and compilation jobs, recovers expired leases after restart, and retries both paths idempotently; capture does not wait for background work.
+The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture, checkpoint generation, and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, error fields, an owner, and a configurable 300-second lease timeout by default. The daemon worker claims checkpoint, finalization, and compilation jobs, recovers expired leases after restart, and retries all paths idempotently; dirty checkpoint state is conditionally completed so concurrent evidence remains pending. Graceful shutdown flushes dirty checkpoints when feasible, and capture does not wait for background work.
 
 ## Claude Code Integration
 
