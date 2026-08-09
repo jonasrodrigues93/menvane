@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.12.0
+Version: 1.13.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -53,9 +53,9 @@ Embedding providers are independent from language-model providers. Embedding sto
 
 ## MCP
 
-`menvane mcp` serves MCP over newline-delimited JSON-RPC on standard input and output. It resolves the active project from its process working directory and exposes exactly `memory_search`, `memory_read`, `memory_write`, and `memory_forget`.
+`menvane mcp` serves MCP over newline-delimited JSON-RPC on standard input and output. It resolves the active project from its process working directory and exposes exactly `memory_search`, `memory_read`, `memory_write`, and `memory_forget`. MCP enforces a 4,096-byte UTF-8 query bound, a 50-item search limit and result bound, 512-character search excerpts, and a 32,768-byte serialized response bound. Unsafe search values are capped deterministically.
 
-MCP search returns identifiers, type, scope, title, score, status, confidence, applicability, and a short excerpt. Read returns metadata, the full Markdown body, source sessions, and supersession metadata. Forgetting changes status without deleting Markdown. Automatic manual writes conservatively use project scope when no compiler is available.
+MCP search returns identifiers, type, scope, title, score, status, confidence, applicability, and a bounded short excerpt. Read returns bounded metadata and provenance plus a UTF-8-safe progressive Markdown range. Read ranges use character units by default, also support byte units, default to 4,096 units, and cap each request at 8,192 units. Range metadata reports the effective offset, returned units, total units, and whether more content exists, so large memories can be reconstructed across calls without an unbounded response. Forgetting changes status without deleting Markdown. Automatic manual writes conservatively use project scope when no compiler is available.
 
 ## Capture And Sessions
 
