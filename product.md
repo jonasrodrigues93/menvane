@@ -1,8 +1,8 @@
 # Menvane
 
-Version: 1.3.0
+Version: 1.4.0
 
-Menvane is a local persistent memory system for coding agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
+Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
 ## Storage
 
@@ -20,7 +20,7 @@ Durable knowledge uses exactly five memory types: fact, decision, procedure, got
 
 Physical scope is either global or project. Project search returns the current project plus global memories by default and never includes unrelated projects. Forgotten memories remain in Markdown with `status: forgotten` and are excluded from normal search.
 
-Every memory has an identifier, type, scope, status, confidence, timestamps, source sessions, tags, applicability, and supersession metadata. Applicability dimensions are languages, frameworks, tools, databases, and platforms.
+Every memory has an identifier, type, scope, status, confidence, timestamps, source sessions, tags, optional applicability, and supersession metadata. Applicability dimensions are languages, frameworks, tools, databases, and platforms; empty dimensions indicate the memory is not tied to specific technologies.
 
 ## Project Resolution
 
@@ -104,7 +104,7 @@ An explicit fallback provider may be configured under `[llm.fallback]`. Fallback
 
 The memory compiler receives bounded session evidence, important prompts and tools, errors, decisions, validation results, existing related memories, and the project technology profile. It requests schema-constrained JSON and never allows a provider to write Markdown directly. Invalid structured output receives one bounded retry and then fails.
 
-Compiler output may contain zero memories. Valid output uses only facts, decisions, procedures, and gotchas. Procedure content contains trigger, preconditions, ordered steps, decision points, validation, failure handling, and expected outcome. Global classification requires high scope confidence; uncertainty resolves to project scope.
+Compiler output may contain zero memories. Valid output uses only facts, decisions, procedures, and gotchas. Applicability is optional; empty dimensions indicate the memory is not tied to specific technologies. Procedure content contains trigger, preconditions, ordered steps, decision points, validation, failure handling, and expected outcome. Global classification requires high scope confidence; uncertainty resolves to project scope.
 
 Before creating durable memory, Menvane searches the same scope and type. Equivalent content reinforces confidence and source evidence. Incompatible content with the same identity creates a new memory and supersedes the old one instead of silently rewriting history. Provider unavailability does not affect capture, session Markdown, manual memory operations, search, MCP, project detection, or technology detection; compilation jobs remain durable and retryable.
 

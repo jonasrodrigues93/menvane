@@ -241,29 +241,126 @@ fn compiler_schema() -> Value {
             "memories": {
                 "type": "array",
                 "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["type", "title", "scope_candidate", "scope_confidence", "confidence", "applies_to", "content", "evidence"],
-                    "properties": {
-                        "type": { "type": "string", "enum": ["fact", "decision", "procedure", "gotcha"] },
-                        "title": { "type": "string" },
-                        "scope_candidate": { "type": "string", "enum": ["project", "global"] },
-                        "scope_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-                        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-                        "applies_to": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "properties": {
-                                "languages": { "type": "array", "items": { "type": "string" } },
-                                "frameworks": { "type": "array", "items": { "type": "string" } },
-                                "tools": { "type": "array", "items": { "type": "string" } },
-                                "databases": { "type": "array", "items": { "type": "string" } },
-                                "platforms": { "type": "array", "items": { "type": "string" } }
-                            }
-                        },
-                        "content": { "type": "object" },
-                        "evidence": { "type": "array", "items": { "type": "string" } }
-                    }
+                    "anyOf": [
+                        { "$ref": "#/$defs/fact" },
+                        { "$ref": "#/$defs/decision" },
+                        { "$ref": "#/$defs/gotcha" },
+                        { "$ref": "#/$defs/procedure" }
+                    ]
+                }
+            }
+        },
+        "$defs": {
+            "applies_to": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["languages", "frameworks", "tools", "databases", "platforms"],
+                "properties": {
+                    "languages": { "type": "array", "items": { "type": "string" } },
+                    "frameworks": { "type": "array", "items": { "type": "string" } },
+                    "tools": { "type": "array", "items": { "type": "string" } },
+                    "databases": { "type": "array", "items": { "type": "string" } },
+                    "platforms": { "type": "array", "items": { "type": "string" } }
+                }
+            },
+            "fact": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "title", "scope_candidate", "scope_confidence", "confidence", "applies_to", "content", "evidence"],
+                "properties": {
+                    "type": { "type": "string", "enum": ["fact"] },
+                    "title": { "type": "string" },
+                    "scope_candidate": { "type": "string", "enum": ["project", "global"] },
+                    "scope_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "applies_to": { "$ref": "#/$defs/applies_to" },
+                    "content": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["statement"],
+                        "properties": {
+                            "statement": { "type": "string" }
+                        }
+                    },
+                    "evidence": { "type": "array", "items": { "type": "string" } }
+                }
+            },
+            "decision": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "title", "scope_candidate", "scope_confidence", "confidence", "applies_to", "content", "evidence"],
+                "properties": {
+                    "type": { "type": "string", "enum": ["decision"] },
+                    "title": { "type": "string" },
+                    "scope_candidate": { "type": "string", "enum": ["project", "global"] },
+                    "scope_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "applies_to": { "$ref": "#/$defs/applies_to" },
+                    "content": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["decision", "reason", "alternatives", "consequences"],
+                        "properties": {
+                            "decision": { "type": "string" },
+                            "reason": { "type": "string" },
+                            "alternatives": { "type": "array", "items": { "type": "string" } },
+                            "consequences": { "type": "array", "items": { "type": "string" } }
+                        }
+                    },
+                    "evidence": { "type": "array", "items": { "type": "string" } }
+                }
+            },
+            "gotcha": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "title", "scope_candidate", "scope_confidence", "confidence", "applies_to", "content", "evidence"],
+                "properties": {
+                    "type": { "type": "string", "enum": ["gotcha"] },
+                    "title": { "type": "string" },
+                    "scope_candidate": { "type": "string", "enum": ["project", "global"] },
+                    "scope_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "applies_to": { "$ref": "#/$defs/applies_to" },
+                    "content": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["problem", "cause", "resolution", "avoidance"],
+                        "properties": {
+                            "problem": { "type": "string" },
+                            "cause": { "type": "string" },
+                            "resolution": { "type": "string" },
+                            "avoidance": { "type": "string" }
+                        }
+                    },
+                    "evidence": { "type": "array", "items": { "type": "string" } }
+                }
+            },
+            "procedure": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type", "title", "scope_candidate", "scope_confidence", "confidence", "applies_to", "content", "evidence"],
+                "properties": {
+                    "type": { "type": "string", "enum": ["procedure"] },
+                    "title": { "type": "string" },
+                    "scope_candidate": { "type": "string", "enum": ["project", "global"] },
+                    "scope_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "applies_to": { "$ref": "#/$defs/applies_to" },
+                    "content": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["trigger", "preconditions", "steps", "decision_points", "validation", "failure_handling", "expected_outcome"],
+                        "properties": {
+                            "trigger": { "type": "string" },
+                            "preconditions": { "type": "array", "items": { "type": "string" } },
+                            "steps": { "type": "array", "items": { "type": "string" } },
+                            "decision_points": { "type": "array", "items": { "type": "string" } },
+                            "validation": { "type": "array", "items": { "type": "string" } },
+                            "failure_handling": { "type": "array", "items": { "type": "string" } },
+                            "expected_outcome": { "type": "string" }
+                        }
+                    },
+                    "evidence": { "type": "array", "items": { "type": "string" } }
                 }
             }
         }
@@ -271,7 +368,7 @@ fn compiler_schema() -> Value {
 }
 
 fn compiler_system_prompt() -> &'static str {
-    "Consolidate only durable reusable coding knowledge. Return zero memories when evidence is temporary or insufficient. Use only fact, decision, procedure, or gotcha. Prefer project scope whenever global validity is uncertain. Never include private reasoning or unsupported claims. Procedure content must include trigger, preconditions, steps, decision_points, validation, failure_handling, and expected_outcome."
+    "Consolidate only durable, reusable knowledge supported by the session evidence. Return zero memories when evidence is temporary or insufficient. Use only fact, decision, procedure, or gotcha. Prefer project scope whenever global validity is uncertain. Never include private reasoning or unsupported claims. Procedure content must include trigger, preconditions, steps, decision_points, validation, failure_handling, and expected_outcome. Leave all applicability dimensions (languages, frameworks, tools, databases, platforms) empty when the memory is not tied to specific technologies."
 }
 
 fn invalid_schema(message: impl ToString) -> LlmError {
@@ -355,7 +452,7 @@ mod tests {
                 "scope_candidate": "global",
                 "scope_confidence": 0.6,
                 "confidence": 0.9,
-                "applies_to": { "databases": ["sqlite"] },
+                "applies_to": { "languages": [], "frameworks": [], "tools": [], "databases": ["sqlite"], "platforms": [] },
                 "content": {
                     "trigger": "Before applying a migration",
                     "preconditions": ["A backup exists"],
@@ -376,6 +473,73 @@ mod tests {
         assert_eq!(result.memories[0].scope, Scope::Project);
         assert!(result.memories[0].body.contains("1. Run migration"));
         assert!(result.memories[0].body.contains("## Failure handling"));
+    }
+
+    #[tokio::test]
+    async fn accepts_non_technical_fact_with_empty_applicability() {
+        let valid = json!({
+            "memories": [{
+                "type": "fact",
+                "title": "Meeting notes belong in durable memory",
+                "scope_candidate": "project",
+                "scope_confidence": 0.95,
+                "confidence": 0.8,
+                "applies_to": { "languages": [], "frameworks": [], "tools": [], "databases": [], "platforms": [] },
+                "content": { "statement": "Action items discussed in the weekly review are stored as durable project facts." },
+                "evidence": ["reviewed during session"]
+            }]
+        });
+        let compiler = MemoryCompiler::new(Arc::new(FakeProvider {
+            responses: Mutex::new(VecDeque::from([valid])),
+        }));
+        let result = compiler.compile(input()).await.unwrap();
+        assert_eq!(result.memories.len(), 1);
+        assert_eq!(result.memories[0].memory_type, MemoryType::Fact);
+        assert!(result.memories[0].body.contains("Action items discussed"));
+    }
+
+    #[test]
+    fn compiler_schema_is_structurally_strict() {
+        let schema = compiler_schema();
+        assert_schema_is_strict(&schema);
+    }
+
+    fn assert_schema_is_strict(schema: &Value) {
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            if schema.get("type").and_then(Value::as_str) == Some("object") {
+                assert!(
+                    schema.get("additionalProperties").and_then(Value::as_bool) == Some(false),
+                    "object schema must set additionalProperties: false"
+                );
+                let required: std::collections::HashSet<_> = schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .map(|values| values.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                for key in properties.keys() {
+                    assert!(
+                        required.contains(key.as_str()),
+                        "required must include every property; missing '{key}'"
+                    );
+                }
+            }
+            for property in properties.values() {
+                assert_schema_is_strict(property);
+            }
+        }
+        if let Some(items) = schema.get("items") {
+            assert_schema_is_strict(items);
+        }
+        if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+            for branch in any_of {
+                assert_schema_is_strict(branch);
+            }
+        }
+        if let Some(defs) = schema.get("$defs").and_then(Value::as_object) {
+            for def in defs.values() {
+                assert_schema_is_strict(def);
+            }
+        }
     }
 
     fn input() -> CompilationInput {

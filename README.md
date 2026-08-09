@@ -1,6 +1,6 @@
 # Menvane
 
-Menvane is a local persistent memory system for Claude Code, OpenAI Codex, and OpenCode. Durable knowledge is Markdown; SQLite is a rebuildable FTS and operational index.
+Menvane is a local persistent memory system for agents. Durable knowledge is Markdown; SQLite is a rebuildable FTS and operational index.
 
 ## Build
 

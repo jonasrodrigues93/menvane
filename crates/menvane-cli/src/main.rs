@@ -19,7 +19,7 @@ use uuid::Uuid;
 #[command(
     name = "menvane",
     version,
-    about = "Local persistent memory for coding agents"
+    about = "Local persistent memory for agents"
 )]
 struct Cli {
     #[command(subcommand)]
