@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -18,6 +19,58 @@ pub enum SessionState {
     Open,
     Idle,
     Finalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptIntentKind {
+    RootGoal,
+    NewGoal,
+    Refinement,
+    Constraint,
+    Correction,
+    FollowUp,
+    Operational,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EpisodeState {
+    Active,
+    Dormant,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IntentClassificationSource {
+    Deterministic,
+    ProviderReview,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskEpisode {
+    pub id: Uuid,
+    pub project_id: Option<String>,
+    pub conversation_key: String,
+    pub root_event_id: String,
+    pub goal: String,
+    pub ordinal: u32,
+    pub state: EpisodeState,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptIntent {
+    pub event_id: String,
+    pub episode_id: Uuid,
+    pub kind: PromptIntentKind,
+    pub confidence: f64,
+    pub weight: f64,
+    pub classifier_version: String,
+    pub source: IntentClassificationSource,
+    pub classified_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,4 +130,21 @@ pub struct NormalizedSession {
 
 pub trait SessionImporter {
     fn discover(&self) -> Result<Vec<NormalizedSession>, String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn episode_and_intent_vocabulary_is_stable() {
+        assert_eq!(
+            serde_json::to_string(&PromptIntentKind::RootGoal).unwrap(),
+            "\"root-goal\""
+        );
+        assert_eq!(
+            serde_json::from_str::<EpisodeState>("\"completed\"").unwrap(),
+            EpisodeState::Completed
+        );
+    }
 }
