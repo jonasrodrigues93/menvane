@@ -120,6 +120,44 @@ pub struct TaskHandoff {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceKind {
+    Goal,
+    Prompt,
+    Action,
+    Decision,
+    Discovery,
+    Error,
+    Validation,
+    CompactionContext,
+    UnresolvedQuestion,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceItem {
+    pub event_id: String,
+    pub kind: EvidenceKind,
+    pub timestamp: DateTime<Utc>,
+    pub content: String,
+    pub importance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeEvidencePacket {
+    pub episode_id: Uuid,
+    pub goal: EvidenceItem,
+    pub prompts: Vec<EvidenceItem>,
+    pub actions: Vec<EvidenceItem>,
+    pub decisions: Vec<EvidenceItem>,
+    pub discoveries: Vec<EvidenceItem>,
+    pub errors: Vec<EvidenceItem>,
+    pub validations: Vec<EvidenceItem>,
+    pub files: Vec<String>,
+    pub compaction_context: Vec<EvidenceItem>,
+    pub unresolved_questions: Vec<EvidenceItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReinforcementSignal {
     Retrieved,
@@ -195,6 +233,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<HandoffStatus>("\"consumed\"").unwrap(),
             HandoffStatus::Consumed
+        );
+        assert_eq!(
+            serde_json::to_string(&EvidenceKind::CompactionContext).unwrap(),
+            "\"compaction-context\""
         );
     }
 }
