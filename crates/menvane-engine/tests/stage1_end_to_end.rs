@@ -6,6 +6,8 @@ use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ProjectResolver, ScopeSelection, WriteMemory};
 use tempfile::TempDir;
 
+mod common;
+
 #[test]
 fn project_isolation_global_visibility_and_database_rebuild() {
     let temporary = TempDir::new().unwrap();
@@ -14,6 +16,8 @@ fn project_isolation_global_visibility_and_database_rebuild() {
     let project_b = temporary.path().join("project-b");
     fs::create_dir_all(&project_a).unwrap();
     fs::create_dir_all(&project_b).unwrap();
+    common::init_git(&project_a);
+    common::init_git(&project_b);
     let menvane = Menvane::new(&home).unwrap();
 
     menvane
@@ -121,10 +125,37 @@ fn git_worktrees_share_project_identity() {
         ],
     );
 
-    let main = ProjectResolver::resolve(&repository).unwrap();
-    let linked = ProjectResolver::resolve(&worktree).unwrap();
+    let main = ProjectResolver::resolve(&repository).unwrap().unwrap();
+    let linked = ProjectResolver::resolve(&worktree).unwrap().unwrap();
     assert_eq!(main.id, linked.id);
     assert_eq!(main.identity, linked.identity);
+}
+
+#[test]
+fn directory_without_git_uses_only_global_memory() {
+    let temporary = TempDir::new().unwrap();
+    let directory = temporary.path().join("notes");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join(".menvane.toml"), "project = 'notes'").unwrap();
+    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+
+    let memory = menvane
+        .write(
+            &directory,
+            write_request("Unrelated note", "global-note-token", Scope::Project),
+        )
+        .unwrap();
+
+    assert_eq!(memory.metadata.scope, Scope::Global);
+    assert!(memory.metadata.project_id.is_none());
+    assert!(menvane.all_projects().unwrap().is_empty());
+    assert_eq!(
+        menvane
+            .search(&directory, "global-note-token", ScopeSelection::Auto, 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 fn write_request(title: &str, body: &str, scope: Scope) -> WriteMemory {

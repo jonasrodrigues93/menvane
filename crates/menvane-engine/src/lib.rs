@@ -210,14 +210,19 @@ impl Menvane {
             bail!("sessions are created by session capture, not manual writes");
         }
         let project = match request.scope {
-            Scope::Project => Some(self.ensure_project(cwd)?),
+            Scope::Project => self.ensure_project(cwd)?,
             Scope::Global => None,
+        };
+        let scope = if project.is_some() {
+            request.scope
+        } else {
+            Scope::Global
         };
         let project_id = project.as_ref().map(|project| project.id.clone());
         let memory = Memory {
             metadata: MemoryMetadata::new(
                 request.memory_type,
-                request.scope,
+                scope,
                 project_id,
                 request.confidence,
                 request.tags,
@@ -253,7 +258,7 @@ impl Menvane {
     ) -> Result<Vec<SearchResult>> {
         let project = match scope {
             ScopeSelection::Global => None,
-            ScopeSelection::Auto | ScopeSelection::Project => Some(self.ensure_project(cwd)?),
+            ScopeSelection::Auto | ScopeSelection::Project => self.ensure_project(cwd)?,
         };
         let retrieval_scope = match scope {
             ScopeSelection::Auto => RetrievalScope::Auto,
@@ -279,7 +284,7 @@ impl Menvane {
         let project = self.ensure_project(cwd)?;
         Retriever::new(&self.index).retrieve(
             query,
-            Some(&project),
+            project.as_ref(),
             RetrievalScope::Auto,
             RetrievalMode::Automatic,
             false,
@@ -331,32 +336,37 @@ impl Menvane {
     pub fn session_briefing(&self, cwd: &Path, session_key: &str) -> Result<String> {
         let project = self.ensure_project(cwd)?;
         let mut memories = Vec::new();
-        for memory in Retriever::new(&self.index).briefing(&project, 20)? {
+        for memory in Retriever::new(&self.index).briefing(project.as_ref(), 20)? {
             if self.sessions.claim_injection(session_key, memory.id)? {
                 self.sessions
                     .record_access(memory.id, ReinforcementSignal::Injected)?;
                 memories.push(memory);
             }
         }
-        let technologies = [
-            project.technologies.languages.join(", "),
-            project.technologies.frameworks.join(", "),
-            project.technologies.tools.join(", "),
-            project.technologies.databases.join(", "),
-            project.technologies.platforms.join(", "),
-        ]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ");
-        let prefix = format!(
-            "Project: {}\nTechnologies: {}\n",
-            project.identity,
-            if technologies.is_empty() {
-                "none detected"
-            } else {
-                &technologies
-            }
+        let prefix = project.map_or_else(
+            || "Scope: global\n".to_owned(),
+            |project| {
+                let technologies = [
+                    project.technologies.languages.join(", "),
+                    project.technologies.frameworks.join(", "),
+                    project.technologies.tools.join(", "),
+                    project.technologies.databases.join(", "),
+                    project.technologies.platforms.join(", "),
+                ]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+                format!(
+                    "Project: {}\nTechnologies: {}\n",
+                    project.identity,
+                    if technologies.is_empty() {
+                        "none detected"
+                    } else {
+                        &technologies
+                    }
+                )
+            },
         );
         Ok(format_memory_context(&prefix, &memories, 2_500))
     }
@@ -823,23 +833,29 @@ impl Menvane {
             if !is_session_worth_compiling(&session) {
                 return Ok((Vec::new(), "skipped".to_owned()));
             }
-            let project_id = session
-                .metadata
-                .project_id
-                .as_deref()
-                .context("session compilation requires a project")?;
-            let project = self
-                .all_projects()?
-                .into_iter()
-                .find(|project| project.id == project_id)
-                .context("session project is missing")?;
-            let cwd = project
-                .known_paths
-                .iter()
-                .map(Path::new)
-                .find(|path| path.exists())
-                .context("session project has no available checkout")?;
             let events = self.sessions.events(session_id)?;
+            let (cwd, technology_profile) =
+                if let Some(project_id) = session.metadata.project_id.as_deref() {
+                    let project = self
+                        .all_projects()?
+                        .into_iter()
+                        .find(|project| project.id == project_id)
+                        .context("session project is missing")?;
+                    let cwd = project
+                        .known_paths
+                        .iter()
+                        .map(PathBuf::from)
+                        .find(|path| path.exists())
+                        .context("session project has no available checkout")?;
+                    (cwd, serde_json::to_value(project.technologies)?)
+                } else {
+                    let cwd = events
+                        .iter()
+                        .map(|event| PathBuf::from(&event.cwd))
+                        .find(|path| path.exists())
+                        .context("global session has no available working directory")?;
+                    (cwd, serde_json::json!({}))
+                };
             let important_prompts = events
                 .iter()
                 .filter(|event| event.kind == NormalizedEventKind::UserPrompt)
@@ -878,7 +894,7 @@ impl Menvane {
                 .filter_map(|event| event.tool_family.clone())
                 .collect();
             self.compile_and_store(
-                cwd,
+                &cwd,
                 CompilationInput {
                     session_summary: session.body,
                     important_prompts,
@@ -887,7 +903,7 @@ impl Menvane {
                     decisions: Vec::new(),
                     validation_results,
                     existing_related_memories: Vec::new(),
-                    technology_profile: serde_json::to_value(project.technologies)?,
+                    technology_profile,
                     source_session: Some(session_id),
                 },
             )
@@ -1097,8 +1113,10 @@ impl Menvane {
         DoctorReport { checks }
     }
 
-    pub fn ensure_project(&self, cwd: &Path) -> Result<Project> {
-        let resolution = ProjectResolver::resolve(cwd)?;
+    pub fn ensure_project(&self, cwd: &Path) -> Result<Option<Project>> {
+        let Some(resolution) = ProjectResolver::resolve(cwd)? else {
+            return Ok(None);
+        };
         let technologies = TechnologyDetector::detect(&resolution.root)?;
         let probe = Project {
             id: resolution.id.clone(),
@@ -1135,7 +1153,7 @@ impl Menvane {
         } else {
             self.index.upsert_project(&project, &path)?;
         }
-        Ok(project)
+        Ok(Some(project))
     }
 }
 

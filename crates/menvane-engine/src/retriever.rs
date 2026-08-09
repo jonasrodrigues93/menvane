@@ -33,8 +33,12 @@ impl<'a> Retriever<'a> {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let search_scope = match scope {
-            RetrievalScope::Auto => SearchScope::Auto(&required_project(project)?.id),
-            RetrievalScope::Project => SearchScope::Project(&required_project(project)?.id),
+            RetrievalScope::Auto => project
+                .map(|project| SearchScope::Auto(project.id.as_str()))
+                .unwrap_or(SearchScope::Global),
+            RetrievalScope::Project => project
+                .map(|project| SearchScope::Project(project.id.as_str()))
+                .unwrap_or(SearchScope::Global),
             RetrievalScope::Global => SearchScope::Global,
         };
         let candidate_limit = limit.saturating_mul(8).max(limit);
@@ -79,17 +83,16 @@ impl<'a> Retriever<'a> {
         Ok(results)
     }
 
-    pub fn briefing(&self, project: &Project, limit: usize) -> Result<Vec<SearchResult>> {
-        let mut results = self.index.list(
-            SearchScope::Auto(&project.id),
-            limit.saturating_mul(8),
-            false,
-        )?;
+    pub fn briefing(&self, project: Option<&Project>, limit: usize) -> Result<Vec<SearchResult>> {
+        let scope = project
+            .map(|project| SearchScope::Auto(project.id.as_str()))
+            .unwrap_or(SearchScope::Global);
+        let mut results = self.index.list(scope, limit.saturating_mul(8), false)?;
         results.retain(|memory| {
             memory.scope != "global"
                 || eligible_global(
                     &memory.applicability,
-                    Some(&project.technologies),
+                    project.map(|project| &project.technologies),
                     RetrievalMode::Automatic,
                     "",
                 )
@@ -115,10 +118,6 @@ pub enum RetrievalScope {
     Auto,
     Project,
     Global,
-}
-
-fn required_project(project: Option<&Project>) -> Result<&Project> {
-    project.ok_or_else(|| anyhow::anyhow!("retrieval scope requires a resolved project"))
 }
 
 fn eligible_global(

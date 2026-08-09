@@ -22,31 +22,29 @@ struct ProjectOverride {
 }
 
 impl ProjectResolver {
-    pub fn resolve(cwd: &Path) -> Result<ProjectResolution> {
+    pub fn resolve(cwd: &Path) -> Result<Option<ProjectResolution>> {
         let cwd = cwd
             .canonicalize()
             .with_context(|| format!("cannot resolve working directory {}", cwd.display()))?;
+        let Some(root) = git_output(&cwd, &["rev-parse", "--show-toplevel"]) else {
+            return Ok(None);
+        };
         if let Some((root, project)) = find_override(&cwd)? {
-            return resolution(format!("override:{project}"), project, root);
+            return Ok(Some(resolution(
+                format!("override:{project}"),
+                project,
+                root,
+            )));
         }
-        if let Some(root) = git_output(&cwd, &["rev-parse", "--show-toplevel"]) {
-            let root = PathBuf::from(root).canonicalize()?;
-            let identity = canonical_git_identity(&root)?;
-            let name = identity
-                .rsplit('/')
-                .next()
-                .filter(|name| !name.is_empty())
-                .unwrap_or("project")
-                .to_owned();
-            return resolution(identity, name, root);
-        }
-        let name = cwd
-            .file_name()
-            .and_then(|name| name.to_str())
+        let root = PathBuf::from(root).canonicalize()?;
+        let identity = canonical_git_identity(&root)?;
+        let name = identity
+            .rsplit('/')
+            .next()
             .filter(|name| !name.is_empty())
             .unwrap_or("project")
             .to_owned();
-        resolution(format!("path:{}", cwd.display()), name, cwd)
+        Ok(Some(resolution(identity, name, root)))
     }
 }
 
@@ -148,14 +146,14 @@ fn git_output(cwd: &Path, arguments: &[&str]) -> Option<String> {
         .filter(|output| !output.is_empty())
 }
 
-fn resolution(identity: String, name: String, root: PathBuf) -> Result<ProjectResolution> {
+fn resolution(identity: String, name: String, root: PathBuf) -> ProjectResolution {
     let id = hex::encode(Sha256::digest(identity.as_bytes()));
-    Ok(ProjectResolution {
+    ProjectResolution {
         id,
         identity,
         name,
         root,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +170,15 @@ mod tests {
         ] {
             assert_eq!(normalize_git_remote(remote).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn directory_without_git_has_no_project() {
+        let directory = tempfile::TempDir::new().unwrap();
+        assert!(
+            ProjectResolver::resolve(directory.path())
+                .unwrap()
+                .is_none()
+        );
     }
 }

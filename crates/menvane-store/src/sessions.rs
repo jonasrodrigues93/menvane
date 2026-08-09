@@ -186,12 +186,9 @@ impl SessionRepository {
         let previous = latest_session(&transaction, &event.client, &event.external_session_id)?;
         let session = match previous {
             Some(previous) if previous.state != SessionState::Finalized => previous,
-            Some(previous) => create_session(
-                &transaction,
-                event,
-                project_id.or(previous.project_id.as_deref()),
-                previous.generation + 1,
-            )?,
+            Some(previous) => {
+                create_session(&transaction, event, project_id, previous.generation + 1)?
+            }
             None => create_session(&transaction, event, project_id, 1)?,
         };
         transaction.execute(

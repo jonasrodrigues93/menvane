@@ -6,11 +6,14 @@ use menvane_domain::{NormalizedEvent, NormalizedEventKind};
 use menvane_engine::{CaptureOutcome, Menvane, ScopeSelection};
 use tempfile::TempDir;
 
+mod common;
+
 #[test]
 fn capture_is_bounded_idempotent_and_reopens_finalized_sessions() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
     let menvane = Menvane::new(temporary.path().join("home")).unwrap();
     let started = event(&project, "start", NormalizedEventKind::SessionStarted);
     assert_eq!(
@@ -90,6 +93,7 @@ fn trivial_sessions_are_not_queued_for_compilation() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
     let menvane = Menvane::new(temporary.path().join("home")).unwrap();
     let started = event(&project, "start", NormalizedEventKind::SessionStarted);
     assert_eq!(
@@ -115,6 +119,7 @@ fn concurrent_events_and_idle_finalization_are_safe() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
     let menvane = Arc::new(Menvane::new(temporary.path().join("home")).unwrap());
     let mut handles = Vec::new();
     for index in 0..20 {
@@ -146,6 +151,39 @@ fn concurrent_events_and_idle_finalization_are_safe() {
             .count(),
         1
     );
+}
+
+#[test]
+fn session_outside_git_is_finalized_as_global() {
+    let temporary = TempDir::new().unwrap();
+    let directory = temporary.path().join("notes");
+    fs::create_dir_all(&directory).unwrap();
+    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+    let mut prompt = event(&directory, "global-prompt", NormalizedEventKind::UserPrompt);
+    prompt.bounded_input = Some("global-session-evidence".to_owned());
+    menvane.ingest_event(prompt).unwrap();
+    menvane
+        .ingest_event(event(
+            &directory,
+            "global-end",
+            NormalizedEventKind::SessionEnded,
+        ))
+        .unwrap();
+
+    let sessions = menvane
+        .search_with_sessions(
+            &directory,
+            "global-session-evidence",
+            ScopeSelection::Auto,
+            10,
+            true,
+        )
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    let session = menvane.read(sessions[0].id).unwrap();
+    assert_eq!(session.metadata.scope, menvane_domain::Scope::Global);
+    assert!(session.metadata.project_id.is_none());
+    assert!(menvane.all_projects().unwrap().is_empty());
 }
 
 fn event(project: &std::path::Path, id: &str, kind: NormalizedEventKind) -> NormalizedEvent {

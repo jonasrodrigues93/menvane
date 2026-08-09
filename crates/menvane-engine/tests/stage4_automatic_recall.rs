@@ -4,11 +4,14 @@ use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, WriteMemory};
 use tempfile::TempDir;
 
+mod common;
+
 #[test]
 fn session_and_prompt_context_are_bounded_trusted_and_not_repeated() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
     fs::write(
         project.join("Cargo.toml"),
         "[package]\nname='recall'\nversion='0.1.0'\n",

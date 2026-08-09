@@ -5,11 +5,14 @@ use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, WriteMemory};
 use tempfile::TempDir;
 
+mod common;
+
 #[test]
 fn backup_restore_validates_and_replaces_state() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
     let home = temporary.path().join("home");
     let backup = temporary.path().join("backup");
     let menvane = Menvane::new(&home).unwrap();
@@ -49,6 +52,7 @@ fn local_prompt_retrieval_stays_within_hot_path_budget() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
     let menvane = Menvane::new(temporary.path().join("home")).unwrap();
     for index in 0..100 {
         write(

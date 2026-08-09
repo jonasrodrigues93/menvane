@@ -4,6 +4,8 @@ use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use tempfile::TempDir;
 
+mod common;
+
 #[test]
 fn automatic_recall_filters_global_applicability() {
     let temporary = TempDir::new().unwrap();
@@ -11,6 +13,8 @@ fn automatic_recall_filters_global_applicability() {
     let python = temporary.path().join("python-project");
     fs::create_dir_all(&java).unwrap();
     fs::create_dir_all(&python).unwrap();
+    common::init_git(&java);
+    common::init_git(&python);
     fs::write(
         java.join("pom.xml"),
         "<project><artifactId>app</artifactId></project>",

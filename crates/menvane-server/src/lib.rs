@@ -312,6 +312,13 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let project = temporary.path().join("project");
         fs::create_dir_all(&project).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
         let state = Arc::new(Menvane::new(temporary.path().join("home")).unwrap());
         let event = NormalizedEvent {
             event_id: "stable-event-id".to_owned(),
@@ -340,6 +347,13 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let project = temporary.path().join("project");
         fs::create_dir_all(&project).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
         let menvane = Menvane::new(temporary.path().join("home")).unwrap();
         let memory = menvane
             .write(
@@ -355,7 +369,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let project_id = menvane.ensure_project(&project).unwrap().id;
+        let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
         let router = app(Arc::new(menvane));
         for path in [
             "/",

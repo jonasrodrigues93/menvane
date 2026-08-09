@@ -5,11 +5,14 @@ use menvane_domain::{NormalizedEvent, NormalizedEventKind};
 use menvane_engine::{Menvane, ScopeSelection};
 use tempfile::TempDir;
 
+mod common;
+
 #[test]
 fn old_irrelevant_session_is_archived_but_remains_reindexable() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
     let home = temporary.path().join("home");
     let menvane = Menvane::new(&home).unwrap();
     let timestamp = Utc::now() - Duration::days(180);

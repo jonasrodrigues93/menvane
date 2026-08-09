@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{Duration, Utc};
 use menvane_domain::{
     Applicability, Memory, MemoryMetadata, MemoryType, NormalizedEvent, NormalizedEventKind, Scope,
@@ -28,8 +28,11 @@ impl<'a> SessionEngine<'a> {
 
     pub fn ingest(&self, mut event: NormalizedEvent) -> Result<CaptureOutcome> {
         let project = self.menvane.ensure_project(Path::new(&event.cwd))?;
-        event.project_id = Some(project.id.clone());
-        let result = self.menvane.sessions.ingest(&event, Some(&project.id))?;
+        event.project_id = project.as_ref().map(|project| project.id.clone());
+        let result = self
+            .menvane
+            .sessions
+            .ingest(&event, project.as_ref().map(|project| project.id.as_str()))?;
         if !result.inserted {
             return Ok(CaptureOutcome::Duplicate);
         }
@@ -58,25 +61,30 @@ impl<'a> SessionEngine<'a> {
             return Ok(());
         }
         let events = self.menvane.sessions.events(session.id)?;
-        let project_id = session
+        let project = session
             .project_id
             .as_deref()
-            .context("live session has no project identity")?;
-        let project = self
-            .menvane
-            .markdown
-            .project_files()?
-            .into_iter()
-            .map(|path| self.menvane.markdown.parse_project(&path))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .find(|project| project.id == project_id)
-            .context("session project metadata is missing")?;
+            .map(|project_id| {
+                self.menvane
+                    .markdown
+                    .project_files()?
+                    .into_iter()
+                    .map(|path| self.menvane.markdown.parse_project(&path))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .find(|project| project.id == project_id)
+                    .ok_or_else(|| anyhow::anyhow!("session project metadata is missing"))
+            })
+            .transpose()?;
         let title = session_title(session, &events);
         let mut metadata = MemoryMetadata::new(
             MemoryType::Session,
-            Scope::Project,
-            Some(project.id.clone()),
+            if project.is_some() {
+                Scope::Project
+            } else {
+                Scope::Global
+            },
+            project.as_ref().map(|project| project.id.clone()),
             1.0,
             Vec::new(),
             Applicability::default(),
@@ -99,7 +107,7 @@ impl<'a> SessionEngine<'a> {
         let path = self
             .menvane
             .markdown
-            .write_memory(&memory, Some(&project))?;
+            .write_memory(&memory, project.as_ref())?;
         self.menvane.index.upsert_memory(&memory, &path)?;
         self.menvane.sessions.mark_finalized(
             session.id,

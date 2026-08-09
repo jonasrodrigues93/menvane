@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.4.0
+Version: 1.5.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -18,17 +18,18 @@ Deleting `index.sqlite` does not delete durable knowledge. `menvane reindex` val
 
 Durable knowledge uses exactly five memory types: fact, decision, procedure, gotcha, and session. The current manual write command creates facts, decisions, procedures, and gotchas. Sessions are reserved for captured episodic evidence.
 
-Physical scope is either global or project. Project search returns the current project plus global memories by default and never includes unrelated projects. Forgotten memories remain in Markdown with `status: forgotten` and are excluded from normal search.
+Physical scope is either global or project. Project scope exists only when the working directory belongs to a Git repository; outside Git, writes, sessions, search, and automatic recall use global scope and no project metadata is created. Project search returns the current project plus global memories by default and never includes unrelated projects. Forgotten memories remain in Markdown with `status: forgotten` and are excluded from normal search.
 
 Every memory has an identifier, type, scope, status, confidence, timestamps, source sessions, tags, optional applicability, and supersession metadata. Applicability dimensions are languages, frameworks, tools, databases, and platforms; empty dimensions indicate the memory is not tied to specific technologies.
 
 ## Project Resolution
 
-Menvane identifies a project in this order:
+Menvane identifies a project only when the working directory belongs to a Git repository, in this order:
 
 1. An explicit `project` value in the nearest ancestor `.menvane.toml`.
 2. A Git repository identity, preferring a normalized canonical remote and otherwise using the canonical Git common directory.
-3. The canonical absolute filesystem path.
+
+Without a Git repository, the working directory has no project identity and memory activity is global. A `.menvane.toml` project override does not create a project outside Git.
 
 Equivalent HTTPS, SSH, and SCP-style Git remotes resolve to the same identity. Worktrees sharing a Git common directory resolve to the same project. Known checkout paths are informational and do not define identity when a remote is available.
 

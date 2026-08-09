@@ -5,6 +5,8 @@ use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use tempfile::TempDir;
 use uuid::Uuid;
 
+mod common;
+
 #[test]
 fn procedure_reinforcement_activation_failure_and_promotion() {
     let temporary = TempDir::new().unwrap();
@@ -14,6 +16,9 @@ fn procedure_reinforcement_activation_failure_and_promotion() {
     fs::create_dir_all(&project_a).unwrap();
     fs::create_dir_all(&project_b).unwrap();
     fs::create_dir_all(&project_c).unwrap();
+    common::init_git(&project_a);
+    common::init_git(&project_b);
+    common::init_git(&project_c);
     let menvane = Menvane::new(temporary.path().join("home")).unwrap();
     let first = write_procedure(&menvane, &project_a);
     assert_eq!(first.metadata.status, MemoryStatus::Candidate);
