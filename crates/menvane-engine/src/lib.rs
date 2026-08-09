@@ -21,9 +21,10 @@ use menvane_domain::{
     NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProviderHealth,
     ReinforcementSignal, Scope,
 };
-use menvane_store::{
+pub use menvane_store::mark_forgotten;
+pub use menvane_store::{
     IndexStore, IntegrationRecord, JobRecord, MarkdownStore, OrphanRecord, SearchResult,
-    SessionRepository, mark_forgotten,
+    SessionRepository,
 };
 use serde::Deserialize;
 use serde::Serialize;
