@@ -298,7 +298,7 @@ fn prepare_interrupted_migration(index: &Path, state: &Path) {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO sessions SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported FROM legacy.sessions",
+            "INSERT INTO sessions(id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported) SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported FROM legacy.sessions",
             [],
         )
         .unwrap();

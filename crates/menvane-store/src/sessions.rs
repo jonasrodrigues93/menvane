@@ -2,10 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use menvane_domain::{NormalizedEvent, NormalizedEventKind, ReinforcementSignal, SessionState};
+use menvane_domain::{
+    EpisodeState, IntentClassificationSource, NormalizedEvent, NormalizedEventKind, PromptIntent,
+    PromptIntentKind, ReinforcementSignal, SessionState, TaskEpisode,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const SESSION_SCHEMA: &str = r#"
@@ -21,10 +25,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_event_at TEXT NOT NULL,
     markdown_path TEXT,
     imported INTEGER NOT NULL DEFAULT 0,
+    conversation_key TEXT NOT NULL DEFAULT '',
     UNIQUE(client, external_session_id, generation)
 );
 CREATE INDEX IF NOT EXISTS sessions_external ON sessions(client, external_session_id, generation DESC);
 CREATE INDEX IF NOT EXISTS sessions_state_event ON sessions(state, last_event_at);
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_key TEXT PRIMARY KEY,
+    client TEXT NOT NULL,
+    external_session_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(client, external_session_id)
+);
 CREATE TABLE IF NOT EXISTS session_events (
     event_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -100,6 +113,49 @@ CREATE TABLE IF NOT EXISTS orphan_sessions (
     created_at TEXT NOT NULL,
     PRIMARY KEY(client, external_session_id)
 );
+CREATE TABLE IF NOT EXISTS task_episodes (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    conversation_key TEXT NOT NULL,
+    root_event_id TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+    state TEXT NOT NULL CHECK(state IN ('active', 'dormant', 'completed')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(root_event_id) REFERENCES session_events(event_id)
+);
+CREATE INDEX IF NOT EXISTS task_episodes_active ON task_episodes(conversation_key, project_id, state, ordinal);
+CREATE TABLE IF NOT EXISTS prompt_intents (
+    event_id TEXT PRIMARY KEY,
+    episode_id TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    weight REAL NOT NULL,
+    classifier_version TEXT NOT NULL,
+    source TEXT NOT NULL,
+    classified_at TEXT NOT NULL,
+    FOREIGN KEY(event_id) REFERENCES session_events(event_id),
+    FOREIGN KEY(episode_id) REFERENCES task_episodes(id)
+);
+CREATE INDEX IF NOT EXISTS prompt_intents_episode ON prompt_intents(episode_id, classified_at, event_id);
+CREATE TABLE IF NOT EXISTS prompt_intent_history (
+    event_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    conversation_key TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    weight REAL NOT NULL,
+    classifier_version TEXT NOT NULL,
+    source TEXT NOT NULL,
+    classified_at TEXT NOT NULL,
+    replaced_at TEXT NOT NULL,
+    PRIMARY KEY(event_id, revision),
+    FOREIGN KEY(event_id) REFERENCES session_events(event_id)
+);
+CREATE INDEX IF NOT EXISTS prompt_intent_history_event ON prompt_intent_history(event_id, revision);
 CREATE TABLE IF NOT EXISTS operational_migration_markers (
     migration TEXT NOT NULL,
     table_name TEXT NOT NULL,
@@ -160,6 +216,16 @@ pub struct SessionRecord {
     pub last_event_at: DateTime<Utc>,
     pub markdown_path: Option<PathBuf>,
     pub imported: bool,
+    pub conversation_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptIntentHistory {
+    pub event_id: String,
+    pub revision: u32,
+    pub conversation_key: String,
+    pub previous: PromptIntent,
+    pub replaced_at: DateTime<Utc>,
 }
 
 pub struct IngestResult {
@@ -221,6 +287,7 @@ impl SessionRepository {
         {
             migrate_legacy_operational_tables(&mut connection, legacy_index)?;
         }
+        ensure_conversation_keys(&connection)?;
         Ok(())
     }
 
@@ -243,7 +310,19 @@ impl SessionRepository {
         }
         let previous = latest_session(&transaction, &event.client, &event.external_session_id)?;
         let session = match previous {
-            Some(previous) if previous.state != SessionState::Finalized => previous,
+            Some(previous) if previous.state != SessionState::Finalized => {
+                if previous
+                    .project_id
+                    .as_deref()
+                    .is_some_and(|previous| Some(previous) != project_id)
+                {
+                    bail!(
+                        "active session {} cannot be reused across project identities",
+                        previous.id
+                    );
+                }
+                previous
+            }
             Some(previous) => {
                 create_session(&transaction, event, project_id, previous.generation + 1)?
             }
@@ -362,6 +441,195 @@ impl SessionRepository {
     pub fn session(&self, id: Uuid) -> Result<SessionRecord> {
         let connection = self.open()?;
         session_by_id(&connection, id)
+    }
+
+    pub fn create_episode(
+        &self,
+        session_id: Uuid,
+        root_event_id: &str,
+        goal: &str,
+    ) -> Result<TaskEpisode> {
+        if goal.trim().is_empty() {
+            bail!("episode goal cannot be empty");
+        }
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = session_by_id(&transaction, session_id)?;
+        let root_session: Option<String> = transaction
+            .query_row(
+                "SELECT session_id FROM session_events WHERE event_id=?1",
+                [root_event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if root_session.as_deref() != Some(&session.id.to_string()) {
+            bail!("episode root event does not belong to its session");
+        }
+        let ordinal: u32 = transaction.query_row(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM task_episodes WHERE conversation_key=?1",
+            [session.conversation_key.as_str()],
+            |row| row.get(0),
+        )?;
+        let episode = TaskEpisode {
+            id: Uuid::now_v7(),
+            project_id: session.project_id,
+            conversation_key: session.conversation_key,
+            root_event_id: root_event_id.to_owned(),
+            goal: goal.trim().to_owned(),
+            ordinal,
+            state: EpisodeState::Active,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        insert_episode(&transaction, &episode)?;
+        transaction.commit()?;
+        Ok(episode)
+    }
+
+    pub fn episode(&self, id: Uuid) -> Result<TaskEpisode> {
+        let connection = self.open()?;
+        episode_by_id(&connection, id)
+    }
+
+    pub fn update_episode(&self, episode: &TaskEpisode) -> Result<TaskEpisode> {
+        if episode.goal.trim().is_empty() {
+            bail!("episode goal cannot be empty");
+        }
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = episode_by_id(&transaction, episode.id)?;
+        if current.project_id != episode.project_id
+            || current.conversation_key != episode.conversation_key
+            || current.root_event_id != episode.root_event_id
+            || current.ordinal != episode.ordinal
+            || current.created_at != episode.created_at
+        {
+            bail!("episode identity cannot be changed");
+        }
+        transaction.execute(
+            "UPDATE task_episodes SET goal=?1, ordinal=?2, state=?3, updated_at=?4 WHERE id=?5",
+            params![
+                episode.goal.trim(),
+                episode.ordinal,
+                episode_state(episode.state),
+                episode.updated_at.to_rfc3339(),
+                episode.id.to_string()
+            ],
+        )?;
+        let updated = episode_by_id(&transaction, episode.id)?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    pub fn list_active_episodes(
+        &self,
+        conversation_key: &str,
+        project_id: Option<&str>,
+    ) -> Result<Vec<TaskEpisode>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at
+             FROM task_episodes
+             WHERE conversation_key=?1 AND state='active' AND project_id IS ?2
+             ORDER BY ordinal, id",
+        )?;
+        let rows = statement.query_map(params![conversation_key, project_id], episode_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn list_active_episodes_for_session(&self, session_id: Uuid) -> Result<Vec<TaskEpisode>> {
+        let session = self.session(session_id)?;
+        self.list_active_episodes(&session.conversation_key, session.project_id.as_deref())
+    }
+
+    pub fn record_prompt_intent(&self, intent: &PromptIntent) -> Result<bool> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let conversation_key = validate_intent(&transaction, intent)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO prompt_intents(event_id, episode_id, conversation_key, kind, confidence, weight, classifier_version, source, classified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                intent.event_id,
+                intent.episode_id.to_string(),
+                conversation_key,
+                prompt_intent_kind(intent.kind),
+                intent.confidence,
+                intent.weight,
+                intent.classifier_version,
+                classification_source(intent.source),
+                intent.classified_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(inserted == 1)
+    }
+
+    pub fn prompt_intent(&self, event_id: &str) -> Result<PromptIntent> {
+        let connection = self.open()?;
+        prompt_intent_by_event(&connection, event_id)
+    }
+
+    pub fn review_prompt_intent(&self, intent: &PromptIntent) -> Result<bool> {
+        if intent.source != IntentClassificationSource::ProviderReview {
+            bail!("prompt intent review must use provider-review source");
+        }
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let conversation_key = validate_intent(&transaction, intent)?;
+        let current = prompt_intent_by_event(&transaction, &intent.event_id)?;
+        if same_classification(&current, intent) {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let revision: u32 = transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM prompt_intent_history WHERE event_id=?1",
+            [&intent.event_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO prompt_intent_history(event_id, revision, conversation_key, episode_id, kind, confidence, weight, classifier_version, source, classified_at, replaced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                current.event_id,
+                revision,
+                current_conversation_key(&transaction, &current.event_id)?,
+                current.episode_id.to_string(),
+                prompt_intent_kind(current.kind),
+                current.confidence,
+                current.weight,
+                current.classifier_version,
+                classification_source(current.source),
+                current.classified_at.to_rfc3339(),
+                intent.classified_at.to_rfc3339(),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE prompt_intents SET episode_id=?1, conversation_key=?2, kind=?3, confidence=?4, weight=?5, classifier_version=?6, source=?7, classified_at=?8 WHERE event_id=?9",
+            params![
+                intent.episode_id.to_string(),
+                conversation_key,
+                prompt_intent_kind(intent.kind),
+                intent.confidence,
+                intent.weight,
+                intent.classifier_version,
+                classification_source(intent.source),
+                intent.classified_at.to_rfc3339(),
+                intent.event_id,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn prompt_intent_history(&self, event_id: &str) -> Result<Vec<PromptIntentHistory>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT event_id, revision, conversation_key, episode_id, kind, confidence, weight, classifier_version, source, classified_at, replaced_at
+             FROM prompt_intent_history WHERE event_id=?1 ORDER BY revision",
+        )?;
+        let rows = statement.query_map([event_id], history_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
     }
 
     pub fn jobs(&self) -> Result<Vec<JobRecord>> {
@@ -738,15 +1006,24 @@ fn create_session(
     generation: u32,
 ) -> Result<SessionRecord> {
     let id = Uuid::now_v7();
+    let conversation_key = conversation_key(&event.client, &event.external_session_id);
+    ensure_conversation(
+        transaction,
+        &conversation_key,
+        &event.client,
+        &event.external_session_id,
+        &event.timestamp,
+    )?;
     transaction.execute(
-        "INSERT INTO sessions(id, client, external_session_id, project_id, generation, state, started_at, last_event_at, imported) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6, 0)",
+        "INSERT INTO sessions(id, client, external_session_id, project_id, generation, state, started_at, last_event_at, imported, conversation_key) VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?6, 0, ?7)",
         params![
             id.to_string(),
             event.client,
             event.external_session_id,
             project_id,
             generation,
-            event.timestamp.to_rfc3339()
+            event.timestamp.to_rfc3339(),
+            conversation_key,
         ],
     )?;
     session_by_id(transaction, id)
@@ -759,7 +1036,7 @@ fn latest_session(
 ) -> Result<Option<SessionRecord>> {
     transaction
         .query_row(
-            "SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1",
+            "SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, conversation_key FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1",
             params![client, external_session_id],
             session_from_row,
         )
@@ -770,7 +1047,7 @@ fn latest_session(
 fn session_by_id(connection: &Connection, id: Uuid) -> Result<SessionRecord> {
     connection
         .query_row(
-            "SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported FROM sessions WHERE id=?1",
+            "SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, conversation_key FROM sessions WHERE id=?1",
             [id.to_string()],
             session_from_row,
         )
@@ -783,6 +1060,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
     let started_at: String = row.get(6)?;
     let ended_at: Option<String> = row.get(7)?;
     let last_event_at: String = row.get(8)?;
+    let conversation_key: String = row.get(11)?;
     Ok(SessionRecord {
         id: Uuid::parse_str(&id).map_err(sql_conversion_error)?,
         client: row.get(1)?,
@@ -798,6 +1076,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         last_event_at: parse_timestamp(&last_event_at).map_err(sql_conversion_error)?,
         markdown_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
         imported: row.get(10)?,
+        conversation_key,
     })
 }
 
@@ -860,6 +1139,10 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
     if current < 3 {
         migrate_to_version_3(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (3)", [])?;
+    }
+    if current < 4 {
+        migrate_to_version_4(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (4)", [])?;
     }
     Ok(())
 }
@@ -963,6 +1246,228 @@ fn migrate_to_version_3(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_version_4(connection: &Connection) -> Result<()> {
+    let exists: Option<()> = connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('sessions') WHERE name='conversation_key'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if exists.is_none() {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN conversation_key TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    ensure_conversation_keys(connection)
+}
+
+fn ensure_conversation_keys(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT client, external_session_id, MIN(started_at), MAX(last_event_at)
+         FROM sessions WHERE conversation_key='' OR conversation_key IS NULL
+         GROUP BY client, external_session_id",
+    )?;
+    let sessions = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (client, external_session_id, created_at, updated_at) in sessions {
+        let key = conversation_key(&client, &external_session_id);
+        connection.execute(
+            "INSERT OR IGNORE INTO conversations(conversation_key, client, external_session_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![key, client, external_session_id, created_at],
+        )?;
+        connection.execute(
+            "UPDATE conversations SET updated_at=?1 WHERE conversation_key=?2",
+            params![updated_at, key],
+        )?;
+        connection.execute(
+            "UPDATE sessions SET conversation_key=?1 WHERE client=?2 AND external_session_id=?3 AND (conversation_key='' OR conversation_key IS NULL)",
+            params![key, client, external_session_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_conversation(
+    connection: &Connection,
+    key: &str,
+    client: &str,
+    external_session_id: &str,
+    timestamp: &DateTime<Utc>,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO conversations(conversation_key, client, external_session_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(conversation_key) DO UPDATE SET updated_at=excluded.updated_at",
+        params![
+            key,
+            client,
+            external_session_id,
+            timestamp.to_rfc3339()
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_episode(connection: &Connection, episode: &TaskEpisode) -> Result<()> {
+    connection.execute(
+        "INSERT INTO task_episodes(id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            episode.id.to_string(),
+            episode.project_id,
+            episode.conversation_key,
+            episode.root_event_id,
+            episode.goal,
+            episode.ordinal,
+            episode_state(episode.state),
+            episode.created_at.to_rfc3339(),
+            episode.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn episode_by_id(connection: &Connection, id: Uuid) -> Result<TaskEpisode> {
+    connection
+        .query_row(
+            "SELECT id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at FROM task_episodes WHERE id=?1",
+            [id.to_string()],
+            episode_from_row,
+        )
+        .map_err(Into::into)
+}
+
+fn episode_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEpisode> {
+    let id: String = row.get(0)?;
+    let state: String = row.get(6)?;
+    let created_at: String = row.get(7)?;
+    let updated_at: String = row.get(8)?;
+    Ok(TaskEpisode {
+        id: Uuid::parse_str(&id).map_err(sql_conversion_error)?,
+        project_id: row.get(1)?,
+        conversation_key: row.get(2)?,
+        root_event_id: row.get(3)?,
+        goal: row.get(4)?,
+        ordinal: row.get(5)?,
+        state: parse_episode_state(&state).map_err(sql_conversion_error)?,
+        created_at: parse_timestamp(&created_at).map_err(sql_conversion_error)?,
+        updated_at: parse_timestamp(&updated_at).map_err(sql_conversion_error)?,
+    })
+}
+
+fn prompt_intent_by_event(connection: &Connection, event_id: &str) -> Result<PromptIntent> {
+    connection
+        .query_row(
+            "SELECT event_id, episode_id, kind, confidence, weight, classifier_version, source, classified_at FROM prompt_intents WHERE event_id=?1",
+            [event_id],
+            prompt_intent_from_row,
+        )
+        .map_err(Into::into)
+}
+
+fn prompt_intent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromptIntent> {
+    let episode_id: String = row.get(1)?;
+    let kind: String = row.get(2)?;
+    let source: String = row.get(6)?;
+    let classified_at: String = row.get(7)?;
+    Ok(PromptIntent {
+        event_id: row.get(0)?,
+        episode_id: Uuid::parse_str(&episode_id).map_err(sql_conversion_error)?,
+        kind: parse_prompt_intent_kind(&kind).map_err(sql_conversion_error)?,
+        confidence: row.get(3)?,
+        weight: row.get(4)?,
+        classifier_version: row.get(5)?,
+        source: parse_classification_source(&source).map_err(sql_conversion_error)?,
+        classified_at: parse_timestamp(&classified_at).map_err(sql_conversion_error)?,
+    })
+}
+
+fn history_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromptIntentHistory> {
+    let intent = PromptIntent {
+        event_id: row.get(0)?,
+        episode_id: Uuid::parse_str(&row.get::<_, String>(3)?).map_err(sql_conversion_error)?,
+        kind: parse_prompt_intent_kind(&row.get::<_, String>(4)?).map_err(sql_conversion_error)?,
+        confidence: row.get(5)?,
+        weight: row.get(6)?,
+        classifier_version: row.get(7)?,
+        source: parse_classification_source(&row.get::<_, String>(8)?)
+            .map_err(sql_conversion_error)?,
+        classified_at: parse_timestamp(&row.get::<_, String>(9)?).map_err(sql_conversion_error)?,
+    };
+    Ok(PromptIntentHistory {
+        event_id: intent.event_id.clone(),
+        revision: row.get(1)?,
+        conversation_key: row.get(2)?,
+        previous: intent,
+        replaced_at: parse_timestamp(&row.get::<_, String>(10)?).map_err(sql_conversion_error)?,
+    })
+}
+
+fn current_conversation_key(connection: &Connection, event_id: &str) -> Result<String> {
+    connection
+        .query_row(
+            "SELECT conversation_key FROM prompt_intents WHERE event_id=?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn validate_intent(connection: &Connection, intent: &PromptIntent) -> Result<String> {
+    if !(0.0..=1.0).contains(&intent.confidence) || !(0.0..=1.0).contains(&intent.weight) {
+        bail!("prompt intent confidence and weight must be between 0 and 1");
+    }
+    let session: (String, Option<String>) = connection.query_row(
+        "SELECT conversation_key, project_id FROM sessions WHERE id=(SELECT session_id FROM session_events WHERE event_id=?1)",
+        [&intent.event_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let episode: (String, Option<String>) = connection.query_row(
+        "SELECT conversation_key, project_id FROM task_episodes WHERE id=?1",
+        [intent.episode_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if session != episode {
+        bail!("prompt intent episode does not match its event conversation or project");
+    }
+    Ok(session.0)
+}
+
+fn same_classification(current: &PromptIntent, next: &PromptIntent) -> bool {
+    current.event_id == next.event_id
+        && current.episode_id == next.episode_id
+        && current.kind == next.kind
+        && current.confidence == next.confidence
+        && current.weight == next.weight
+        && current.classifier_version == next.classifier_version
+        && current.source == next.source
+}
+
+pub fn conversation_key(client: &str, external_session_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"menvane-conversation-v1\0");
+    for value in [client, external_session_id] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("v1:{encoded}")
+}
+
 fn state_after_event(current: SessionState, event: NormalizedEventKind) -> SessionState {
     match event {
         NormalizedEventKind::SessionEnded => SessionState::Finalized,
@@ -990,6 +1495,72 @@ fn session_state(state: SessionState) -> &'static str {
         SessionState::Open => "open",
         SessionState::Idle => "idle",
         SessionState::Finalized => "finalized",
+    }
+}
+
+fn episode_state(state: EpisodeState) -> &'static str {
+    match state {
+        EpisodeState::Active => "active",
+        EpisodeState::Dormant => "dormant",
+        EpisodeState::Completed => "completed",
+    }
+}
+
+fn parse_episode_state(value: &str) -> std::io::Result<EpisodeState> {
+    match value {
+        "active" => Ok(EpisodeState::Active),
+        "dormant" => Ok(EpisodeState::Dormant),
+        "completed" => Ok(EpisodeState::Completed),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid episode state: {value}"),
+        )),
+    }
+}
+
+fn prompt_intent_kind(kind: PromptIntentKind) -> &'static str {
+    match kind {
+        PromptIntentKind::RootGoal => "root-goal",
+        PromptIntentKind::NewGoal => "new-goal",
+        PromptIntentKind::Refinement => "refinement",
+        PromptIntentKind::Constraint => "constraint",
+        PromptIntentKind::Correction => "correction",
+        PromptIntentKind::FollowUp => "follow-up",
+        PromptIntentKind::Operational => "operational",
+    }
+}
+
+fn parse_prompt_intent_kind(value: &str) -> std::io::Result<PromptIntentKind> {
+    match value {
+        "root-goal" => Ok(PromptIntentKind::RootGoal),
+        "new-goal" => Ok(PromptIntentKind::NewGoal),
+        "refinement" => Ok(PromptIntentKind::Refinement),
+        "constraint" => Ok(PromptIntentKind::Constraint),
+        "correction" => Ok(PromptIntentKind::Correction),
+        "follow-up" => Ok(PromptIntentKind::FollowUp),
+        "operational" => Ok(PromptIntentKind::Operational),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid prompt intent kind: {value}"),
+        )),
+    }
+}
+
+fn classification_source(source: IntentClassificationSource) -> &'static str {
+    match source {
+        IntentClassificationSource::Deterministic => "deterministic",
+        IntentClassificationSource::ProviderReview => "provider-review",
+    }
+}
+
+fn parse_classification_source(value: &str) -> std::io::Result<IntentClassificationSource> {
+    match value {
+        "deterministic" => Ok(IntentClassificationSource::Deterministic),
+        "provider-review" => Ok(IntentClassificationSource::ProviderReview),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid classification source: {value}"),
+        )),
     }
 }
 
