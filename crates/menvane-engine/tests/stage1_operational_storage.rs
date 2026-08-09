@@ -1,0 +1,272 @@
+use std::fs;
+use std::path::Path;
+
+use chrono::{TimeZone, Utc};
+use menvane_domain::{
+    Applicability, MemoryType, NormalizedEvent, NormalizedEventKind, ReinforcementSignal, Scope,
+};
+use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
+use menvane_store::SessionRepository;
+use rusqlite::Connection;
+use serde_json::Value;
+use tempfile::TempDir;
+use uuid::Uuid;
+
+#[test]
+fn legacy_operational_tables_migrate_idempotently_with_markers() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let legacy = SessionRepository::new(home.join("index.sqlite"));
+    legacy.initialize().unwrap();
+    let first = legacy
+        .ingest(
+            &event(
+                "first",
+                "legacy-session",
+                NormalizedEventKind::SessionStarted,
+                Path::new("/tmp/menvane-test-project"),
+            ),
+            None,
+        )
+        .unwrap();
+    legacy
+        .ingest(
+            &event(
+                "second",
+                "legacy-session",
+                NormalizedEventKind::SessionEnded,
+                Path::new("/tmp/menvane-test-project"),
+            ),
+            None,
+        )
+        .unwrap();
+    let memory_id = Uuid::from_u128(7);
+    legacy
+        .record_access(memory_id, ReinforcementSignal::Retrieved)
+        .unwrap();
+    legacy.claim_injection("legacy-key", memory_id).unwrap();
+    legacy
+        .record_procedure_application(memory_id, first.session.id, true)
+        .unwrap();
+    legacy
+        .record_import("legacy", "imported", "orphan", Some("payload"))
+        .unwrap();
+    drop(legacy);
+
+    let state_path = home.join("state.sqlite");
+    prepare_interrupted_migration(&home.join("index.sqlite"), &state_path);
+    let menvane = Menvane::new(&home).unwrap();
+    for table in operational_tables() {
+        assert_eq!(
+            row_count(&home.join("index.sqlite"), table),
+            row_count(&state_path, table),
+            "{table}"
+        );
+    }
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 10);
+    assert!(has_table(&home.join("index.sqlite"), "sessions"));
+    assert_eq!(
+        SessionRepository::new(&state_path)
+            .events(first.session.id)
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(menvane);
+
+    let reopened = Menvane::new(&home).unwrap();
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 10);
+    assert_eq!(
+        SessionRepository::new(&state_path)
+            .events(first.session.id)
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(reopened);
+}
+
+#[test]
+fn reindex_replaces_only_the_derived_index() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path().join("home");
+    let menvane = Menvane::new(&home).unwrap();
+    let cwd = temporary.path().join("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    let session = event(
+        "session",
+        "reindex-session",
+        NormalizedEventKind::SessionStarted,
+        &cwd,
+    );
+    menvane.ingest_event(session).unwrap();
+    menvane
+        .write(
+            &cwd,
+            WriteMemory {
+                title: "Reindex marker".to_owned(),
+                body: "reindex-preserves-derived-search".to_owned(),
+                memory_type: MemoryType::Fact,
+                scope: Scope::Global,
+                confidence: 1.0,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    menvane.reindex().unwrap();
+
+    assert_eq!(row_count(&home.join("state.sqlite"), "sessions"), 1);
+    assert_eq!(row_count(&home.join("state.sqlite"), "session_events"), 1);
+    assert!(!has_table(&home.join("index.sqlite"), "sessions"));
+    assert_eq!(
+        menvane
+            .search(
+                &cwd,
+                "reindex-preserves-derived-search",
+                ScopeSelection::Global,
+                10
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn backup_restore_round_trips_index_and_state_databases() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path().join("home");
+    let backup = temporary.path().join("backup");
+    let menvane = Menvane::new(&home).unwrap();
+    let cwd = temporary.path().join("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    let original = event(
+        "original",
+        "backup-session",
+        NormalizedEventKind::SessionStarted,
+        &cwd,
+    );
+    menvane.ingest_event(original).unwrap();
+    let retained = menvane
+        .write(
+            &cwd,
+            WriteMemory {
+                title: "Backup retained".to_owned(),
+                body: "backup-retained-memory".to_owned(),
+                memory_type: MemoryType::Fact,
+                scope: Scope::Global,
+                confidence: 1.0,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap()
+        .metadata
+        .id;
+    menvane.backup(&backup).unwrap();
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(backup.join("manifest.json")).unwrap()).unwrap();
+    let files = manifest["files"].as_object().unwrap();
+    assert!(files.contains_key("index.sqlite"));
+    assert!(files.contains_key("state.sqlite"));
+
+    menvane
+        .ingest_event(event(
+            "later",
+            "later-session",
+            NormalizedEventKind::SessionStarted,
+            &cwd,
+        ))
+        .unwrap();
+    menvane.restore(&backup).unwrap();
+
+    assert_eq!(row_count(&home.join("state.sqlite"), "sessions"), 1);
+    assert_eq!(row_count(&home.join("state.sqlite"), "session_events"), 1);
+    assert_eq!(menvane.read(retained).unwrap().title, "Backup retained");
+}
+
+fn operational_tables() -> [&'static str; 10] {
+    [
+        "sessions",
+        "session_events",
+        "observations",
+        "jobs",
+        "imports",
+        "access_events",
+        "integration_state",
+        "session_injections",
+        "procedure_applications",
+        "orphan_sessions",
+    ]
+}
+
+fn row_count(path: &Path, table: &str) -> i64 {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn prepare_interrupted_migration(index: &Path, state: &Path) {
+    SessionRepository::new(state).initialize().unwrap();
+    let connection = Connection::open(state).unwrap();
+    connection
+        .execute(
+            "ATTACH DATABASE ?1 AS legacy",
+            [index.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported FROM legacy.sessions",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO operational_migration_markers(migration, table_name, completed_at) VALUES ('index-to-state-v1', 'sessions', '2023-11-14T22:13:20Z')",
+            [],
+        )
+        .unwrap();
+    connection.execute_batch("DETACH DATABASE legacy").unwrap();
+}
+
+fn has_table(path: &Path, table: &str) -> bool {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn event(
+    id: &str,
+    external_session_id: &str,
+    kind: NormalizedEventKind,
+    cwd: &Path,
+) -> NormalizedEvent {
+    NormalizedEvent {
+        event_id: id.to_owned(),
+        kind,
+        client: "test-client".to_owned(),
+        external_session_id: external_session_id.to_owned(),
+        timestamp: Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        project_id: None,
+        tool_family: None,
+        bounded_input: Some("deterministic evidence".to_owned()),
+        bounded_output: None,
+        attributed_path: None,
+        success: None,
+        model: None,
+    }
+}

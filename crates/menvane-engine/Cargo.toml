@@ -28,3 +28,4 @@ webbrowser.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+rusqlite.workspace = true

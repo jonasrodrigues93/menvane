@@ -188,8 +188,8 @@ impl Menvane {
         let config: MenvaneConfig = toml::from_str(&fs::read_to_string(home.join("config.toml"))?)?;
         let index = IndexStore::new(home.join("index.sqlite"));
         index.initialize()?;
-        let sessions = SessionRepository::new(home.join("index.sqlite"));
-        sessions.initialize()?;
+        let sessions = SessionRepository::new(home.join("state.sqlite"));
+        sessions.initialize_with_legacy(Some(&home.join("index.sqlite")))?;
         Ok(Self {
             home,
             markdown,
@@ -309,9 +309,7 @@ impl Menvane {
     }
 
     pub fn reindex(&self) -> Result<(usize, usize)> {
-        let result = self.index.reindex(&self.markdown)?;
-        self.sessions.initialize()?;
-        Ok(result)
+        self.index.reindex(&self.markdown)
     }
 
     pub fn ingest_event(&self, event: NormalizedEvent) -> Result<CaptureOutcome> {
@@ -713,10 +711,11 @@ impl Menvane {
             destination.join("config.toml"),
         )?;
         self.index.backup(&destination.join("index.sqlite"))?;
+        self.sessions.backup(&destination.join("state.sqlite"))?;
         let mut files = backup_files(destination)?;
         files.sort();
         let manifest = BackupManifest {
-            version: 1,
+            version: 2,
             created_at: Utc::now(),
             files: files
                 .into_iter()
@@ -749,10 +748,14 @@ impl Menvane {
         copy_tree(&source.join("memory"), &staging.join("memory"))?;
         fs::copy(source.join("config.toml"), staging.join("config.toml"))?;
         fs::copy(source.join("index.sqlite"), staging.join("index.sqlite"))?;
+        fs::copy(source.join("state.sqlite"), staging.join("state.sqlite"))?;
         fs::create_dir_all(&previous)?;
-        for name in ["memory", "config.toml", "index.sqlite"] {
+        for name in ["memory", "config.toml", "index.sqlite", "state.sqlite"] {
             let current = self.home.join(name);
             if current.exists() {
+                if name.ends_with(".sqlite") {
+                    remove_sqlite_sidecars(&current)?;
+                }
                 fs::rename(&current, previous.join(name))?;
             }
             fs::rename(staging.join(name), current)?;
@@ -1010,7 +1013,7 @@ impl Menvane {
             .map_err(|error| error.to_string());
         checks.push(check("home writable", writable));
         checks.push(check(
-            "SQLite",
+            "index database",
             self.index
                 .memory_count()
                 .map(|count| format!("{count} memories")),
@@ -1023,6 +1026,7 @@ impl Menvane {
                     .context("unavailable")
             }),
         ));
+        checks.push(check("state database", self.sessions.health()));
         let markdown_counts = self.markdown.project_files().and_then(|projects| {
             self.markdown
                 .memory_files()
@@ -1288,8 +1292,13 @@ struct BackupManifest {
 fn validate_backup(source: &Path) -> Result<()> {
     let manifest: BackupManifest =
         serde_json::from_slice(&fs::read(source.join("manifest.json"))?)?;
-    if manifest.version != 1 {
+    if manifest.version != 2 {
         bail!("unsupported backup version: {}", manifest.version);
+    }
+    for required in ["config.toml", "index.sqlite", "state.sqlite"] {
+        if !manifest.files.contains_key(required) {
+            bail!("backup manifest is missing {required}");
+        }
     }
     for (relative, expected) in manifest.files {
         let path = source.join(&relative);
@@ -1311,6 +1320,9 @@ fn validate_backup(source: &Path) -> Result<()> {
     let index = IndexStore::new(source.join("index.sqlite"));
     index.initialize()?;
     index.memory_count()?;
+    let state = SessionRepository::new(source.join("state.sqlite"));
+    state.initialize()?;
+    state.health()?;
     Ok(())
 }
 
@@ -1347,4 +1359,14 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
 fn sha256_file(path: &Path) -> Result<String> {
     use sha2::Digest;
     Ok(hex::encode(sha2::Sha256::digest(fs::read(path)?)))
+}
+
+fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{}", path.display(), suffix));
+        if sidecar.exists() {
+            fs::remove_file(sidecar)?;
+        }
+    }
+    Ok(())
 }

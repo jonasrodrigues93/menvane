@@ -964,6 +964,7 @@ dependencies = [
  "menvane-store",
  "regex",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

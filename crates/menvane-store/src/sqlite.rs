@@ -9,10 +9,6 @@ use uuid::Uuid;
 use crate::MarkdownStore;
 
 const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version INTEGER PRIMARY KEY
-);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES (1);
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     identity TEXT NOT NULL UNIQUE,
@@ -56,6 +52,19 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     PRIMARY KEY(memory_id, provider, model)
 );
 "#;
+
+const LEGACY_OPERATIONAL_TABLES: &[&str] = &[
+    "sessions",
+    "session_events",
+    "observations",
+    "jobs",
+    "imports",
+    "access_events",
+    "integration_state",
+    "session_injections",
+    "procedure_applications",
+    "orphan_sessions",
+];
 
 #[derive(Debug, Clone, Copy)]
 pub enum SearchScope<'a> {
@@ -286,6 +295,7 @@ impl IndexStore {
     }
 
     pub fn reindex(&self, markdown: &MarkdownStore) -> Result<(usize, usize)> {
+        self.ensure_legacy_operational_tables_are_migrated()?;
         let temporary = self
             .path
             .with_extension(format!("reindex-{}", Uuid::now_v7()));
@@ -339,6 +349,51 @@ impl IndexStore {
 
     fn open_initialized(&self) -> Result<Connection> {
         self.open()
+    }
+
+    fn ensure_legacy_operational_tables_are_migrated(&self) -> Result<()> {
+        let connection = self.open_initialized()?;
+        let legacy_tables = LEGACY_OPERATIONAL_TABLES
+            .iter()
+            .map(|table| format!("'{table}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let legacy_count: i64 = connection.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ({legacy_tables})"
+            ),
+            [],
+            |row| row.get(0),
+        )?;
+        if legacy_count == 0 {
+            return Ok(());
+        }
+        let state_path = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("state.sqlite");
+        if !state_path.exists() {
+            bail!(
+                "cannot replace legacy operational tables without {}",
+                state_path.display()
+            );
+        }
+        let state = Connection::open(&state_path).with_context(|| {
+            format!(
+                "cannot replace legacy operational tables without {}",
+                state_path.display()
+            )
+        })?;
+        let markers: i64 = state.query_row(
+            "SELECT COUNT(*) FROM operational_migration_markers WHERE migration='index-to-state-v1'",
+            [],
+            |row| row.get(0),
+        )?;
+        if markers != i64::try_from(LEGACY_OPERATIONAL_TABLES.len())? {
+            bail!("cannot reindex while legacy operational tables are not fully migrated");
+        }
+        Ok(())
     }
 }
 

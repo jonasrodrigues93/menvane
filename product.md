@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.6.0
+Version: 1.7.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -8,11 +8,11 @@ Menvane is a local persistent memory system for agents. In its current version, 
 
 Menvane stores data under `~/.menvane` by default. `MENVANE_HOME` overrides that location.
 
-The home contains `config.toml`, `index.sqlite`, operational directories, global memory directories, and project memory directories. Durable memories and project metadata are Markdown with YAML frontmatter. SQLite contains derived project and memory metadata and an FTS5 index.
+The home contains `config.toml`, `index.sqlite`, `state.sqlite`, operational directories, global memory directories, and project memory directories. Durable memories and project metadata are Markdown with YAML frontmatter. `index.sqlite` contains only derived project and memory metadata, FTS5 search data, and embeddings. `state.sqlite` contains operational sessions, events, observations, jobs, access events, procedure applications, imports, orphans, integration state, and injection claims.
 
 Markdown writes use a temporary file, filesystem synchronization, and atomic rename before the derived index is updated. If Git is available, the memory directory is initialized as a local repository and durable memory changes are committed automatically. Menvane remains functional when Git is unavailable.
 
-Deleting `index.sqlite` does not delete durable knowledge. `menvane reindex` validates all Markdown into a temporary SQLite database and atomically installs the rebuilt index.
+Deleting `index.sqlite` does not delete durable knowledge or operational evidence. `menvane reindex` validates all Markdown into a temporary SQLite database and atomically installs the rebuilt derived index without changing `state.sqlite`. Existing homes migrate operational tables from the legacy `index.sqlite` to `state.sqlite` with durable, resumable table markers; legacy tables remain until the derived index is safely rebuilt.
 
 ## Memory Model
 
@@ -41,7 +41,7 @@ Technology detection is deterministic and inspects known project files and depen
 
 ## Commands
 
-`menvane write` creates a durable memory. `menvane search` searches current-project and global memory by default. `menvane read` displays a memory. `menvane forget` marks one forgotten. `menvane reindex` reconstructs SQLite from Markdown. `menvane doctor` checks the home, SQLite, FTS5, Git availability, and Markdown/index consistency.
+`menvane write` creates a durable memory. `menvane search` searches current-project and global memory by default. `menvane read` displays a memory. `menvane forget` marks one forgotten. `menvane reindex` reconstructs the derived index from Markdown. `menvane doctor` checks the home, index database, state database, FTS5, Git availability, and Markdown/index consistency independently.
 
 ## Retrieval
 
@@ -157,10 +157,10 @@ REST endpoints under `/api/v1` cover health, projects, memories, sessions, impor
 
 ## Backup, Restore, And Distribution
 
-`menvane backup <path>` creates a new backup directory containing the complete Markdown memory repository, non-secret configuration, a consistent SQLite online backup, and a checksummed manifest. Existing destinations are never overwritten. `menvane restore <path> --confirm` verifies every checksum, configuration, Markdown frontmatter, and SQLite readability before staging and replacing current state. Restore refuses to run while a daemon PID is present and never replaces state without explicit confirmation.
+`menvane backup <path>` creates a new backup directory containing the complete Markdown memory repository, non-secret configuration, consistent SQLite online backups of both `index.sqlite` and `state.sqlite`, and a checksummed manifest. Existing destinations are never overwritten. `menvane restore <path> --confirm` verifies every checksum, configuration, Markdown frontmatter, and both SQLite databases independently before staging and replacing current state. Restore refuses to run while a daemon PID is present and never replaces state without explicit confirmation.
 
-Daemon startup uses one process lock per Menvane home, graceful shutdown, idle-session recovery, WAL, bounded waits, and idempotent event and job keys. Atomic Markdown writes and reindex permit reconciliation after interrupted index updates. Git durable-history writes are serialized independently from concurrent capture.
+Daemon startup uses one process lock per Menvane home, graceful shutdown, idle-session recovery, WAL, bounded waits, and idempotent event and job keys. Atomic Markdown writes and derived-index reindex permit reconciliation after interrupted index updates without removing operational state. Git durable-history writes are serialized independently from concurrent capture.
 
 Release builds target Linux, macOS, and WSL as Linux. The repository CI runs formatting, Clippy, all tests, and release builds without real Codex authentication, OpenRouter credentials, or paid APIs. Runtime provider status may use local non-paid health interfaces; deterministic fake providers and mock servers cover CI behavior.
 
-Menvane is operationally complete when normal work in any connected agent is captured and consolidated, and later connected agents in the same project receive project plus applicable global context automatically. Unrelated project memory remains isolated, contextual global memory respects technology, procedures strengthen through reuse, sessions archive without hard deletion, and deleting SQLite followed by reindex preserves all durable knowledge.
+Menvane is operationally complete when normal work in any connected agent is captured and consolidated, and later connected agents in the same project receive project plus applicable global context automatically. Unrelated project memory remains isolated, contextual global memory respects technology, procedures strengthen through reuse, sessions archive without hard deletion, and rebuilding `index.sqlite` preserves all durable knowledge and operational evidence in `state.sqlite`.

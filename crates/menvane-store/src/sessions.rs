@@ -100,7 +100,52 @@ CREATE TABLE IF NOT EXISTS orphan_sessions (
     created_at TEXT NOT NULL,
     PRIMARY KEY(client, external_session_id)
 );
+CREATE TABLE IF NOT EXISTS operational_migration_markers (
+    migration TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    PRIMARY KEY(migration, table_name)
+);
 "#;
+
+const OPERATIONAL_MIGRATION: &str = "index-to-state-v1";
+
+const OPERATIONAL_TABLES: &[(&str, &str)] = &[
+    (
+        "sessions",
+        "id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported",
+    ),
+    (
+        "session_events",
+        "event_id, session_id, kind, timestamp, payload_json",
+    ),
+    (
+        "observations",
+        "id, session_id, event_id, kind, content, created_at",
+    ),
+    (
+        "jobs",
+        "id, job_type, dedupe_key, status, payload_json, attempt_count, next_retry_at, last_error, provider, created_at, updated_at",
+    ),
+    (
+        "imports",
+        "id, client, external_session_id, status, created_at",
+    ),
+    ("access_events", "id, memory_id, signal, created_at"),
+    (
+        "integration_state",
+        "client, connected, mcp_registered, hook_status, last_event_at, details_json",
+    ),
+    ("session_injections", "session_key, memory_id, injected_at"),
+    (
+        "procedure_applications",
+        "memory_id, source_session, signal, created_at",
+    ),
+    (
+        "orphan_sessions",
+        "client, external_session_id, payload_json, created_at",
+    ),
+];
 
 #[derive(Debug, Clone)]
 pub struct SessionRecord {
@@ -159,10 +204,20 @@ impl SessionRepository {
     }
 
     pub fn initialize(&self) -> Result<()> {
-        let connection = self.open()?;
+        self.initialize_with_legacy(None)
+    }
+
+    pub fn initialize_with_legacy(&self, legacy_index: Option<&Path>) -> Result<()> {
+        let mut connection = self.open()?;
         connection.execute_batch("PRAGMA journal_mode=WAL;")?;
         connection.execute_batch(SESSION_SCHEMA)?;
         apply_migrations(&connection)?;
+        if let Some(legacy_index) = legacy_index
+            && legacy_index != self.path.as_path()
+            && legacy_index.exists()
+        {
+            migrate_legacy_operational_tables(&mut connection, legacy_index)?;
+        }
         Ok(())
     }
 
@@ -328,6 +383,22 @@ impl SessionRepository {
             })
         })
         .collect()
+    }
+
+    pub fn health(&self) -> Result<String> {
+        let connection = self.open()?;
+        let sessions: u64 =
+            connection.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+        let jobs: u64 = connection.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
+        Ok(format!("{sessions} sessions, {jobs} jobs"))
+    }
+
+    pub fn backup(&self, destination: &Path) -> Result<()> {
+        let source = self.open()?;
+        let mut destination = Connection::open(destination)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+        backup.run_to_completion(128, Duration::from_millis(10), None)?;
+        Ok(())
     }
 
     pub fn claim_compile_job(&self) -> Result<Option<JobRecord>> {
@@ -716,6 +787,65 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
     if current < 2 {
         migrate_to_version_2(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (2)", [])?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_operational_tables(
+    connection: &mut Connection,
+    legacy_index: &Path,
+) -> Result<()> {
+    let legacy_path = legacy_index.to_string_lossy().into_owned();
+    connection.execute("ATTACH DATABASE ?1 AS legacy", [&legacy_path])?;
+    let result = migrate_attached_operational_tables(connection);
+    if let Err(error) = result {
+        let _ = connection.execute_batch("DETACH DATABASE legacy");
+        return Err(error);
+    }
+    connection.execute_batch("DETACH DATABASE legacy")?;
+    Ok(())
+}
+
+fn migrate_attached_operational_tables(connection: &mut Connection) -> Result<()> {
+    let migration_complete: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM operational_migration_markers WHERE migration=?1",
+        [OPERATIONAL_MIGRATION],
+        |row| row.get(0),
+    )?;
+    if migration_complete == i64::try_from(OPERATIONAL_TABLES.len())? {
+        return Ok(());
+    }
+
+    for (table, columns) in OPERATIONAL_TABLES {
+        let marked: Option<()> = connection
+            .query_row(
+                "SELECT 1 FROM operational_migration_markers WHERE migration=?1 AND table_name=?2",
+                params![OPERATIONAL_MIGRATION, table],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if marked.is_some() {
+            continue;
+        }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM legacy.sqlite_master WHERE type='table' AND name=?1)",
+            [*table],
+            |row| row.get(0),
+        )?;
+        if exists {
+            transaction.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO {table}({columns}) SELECT {columns} FROM legacy.{table}"
+                ),
+                [],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO operational_migration_markers(migration, table_name, completed_at) VALUES (?1, ?2, ?3)",
+            params![OPERATIONAL_MIGRATION, table, Utc::now().to_rfc3339()],
+        )?;
+        transaction.commit()?;
     }
     Ok(())
 }
