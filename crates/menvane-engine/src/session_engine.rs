@@ -7,6 +7,7 @@ use menvane_domain::{
 };
 use menvane_store::{JobRecord, SessionRecord};
 
+use crate::IntentEngine;
 use crate::Menvane;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,7 @@ impl<'a> SessionEngine<'a> {
             .menvane
             .sessions
             .ingest(&event, project.as_ref().map(|project| project.id.as_str()))?;
+        IntentEngine::new(&self.menvane.sessions).classify(&event, &result.session)?;
         if !result.inserted {
             return Ok(CaptureOutcome::Duplicate);
         }

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use menvane_domain::{
     EpisodeState, IntentClassificationSource, NormalizedEvent, NormalizedEventKind, PromptIntent,
@@ -299,8 +299,12 @@ impl SessionRepository {
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if event_exists(&transaction, &event.event_id)? {
-            let session = latest_session(&transaction, &event.client, &event.external_session_id)?
-                .context("duplicate event refers to a missing session")?;
+            let session_id: String = transaction.query_row(
+                "SELECT session_id FROM session_events WHERE event_id=?1",
+                [&event.event_id],
+                |row| row.get(0),
+            )?;
+            let session = session_by_id(&transaction, Uuid::parse_str(&session_id)?)?;
             transaction.commit()?;
             return Ok(IngestResult {
                 session,
@@ -465,9 +469,21 @@ impl SessionRepository {
         if root_session.as_deref() != Some(&session.id.to_string()) {
             bail!("episode root event does not belong to its session");
         }
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM task_episodes WHERE root_event_id=?1",
+                [root_event_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            let episode = episode_by_id(&transaction, Uuid::parse_str(&id)?)?;
+            transaction.commit()?;
+            return Ok(episode);
+        }
         let ordinal: u32 = transaction.query_row(
-            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM task_episodes WHERE conversation_key=?1",
-            [session.conversation_key.as_str()],
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM task_episodes WHERE conversation_key=?1 AND project_id IS ?2",
+            params![session.conversation_key, session.project_id],
             |row| row.get(0),
         )?;
         let episode = TaskEpisode {
@@ -489,6 +505,18 @@ impl SessionRepository {
     pub fn episode(&self, id: Uuid) -> Result<TaskEpisode> {
         let connection = self.open()?;
         episode_by_id(&connection, id)
+    }
+
+    pub fn episode_for_root_event(&self, root_event_id: &str) -> Result<Option<TaskEpisode>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at FROM task_episodes WHERE root_event_id=?1",
+                [root_event_id],
+                episode_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn update_episode(&self, episode: &TaskEpisode) -> Result<TaskEpisode> {
@@ -542,6 +570,22 @@ impl SessionRepository {
         self.list_active_episodes(&session.conversation_key, session.project_id.as_deref())
     }
 
+    pub fn list_episodes(
+        &self,
+        conversation_key: &str,
+        project_id: Option<&str>,
+    ) -> Result<Vec<TaskEpisode>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at
+             FROM task_episodes
+             WHERE conversation_key=?1 AND project_id IS ?2
+             ORDER BY ordinal, id",
+        )?;
+        let rows = statement.query_map(params![conversation_key, project_id], episode_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
     pub fn record_prompt_intent(&self, intent: &PromptIntent) -> Result<bool> {
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -568,6 +612,26 @@ impl SessionRepository {
     pub fn prompt_intent(&self, event_id: &str) -> Result<PromptIntent> {
         let connection = self.open()?;
         prompt_intent_by_event(&connection, event_id)
+    }
+
+    pub fn list_prompt_intents(
+        &self,
+        conversation_key: &str,
+        project_id: Option<&str>,
+    ) -> Result<Vec<PromptIntent>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT i.event_id, i.episode_id, i.kind, i.confidence, i.weight, i.classifier_version, i.source, i.classified_at
+             FROM prompt_intents i
+             JOIN task_episodes e ON e.id=i.episode_id
+             WHERE i.conversation_key=?1 AND e.project_id IS ?2
+             ORDER BY i.classified_at, i.event_id",
+        )?;
+        let rows = statement.query_map(
+            params![conversation_key, project_id],
+            prompt_intent_from_row,
+        )?;
+        rows.map(|row| row.map_err(Into::into)).collect()
     }
 
     pub fn review_prompt_intent(&self, intent: &PromptIntent) -> Result<bool> {

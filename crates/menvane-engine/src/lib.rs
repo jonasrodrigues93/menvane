@@ -1,6 +1,7 @@
 mod compiler;
 mod decay;
 mod global_promoter;
+mod intent_engine;
 mod oauth_provider;
 mod project_resolver;
 mod providers;
@@ -19,8 +20,8 @@ use chrono::Utc;
 use fs2::FileExt;
 use menvane_domain::{
     Applicability, JsonSchema, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryType,
-    NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProviderHealth,
-    ReinforcementSignal, Scope,
+    NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, PromptIntent, ProviderHealth,
+    ReinforcementSignal, Scope, TaskEpisode,
 };
 pub use menvane_store::mark_forgotten;
 pub use menvane_store::{
@@ -34,6 +35,9 @@ use uuid::Uuid;
 pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
 pub use decay::DecayEngine;
 pub use global_promoter::GlobalPromoter;
+pub use intent_engine::{
+    CLASSIFIER_VERSION, ClassifierDiagnostics, ClassifierWeights, IntentEngine,
+};
 pub use oauth_provider::OpenAiOAuthProvider;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
 pub use providers::{CodexProvider, OpenAIApiProvider, OpenRouterProvider, ProviderChain};
@@ -341,6 +345,26 @@ impl Menvane {
             return Ok(CaptureOutcome::Dropped);
         };
         SessionEngine::new(self).ingest(event)
+    }
+
+    pub fn episodes(
+        &self,
+        conversation_key: &str,
+        project_id: Option<&str>,
+    ) -> Result<Vec<TaskEpisode>> {
+        IntentEngine::new(&self.sessions).episodes(conversation_key, project_id)
+    }
+
+    pub fn prompt_intents(
+        &self,
+        conversation_key: &str,
+        project_id: Option<&str>,
+    ) -> Result<Vec<PromptIntent>> {
+        IntentEngine::new(&self.sessions).intents(conversation_key, project_id)
+    }
+
+    pub fn classifier_diagnostics(&self) -> ClassifierDiagnostics {
+        IntentEngine::new(&self.sessions).diagnostics()
     }
 
     pub fn sanitize_event(&self, event: NormalizedEvent) -> Result<Option<NormalizedEvent>> {

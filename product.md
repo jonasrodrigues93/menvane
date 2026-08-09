@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.9.0
+Version: 1.10.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -64,6 +64,8 @@ Clients send a normalized vocabulary of session-started, user-prompt, tool-compl
 Capture removes authentication headers, likely API keys and tokens, bounds prompts and tool inputs and outputs, and drops reliably attributed ignored paths before persistence. Default limits are 16,384 bytes for prompts and 4,096 bytes for tool input and output. Default ignored paths include environment files, secret directories, and SSH directories. Menvane never captures private model reasoning.
 
 Sessions are open, idle, or finalized. Session end queues deterministic finalization without waiting for background work. Turn stop marks idle, and idle sessions queue finalization after 120 seconds by default. Events arriving after finalization reuse the external session identifier in a new generation and process only new evidence.
+
+Each conversation can contain multiple task episodes spanning session generations. The first user prompt creates a root episode. Deterministic provider-free classification records root goals, new goals, refinements, constraints, corrections, follow-ups, and operational prompts with a version and observable signal weights. Strong lexical or topic changes create a new episode and make prior active episodes dormant; corrections update the active goal, while refinements, constraints, short follow-ups, turn stops, and elapsed time do not create a new task. Episodes continue only within the same project identity, and project changes create an isolated root episode. Duplicate event delivery repairs missing episode or intent state idempotently against the event's owning session.
 
 Finalization writes concise episodic Markdown containing the goal, outcome, important actions, explicit deterministic evidence, errors, validation, and involved files. It does not copy complete transcripts or tool outputs. Finalization is asynchronous, idempotent, and recoverable through the daemon worker; it queues compilation without requiring an available language-model provider.
 
