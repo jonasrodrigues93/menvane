@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     UNIQUE(job_type, dedupe_key)
 );
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status, next_retry_at);
+CREATE TABLE IF NOT EXISTS compilation_operations (
+    operation_key TEXT PRIMARY KEY,
+    memory_ids_json TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS imports (
     id TEXT PRIMARY KEY,
     client TEXT NOT NULL,
@@ -598,6 +603,42 @@ impl SessionRepository {
         )?;
         let rows = statement.query_map([session_id.to_string()], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn compilation_operation_result(&self, operation_key: &str) -> Result<Option<Vec<Uuid>>> {
+        let connection = self.open()?;
+        let value: Option<String> = connection
+            .query_row(
+                "SELECT memory_ids_json FROM compilation_operations WHERE operation_key=?1",
+                [operation_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| {
+                serde_json::from_str::<Vec<String>>(&value)?
+                    .into_iter()
+                    .map(|id| Uuid::parse_str(&id).map_err(anyhow::Error::new))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()
+    }
+
+    pub fn record_compilation_operation(
+        &self,
+        operation_key: &str,
+        memory_ids: &[Uuid],
+    ) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO compilation_operations(operation_key, memory_ids_json, applied_at) VALUES (?1, ?2, ?3)",
+            params![
+                operation_key,
+                serde_json::to_string(&memory_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn associate_event_with_active_episode(&self, event_id: &str) -> Result<Option<Uuid>> {

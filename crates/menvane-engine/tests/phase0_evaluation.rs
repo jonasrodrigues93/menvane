@@ -54,6 +54,7 @@ async fn phase0_corpus_compiles_replays_recall_and_matches_baseline() {
         let result = compiler.compile(compilation_input(fixture)).await.unwrap();
         assert_eq!(result.provider, "fixture");
         assert_eq!(result.model, "phase-0-deterministic");
+        assert_compiled_operations(fixture, &result.operations);
         assert_compiled_memories(fixture, &result.memories);
         compiled.insert(fixture.id.clone(), result.memories);
     }
@@ -76,6 +77,23 @@ async fn phase0_corpus_compiles_replays_recall_and_matches_baseline() {
     let expected: Value =
         serde_json::from_str(include_str!("fixtures/phase0/baseline.json")).unwrap();
     assert_eq!(serde_json::to_value(report).unwrap(), expected);
+}
+
+fn assert_compiled_operations(fixture: &Fixture, actual: &[menvane_engine::CompiledOperation]) {
+    let expected = fixture.expected.memory_operations.as_array().unwrap();
+    assert_eq!(actual.len(), expected.len(), "{}", fixture.id);
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert_eq!(
+            actual.operation,
+            expected["operation"].as_str().unwrap(),
+            "{}",
+            fixture.id
+        );
+        assert_eq!(
+            serde_json::to_value(&actual.evidence_event_ids).unwrap(),
+            expected["evidence_event_ids"]
+        );
+    }
 }
 
 fn assert_category_coverage(corpus: &Corpus) {

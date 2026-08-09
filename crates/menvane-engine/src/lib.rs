@@ -12,7 +12,7 @@ mod sanitizer;
 mod session_engine;
 mod technology_detector;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -34,9 +34,14 @@ pub use menvane_store::{
 };
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
+pub use compiler::{
+    CompilationInput, CompilationResult, CompiledMemory, CompiledOperation,
+    GLOBAL_SCOPE_CONFIDENCE_THRESHOLD, MemoryCompiler, RELATED_MEMORY_BUDGET_BYTES,
+    RELATED_MEMORY_LIMIT, RelatedMemory, RelatedMemoryProvenance,
+};
 pub use decay::DecayEngine;
 pub use evidence::{
     DEFAULT_EVIDENCE_BUDGET_BYTES, EvidenceBuilder, MAX_SESSION_MARKDOWN_BYTES,
@@ -1459,15 +1464,36 @@ impl Menvane {
         input: CompilationInput,
     ) -> Result<(Vec<Uuid>, String)> {
         let source_session = input.source_session;
+        let source_episode = input.source_episode;
         let result = MemoryCompiler::new(self.configured_provider()?)
             .compile(input)
             .await
             .map_err(anyhow::Error::new)?;
+        let provider = result.provider.clone();
+        let ids = self.apply_compilation_result(cwd, result, source_session, source_episode)?;
+        Ok((ids, provider))
+    }
+
+    pub fn apply_compilation_result(
+        &self,
+        cwd: &Path,
+        result: CompilationResult,
+        source_session: Option<Uuid>,
+        source_episode: Option<Uuid>,
+    ) -> Result<Vec<Uuid>> {
         let mut ids = Vec::new();
-        for candidate in result.memories {
-            ids.push(self.store_compiled_memory(cwd, candidate, source_session)?);
+        for (operation_index, operation) in result.operations.into_iter().enumerate() {
+            if let Some(id) = self.apply_compilation_operation(
+                cwd,
+                operation,
+                source_session,
+                source_episode,
+                operation_index,
+            )? {
+                ids.push(id);
+            }
         }
-        Ok((ids, result.provider))
+        Ok(ids)
     }
 
     pub async fn process_next_compilation(&self) -> Result<bool> {
@@ -1529,12 +1555,18 @@ impl Menvane {
                 (cwd, serde_json::json!({}))
             };
             let source_session = events.last().map(|event| event.session_id);
+            let existing_related_memories = self.related_memories(
+                &cwd,
+                &evidence,
+                &technology_profile,
+                episode.project_id.as_deref(),
+            )?;
             let (_, provider) = self
                 .compile_and_store(
                     &cwd,
                     CompilationInput {
                         evidence,
-                        existing_related_memories: Vec::new(),
+                        existing_related_memories,
                         technology_profile,
                         source_session,
                         source_episode: Some(episode_id),
@@ -1624,6 +1656,95 @@ impl Menvane {
         Ok(true)
     }
 
+    pub fn related_memories(
+        &self,
+        cwd: &Path,
+        evidence: &menvane_domain::EpisodeEvidencePacket,
+        technology_profile: &serde_json::Value,
+        project_id: Option<&str>,
+    ) -> Result<Vec<RelatedMemory>> {
+        let mut query = vec![evidence.goal.content.clone()];
+        query.extend(evidence.prompts.iter().map(|item| item.content.clone()));
+        query.extend(evidence.actions.iter().map(|item| item.content.clone()));
+        query.extend(evidence.decisions.iter().map(|item| item.content.clone()));
+        query.extend(evidence.discoveries.iter().map(|item| item.content.clone()));
+        query.extend(evidence.errors.iter().map(|item| item.content.clone()));
+        query.extend(evidence.validations.iter().map(|item| item.content.clone()));
+        query.extend(evidence.files.iter().cloned());
+        let mut technology_values = Vec::new();
+        collect_strings(technology_profile, &mut technology_values);
+        query.extend(technology_values.iter().cloned());
+        let query_tokens = query
+            .iter()
+            .flat_map(|value| lexical_tokens(value))
+            .collect::<HashSet<_>>();
+        let technology_tokens = technology_values
+            .iter()
+            .flat_map(|value| lexical_tokens(value))
+            .collect::<HashSet<_>>();
+        let mut candidates = self
+            .all_memories()?
+            .into_iter()
+            .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
+            .filter(|memory| {
+                (memory.metadata.scope == Scope::Global
+                    && applicability_compatible(&memory.metadata.applies_to, &technology_tokens))
+                    || project_id
+                        .is_some_and(|id| memory.metadata.project_id.as_deref() == Some(id))
+            })
+            .filter_map(|memory| {
+                let memory_tokens = lexical_tokens(&format!("{} {}", memory.title, memory.body));
+                let relevance = memory_tokens.intersection(&query_tokens).count();
+                let technology_match = memory
+                    .metadata
+                    .applies_to
+                    .languages
+                    .iter()
+                    .chain(memory.metadata.applies_to.frameworks.iter())
+                    .chain(memory.metadata.applies_to.tools.iter())
+                    .chain(memory.metadata.applies_to.databases.iter())
+                    .chain(memory.metadata.applies_to.platforms.iter())
+                    .flat_map(|value| lexical_tokens(value))
+                    .filter(|token| technology_tokens.contains(token))
+                    .count();
+                let score = relevance * 2 + technology_match;
+                (score > 0).then_some((score, memory))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.metadata.id.cmp(&right.1.metadata.id))
+        });
+        let mut related = Vec::new();
+        let mut bytes = 0;
+        for (_, memory) in candidates.into_iter().take(RELATED_MEMORY_LIMIT) {
+            let related_memory = RelatedMemory {
+                id: memory.metadata.id,
+                memory_type: memory.metadata.memory_type,
+                scope: memory.metadata.scope,
+                status: memory.metadata.status,
+                confidence: memory.metadata.confidence,
+                applicability: memory.metadata.applies_to.clone(),
+                title: memory.title,
+                body: truncate_utf8(&memory.body, 4_096),
+                provenance: RelatedMemoryProvenance {
+                    source_session_count: memory.metadata.source_sessions.len(),
+                    supersession_count: memory.metadata.supersedes.len(),
+                },
+            };
+            let item_bytes = serde_json::to_vec(&related_memory)?.len();
+            if bytes + item_bytes > RELATED_MEMORY_BUDGET_BYTES {
+                continue;
+            }
+            bytes += item_bytes;
+            related.push(related_memory);
+        }
+        let _ = cwd;
+        Ok(related)
+    }
+
     pub async fn flush_dirty_checkpoints(&self) -> Result<()> {
         self.sessions.prepare_checkpoint_flush()?;
         while self.process_next_checkpoint_job().await? {}
@@ -1642,85 +1763,171 @@ impl Menvane {
         Ok(std::sync::Arc::new(ProviderChain::new(primary, fallback)))
     }
 
-    fn store_compiled_memory(
+    fn apply_compilation_operation(
         &self,
         cwd: &Path,
-        candidate: CompiledMemory,
+        operation: CompiledOperation,
         source_session: Option<Uuid>,
-    ) -> Result<Uuid> {
-        if let Some(memory) = self.all_memories()?.into_iter().find(|memory| {
-            memory.metadata.memory_type == candidate.memory_type
-                && memory.metadata.scope == candidate.scope
-                && normalize_markdown(&memory.body) == normalize_markdown(&candidate.body)
-                && (memory.title.eq_ignore_ascii_case(&candidate.title)
-                    || source_session.is_some_and(|source_session| {
-                        memory.metadata.source_sessions.contains(&source_session)
-                    }))
-        }) {
-            let (mut memory, path) = self.index.read_memory(&self.markdown, memory.metadata.id)?;
-            if let Some(source_session) = source_session
-                && !memory.metadata.source_sessions.contains(&source_session)
-            {
-                memory.metadata.source_sessions.push(source_session);
-                self.markdown.update_memory(&path, &memory)?;
-                self.index.upsert_memory(&memory, &path)?;
-            }
-            return Ok(memory.metadata.id);
+        source_episode: Option<Uuid>,
+        operation_index: usize,
+    ) -> Result<Option<Uuid>> {
+        let operation_key = compilation_operation_key(source_episode, operation_index, &operation)?;
+        if let Some(ids) = self.sessions.compilation_operation_result(&operation_key)? {
+            return Ok(ids.into_iter().next());
         }
-        let scope = match candidate.scope {
-            Scope::Global => ScopeSelection::Global,
-            Scope::Project => ScopeSelection::Project,
+        let memories = self
+            .all_memories()?
+            .into_iter()
+            .map(|memory| (memory.metadata.id, memory))
+            .collect::<HashMap<_, _>>();
+        let targets = operation
+            .target_memory_ids
+            .iter()
+            .map(|id| {
+                memories
+                    .get(id)
+                    .cloned()
+                    .with_context(|| format!("memory not found: {id}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let body = if operation.operation == "no-op" {
+            String::new()
+        } else {
+            compiler::content_markdown(operation.memory_type, &operation.content)?
         };
-        let related = self.search(cwd, &candidate.title, scope, 20)?;
-        let equivalent = related.into_iter().find(|memory| {
-            memory.memory_type == candidate.memory_type.to_string()
-                && memory.scope == candidate.scope.to_string()
-                && memory.title.eq_ignore_ascii_case(&candidate.title)
-        });
-        let mut supersedes = Vec::new();
-        if let Some(existing) = equivalent {
-            let (mut memory, path) = self.index.read_memory(&self.markdown, existing.id)?;
-            if normalize_markdown(&memory.body) == normalize_markdown(&candidate.body) {
-                memory.metadata.confidence = memory.metadata.confidence.max(candidate.confidence);
-                memory.metadata.updated_at = Utc::now();
+        let result = match operation.operation.as_str() {
+            "no-op" => targets.first().map(|memory| memory.metadata.id),
+            "reinforce" => {
+                let mut memory = targets
+                    .into_iter()
+                    .next()
+                    .context("reinforce target missing")?;
+                add_source_session(&mut memory, source_session);
+                memory.metadata.confidence =
+                    memory.metadata.confidence.max(operation.confidence_signal);
                 memory.metadata.last_verified_at = Some(Utc::now());
-                if let Some(session) = source_session
-                    && !memory.metadata.source_sessions.contains(&session)
-                {
-                    memory.metadata.source_sessions.push(session);
-                }
-                self.markdown.update_memory(&path, &memory)?;
-                self.index.upsert_memory(&memory, &path)?;
-                self.markdown
-                    .commit(&format!("feat(memory): reinforce {}", memory.metadata.id));
-                return Ok(memory.metadata.id);
+                memory.metadata.updated_at = Utc::now();
+                self.persist_memory(&memory)?;
+                Some(memory.metadata.id)
             }
-            memory.metadata.status = menvane_domain::MemoryStatus::Superseded;
-            memory.metadata.updated_at = Utc::now();
-            self.markdown.update_memory(&path, &memory)?;
-            self.index.upsert_memory(&memory, &path)?;
-            supersedes.push(memory.metadata.id);
+            "merge" => {
+                let mut survivor = targets.first().cloned().context("merge target missing")?;
+                let merged_ids = targets
+                    .iter()
+                    .skip(1)
+                    .map(|memory| memory.metadata.id)
+                    .collect::<Vec<_>>();
+                survivor.title = operation.title.clone();
+                survivor.body = body;
+                survivor.metadata.confidence = survivor
+                    .metadata
+                    .confidence
+                    .max(operation.confidence_signal);
+                survivor.metadata.applies_to = operation.applies_to.clone();
+                for source_session in targets
+                    .iter()
+                    .flat_map(|memory| memory.metadata.source_sessions.iter())
+                {
+                    if !survivor.metadata.source_sessions.contains(source_session) {
+                        survivor.metadata.source_sessions.push(*source_session);
+                    }
+                }
+                survivor
+                    .metadata
+                    .supersedes
+                    .extend(merged_ids.iter().copied());
+                add_source_session(&mut survivor, source_session);
+                survivor.metadata.updated_at = Utc::now();
+                self.persist_memory(&survivor)?;
+                for mut memory in targets.into_iter().skip(1) {
+                    memory.metadata.status = menvane_domain::MemoryStatus::Historical;
+                    memory.metadata.updated_at = Utc::now();
+                    self.persist_memory(&memory)?;
+                }
+                Some(survivor.metadata.id)
+            }
+            "supersede" => {
+                let superseded_ids = targets
+                    .iter()
+                    .map(|memory| memory.metadata.id)
+                    .collect::<Vec<_>>();
+                for mut memory in targets {
+                    memory.metadata.status = menvane_domain::MemoryStatus::Superseded;
+                    memory.metadata.updated_at = Utc::now();
+                    self.persist_memory(&memory)?;
+                }
+                Some(self.write_operation_memory(
+                    cwd,
+                    &operation,
+                    body,
+                    source_session,
+                    superseded_ids,
+                    &operation_key,
+                )?)
+            }
+            "create" => Some(self.write_operation_memory(
+                cwd,
+                &operation,
+                body,
+                source_session,
+                targets.iter().map(|memory| memory.metadata.id).collect(),
+                &operation_key,
+            )?),
+            _ => None,
+        };
+        let memory_ids = result.iter().copied().collect::<Vec<_>>();
+        self.sessions
+            .record_compilation_operation(&operation_key, &memory_ids)?;
+        if let Some(result) = result {
+            self.markdown.commit(&format!(
+                "feat(memory): apply compilation operation {result}"
+            ));
         }
-        let memory = self.write(
-            cwd,
-            WriteMemory {
-                title: candidate.title,
-                body: candidate.body,
-                memory_type: candidate.memory_type,
-                scope: candidate.scope,
-                confidence: candidate.confidence,
-                tags: Vec::new(),
-                applies_to: candidate.applies_to,
-            },
-        )?;
-        let (mut memory, path) = self.index.read_memory(&self.markdown, memory.metadata.id)?;
-        if let Some(session) = source_session {
-            memory.metadata.source_sessions.push(session);
+        Ok(result)
+    }
+
+    fn write_operation_memory(
+        &self,
+        cwd: &Path,
+        operation: &CompiledOperation,
+        body: String,
+        source_session: Option<Uuid>,
+        supersedes: Vec<Uuid>,
+        operation_key: &str,
+    ) -> Result<Uuid> {
+        let project = match operation.scope {
+            Scope::Project => self.ensure_project(cwd)?,
+            Scope::Global => None,
+        };
+        let scope = project.as_ref().map_or(Scope::Global, |_| operation.scope);
+        let mut metadata = MemoryMetadata::new(
+            operation.memory_type,
+            scope,
+            project.as_ref().map(|project| project.id.clone()),
+            operation.confidence_signal,
+            Vec::new(),
+            operation.applies_to.clone(),
+        );
+        metadata.id = compilation_memory_id(operation_key);
+        metadata.supersedes = supersedes;
+        if let Some(source_session) = source_session {
+            metadata.source_sessions.push(source_session);
         }
-        memory.metadata.supersedes = supersedes;
-        self.markdown.update_memory(&path, &memory)?;
+        let memory = Memory {
+            metadata,
+            title: operation.title.clone(),
+            body: format_memory_body(operation.memory_type, &body),
+        };
+        let path = self.markdown.write_memory(&memory, project.as_ref())?;
         self.index.upsert_memory(&memory, &path)?;
         Ok(memory.metadata.id)
+    }
+
+    fn persist_memory(&self, memory: &Memory) -> Result<()> {
+        let (current, path) = self.index.read_memory(&self.markdown, memory.metadata.id)?;
+        let _ = current;
+        self.markdown.update_memory(&path, memory)?;
+        self.index.upsert_memory(memory, &path)
     }
 
     pub fn doctor(&self) -> DoctorReport {
@@ -2301,6 +2508,81 @@ fn normalize_markdown(markdown: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn compilation_operation_key(
+    source_episode: Option<Uuid>,
+    operation_index: usize,
+    operation: &CompiledOperation,
+) -> Result<String> {
+    let payload = serde_json::to_vec(&(source_episode, operation_index, operation))?;
+    Ok(hex::encode(Sha256::digest(payload)))
+}
+
+fn compilation_memory_id(operation_key: &str) -> Uuid {
+    let digest = Sha256::digest(operation_key.as_bytes());
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn add_source_session(memory: &mut Memory, source_session: Option<Uuid>) {
+    if let Some(source_session) = source_session
+        && !memory.metadata.source_sessions.contains(&source_session)
+    {
+        memory.metadata.source_sessions.push(source_session);
+    }
+}
+
+fn applicability_compatible(
+    applicability: &Applicability,
+    technology_tokens: &HashSet<String>,
+) -> bool {
+    [
+        &applicability.languages,
+        &applicability.frameworks,
+        &applicability.tools,
+        &applicability.databases,
+        &applicability.platforms,
+    ]
+    .iter()
+    .all(|dimension| {
+        dimension.is_empty()
+            || dimension
+                .iter()
+                .flat_map(|value| lexical_tokens(value))
+                .any(|token| technology_tokens.contains(&token))
+    })
+}
+
+fn collect_strings(value: &serde_json::Value, strings: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => strings.push(value.clone()),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_strings(value, strings);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_strings(value, strings);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn truncate_utf8(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 #[derive(Serialize, Deserialize)]
 struct BackupManifest {
     version: u32,
@@ -2410,25 +2692,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeated_compilation_storage_reuses_source_session_memory() {
+    fn repeated_compilation_operation_is_idempotent() {
         let temporary = TempDir::new().unwrap();
         let menvane = Menvane::new(temporary.path().join("home")).unwrap();
         let source_session = Uuid::from_u128(41);
-        let candidate = CompiledMemory {
+        let operation = CompiledOperation {
+            operation: "create".to_owned(),
+            target_memory_ids: Vec::new(),
             memory_type: MemoryType::Fact,
             title: "Retry-safe compilation".to_owned(),
             scope: Scope::Global,
             scope_confidence: 1.0,
-            confidence: 0.9,
+            scope_reason: "Observed in the session".to_owned(),
+            confidence_signal: 0.9,
             applies_to: Applicability::default(),
-            body: "The same compilation result is applied once.".to_owned(),
-            evidence: vec!["event-1".to_owned()],
+            content: serde_json::json!({"statement": "The same compilation result is applied once."}),
+            evidence_event_ids: vec!["event-1".to_owned()],
+            contradicting_event_ids: Vec::new(),
         };
         let first = menvane
-            .store_compiled_memory(temporary.path(), candidate.clone(), Some(source_session))
+            .apply_compilation_operation(
+                temporary.path(),
+                operation.clone(),
+                Some(source_session),
+                Some(Uuid::from_u128(42)),
+                0,
+            )
+            .unwrap()
             .unwrap();
         let second = menvane
-            .store_compiled_memory(temporary.path(), candidate, Some(source_session))
+            .apply_compilation_operation(
+                temporary.path(),
+                operation,
+                Some(source_session),
+                Some(Uuid::from_u128(42)),
+                0,
+            )
+            .unwrap()
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(

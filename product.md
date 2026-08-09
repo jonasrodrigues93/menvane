@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.17.0
+Version: 1.18.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -117,11 +117,11 @@ An explicit fallback provider may be configured under `[llm.fallback]`. Fallback
 
 ## Memory Compilation
 
-The memory compiler receives a bounded structured evidence packet for one task episode, existing related memories, and the project technology profile. Packets contain only linked episode events, preserve resolvable event identifiers, prioritize goals, corrections, constraints, failures, final successful changes, and validation, and treat compaction summaries as context rather than validation. Repetitive tool noise is collapsed and unrelated episodes are excluded. The aggregate packet budget is configurable under `[compilation].aggregate_evidence_budget_bytes` and defaults to 32,768 bytes. The compiler requests schema-constrained JSON and never allows a provider to write Markdown directly. Invalid structured output receives one bounded retry and then fails.
+The memory compiler receives a bounded structured evidence packet for one task episode, bounded related memories from the current project and global scope, and the project technology profile. Related memories include active, candidate, needs-validation, superseded, historical, and forgotten records when relevant, with bounded bodies and provenance summaries; session memories are excluded. Packets contain only linked episode events, preserve resolvable event identifiers, prioritize goals, corrections, constraints, failures, final successful changes, and validation, and treat compaction summaries as context rather than validation. Repetitive tool noise is collapsed and unrelated episodes are excluded. The aggregate packet budget is configurable under `[compilation].aggregate_evidence_budget_bytes` and defaults to 32,768 bytes; related-memory input is independently bounded. The compiler requests schema-constrained operation responses for create, reinforce, merge, supersede, and no-op, validates source events, targets, contradictions, forgotten-memory policy, and conservative global scope, and never allows a provider to write Markdown directly. Invalid structured output receives one bounded repair retry and then fails.
 
-Compiler output may contain zero memories. Valid output uses only facts, decisions, procedures, and gotchas. Applicability is optional; empty dimensions indicate the memory is not tied to specific technologies. Procedure content contains trigger, preconditions, ordered steps, decision points, validation, failure handling, and expected outcome. Global classification requires high scope confidence; uncertainty resolves to project scope.
+Compiler output may contain zero operations. Valid durable operations use only facts, decisions, procedures, and gotchas. Applicability is optional; empty dimensions indicate the memory is not tied to specific technologies. Procedure content contains trigger, preconditions, ordered steps, decision points, validation, failure handling, and expected outcome. Global classification requires high scope confidence; uncertainty resolves to project scope.
 
-Before creating durable memory, Menvane searches the same scope and type. Equivalent content reinforces confidence and source evidence. Incompatible content with the same identity creates a new memory and supersedes the old one instead of silently rewriting history. Provider unavailability does not affect capture, session Markdown, manual memory operations, search, MCP, project detection, or technology detection; compilation jobs remain durable and retryable.
+Every durable compiler change is applied through its validated operation. Equivalent content reinforces confidence and source evidence; complementary targets merge while retaining historical records; contradictions supersede eligible targets; and no-op output is valid. Forgotten memories are never silently recreated. Operation application is transactional at the operation marker and idempotent across retries, without using equal titles as the primary identity test. Provider unavailability does not affect capture, session Markdown, manual memory operations, search, MCP, project detection, or technology detection; compilation jobs remain durable and retryable.
 
 ## Procedure Learning And Promotion
 

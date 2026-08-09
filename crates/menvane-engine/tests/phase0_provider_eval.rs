@@ -23,7 +23,7 @@ struct ProviderReport {
 struct FixtureResult {
     id: String,
     latency_ms: u128,
-    memories: usize,
+    operations: usize,
     error: Option<String>,
 }
 
@@ -45,7 +45,7 @@ async fn provider_evaluation_runner() {
         fixtures.push(FixtureResult {
             id: fixture.id.clone(),
             latency_ms: started.elapsed().as_millis(),
-            memories: result.as_ref().map_or(0, |value| value.memories.len()),
+            operations: result.as_ref().map_or(0, |value| value.operations.len()),
             error: result.err().map(|error| error.to_string()),
         });
     }
