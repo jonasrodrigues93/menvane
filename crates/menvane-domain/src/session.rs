@@ -74,6 +74,52 @@ pub struct PromptIntent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HandoffStatus {
+    Active,
+    Ready,
+    Consumed,
+    Completed,
+    Stale,
+    Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandoffValidation {
+    pub event_id: String,
+    pub command: Option<String>,
+    pub success: bool,
+    pub summary: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskHandoff {
+    pub id: Uuid,
+    pub project_id: Option<String>,
+    pub conversation_key: String,
+    pub episode_id: Uuid,
+    pub source_session_id: Uuid,
+    pub source_client: String,
+    pub status: HandoffStatus,
+    pub goal: String,
+    pub current_state: String,
+    pub completed_work: Vec<String>,
+    pub pending_work: Vec<String>,
+    pub next_action: Option<String>,
+    pub blockers: Vec<String>,
+    pub changed_files: Vec<String>,
+    pub decisions: Vec<String>,
+    pub validation: Vec<HandoffValidation>,
+    pub relevant_memory_ids: Vec<Uuid>,
+    pub source_event_ids: Vec<String>,
+    pub git_head: Option<String>,
+    pub worktree_state_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReinforcementSignal {
     Retrieved,
@@ -145,6 +191,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<EpisodeState>("\"completed\"").unwrap(),
             EpisodeState::Completed
+        );
+        assert_eq!(
+            serde_json::from_str::<HandoffStatus>("\"consumed\"").unwrap(),
+            HandoffStatus::Consumed
         );
     }
 }

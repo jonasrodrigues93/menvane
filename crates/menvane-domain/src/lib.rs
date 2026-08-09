@@ -11,6 +11,7 @@ pub use retrieval::{
 };
 pub use session::ReinforcementSignal;
 pub use session::{
-    EpisodeState, IntentClassificationSource, NormalizedEvent, NormalizedEventKind,
-    NormalizedSession, PromptIntent, PromptIntentKind, SessionImporter, SessionState, TaskEpisode,
+    EpisodeState, HandoffStatus, HandoffValidation, IntentClassificationSource, NormalizedEvent,
+    NormalizedEventKind, NormalizedSession, PromptIntent, PromptIntentKind, SessionImporter,
+    SessionState, TaskEpisode, TaskHandoff,
 };
