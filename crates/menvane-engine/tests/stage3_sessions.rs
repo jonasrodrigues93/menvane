@@ -86,6 +86,31 @@ fn capture_is_bounded_idempotent_and_reopens_finalized_sessions() {
 }
 
 #[test]
+fn trivial_sessions_are_not_queued_for_compilation() {
+    let temporary = TempDir::new().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+    let started = event(&project, "start", NormalizedEventKind::SessionStarted);
+    assert_eq!(
+        menvane.ingest_event(started).unwrap(),
+        CaptureOutcome::Stored
+    );
+    let ended = event(&project, "end", NormalizedEventKind::SessionEnded);
+    assert_eq!(
+        menvane.ingest_event(ended).unwrap(),
+        CaptureOutcome::Finalized
+    );
+    let jobs = menvane.jobs().unwrap();
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.job_type == "compile_session")
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn concurrent_events_and_idle_finalization_are_safe() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");

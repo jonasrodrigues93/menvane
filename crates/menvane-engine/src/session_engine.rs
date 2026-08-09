@@ -101,7 +101,11 @@ impl<'a> SessionEngine<'a> {
             .markdown
             .write_memory(&memory, Some(&project))?;
         self.menvane.index.upsert_memory(&memory, &path)?;
-        self.menvane.sessions.mark_finalized(session.id, &path)?;
+        self.menvane.sessions.mark_finalized(
+            session.id,
+            &path,
+            is_session_worth_compiling(&memory),
+        )?;
         self.menvane
             .markdown
             .commit(&format!("feat(session): finalize {}", session.id));
@@ -188,4 +192,26 @@ fn excerpt(value: &str, max_chars: usize) -> String {
         excerpt.push_str(" [TRUNCATED]");
     }
     excerpt
+}
+
+pub fn is_session_worth_compiling(memory: &Memory) -> bool {
+    !is_system_noise_title(&memory.title) && has_meaningful_evidence(&memory.body)
+}
+
+fn is_system_noise_title(title: &str) -> bool {
+    let title = title.trim();
+    title == "<available-skills>" || (title.starts_with('<') && title.ends_with('>'))
+}
+
+fn has_meaningful_evidence(body: &str) -> bool {
+    let body = body.trim();
+    if body.len() < 120 {
+        return false;
+    }
+    let no_goal = body.contains("## Goal\n\nNo explicit goal was captured.");
+    let no_actions = body.contains("## Important actions\n\nNone captured.");
+    let no_errors = body.contains("## Errors and discoveries\n\nNone captured.");
+    let no_validation = body.contains("## Validation\n\nNone captured.");
+    let no_files = body.contains("## Files involved\n\nNone captured.");
+    !(no_goal && no_actions && no_errors && no_validation && no_files)
 }

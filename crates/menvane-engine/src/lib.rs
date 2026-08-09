@@ -37,7 +37,7 @@ pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_rem
 pub use providers::{CodexProvider, OpenAIApiProvider, OpenRouterProvider, ProviderChain};
 pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
 pub use sanitizer::{CaptureSanitizer, CaptureSanitizerConfig};
-pub use session_engine::{CaptureOutcome, SessionEngine};
+pub use session_engine::{CaptureOutcome, SessionEngine, is_session_worth_compiling};
 pub use technology_detector::TechnologyDetector;
 
 pub struct WriteMemory {
@@ -817,6 +817,9 @@ impl Menvane {
         let session_id = Uuid::parse_str(&job.dedupe_key)?;
         let result = async {
             let session = self.index.read_memory(&self.markdown, session_id)?.0;
+            if !is_session_worth_compiling(&session) {
+                return Ok((Vec::new(), "skipped".to_owned()));
+            }
             let project_id = session
                 .metadata
                 .project_id

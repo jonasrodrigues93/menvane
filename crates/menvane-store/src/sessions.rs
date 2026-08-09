@@ -162,6 +162,7 @@ impl SessionRepository {
         let connection = self.open()?;
         connection.execute_batch("PRAGMA journal_mode=WAL;")?;
         connection.execute_batch(SESSION_SCHEMA)?;
+        apply_migrations(&connection)?;
         Ok(())
     }
 
@@ -277,7 +278,12 @@ impl SessionRepository {
         Ok(sessions)
     }
 
-    pub fn mark_finalized(&self, session_id: Uuid, markdown_path: &Path) -> Result<()> {
+    pub fn mark_finalized(
+        &self,
+        session_id: Uuid,
+        markdown_path: &Path,
+        enqueue_compile: bool,
+    ) -> Result<()> {
         let connection = self.open()?;
         let now = Utc::now().to_rfc3339();
         connection.execute(
@@ -288,7 +294,9 @@ impl SessionRepository {
             "UPDATE jobs SET status='completed', updated_at=?1 WHERE job_type='finalize_session' AND dedupe_key=?2",
             params![now, session_id.to_string()],
         )?;
-        enqueue_job_connection(&connection, "compile_session", &session_id.to_string())?;
+        if enqueue_compile {
+            enqueue_job_connection(&connection, "compile_session", &session_id.to_string())?;
+        }
         Ok(())
     }
 
@@ -671,6 +679,42 @@ fn observation_content(event: &NormalizedEvent) -> Option<String> {
         parts.push(output.as_str());
     }
     (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn apply_migrations(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY);",
+    )?;
+    let current: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if current < 2 {
+        migrate_to_version_2(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (2)", [])?;
+    }
+    Ok(())
+}
+
+fn migrate_to_version_2(connection: &Connection) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "UPDATE jobs
+         SET status = 'pending',
+             attempt_count = 0,
+             last_error = NULL,
+             provider = NULL,
+             next_retry_at = ?1,
+             updated_at = ?1
+         WHERE job_type = 'compile_session'
+           AND status = 'failed'
+           AND last_error LIKE '%invalid_json_schema%'",
+        params![now],
+    )?;
+    Ok(())
 }
 
 fn state_after_event(current: SessionState, event: NormalizedEventKind) -> SessionState {
