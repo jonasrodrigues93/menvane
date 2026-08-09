@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS memories (
     applicability_json TEXT NOT NULL,
     tags_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    source_sessions_json TEXT NOT NULL DEFAULT '[]',
+    supersedes_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS memories_scope_project ON memories(scope, project_id);
 CREATE INDEX IF NOT EXISTS memories_status ON memories(status);
@@ -62,6 +64,7 @@ const LEGACY_OPERATIONAL_TABLES: &[&str] = &[
     "access_events",
     "integration_state",
     "session_injections",
+    "briefing_deliveries",
     "procedure_applications",
     "orphan_sessions",
 ];
@@ -86,6 +89,8 @@ pub struct SearchResult {
     pub score: f64,
     pub fts_rank: usize,
     pub age_days: f64,
+    pub source_session_count: usize,
+    pub supersession_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +107,7 @@ impl IndexStore {
         let connection = self.open()?;
         connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         connection.execute_batch(SCHEMA)?;
+        ensure_memory_metadata_columns(&connection)?;
         Ok(())
     }
 
@@ -153,7 +159,7 @@ impl IndexStore {
             SearchScope::Global => ("m.scope = 'global'", ""),
         };
         let sql = format!(
-            "SELECT m.id, m.type, m.scope, m.title, m.status, m.confidence, m.applicability_json, snippet(memory_fts, 2, '', '', ' … ', 24), -bm25(memory_fts) AS score, MAX(0, julianday('now') - julianday(m.updated_at))
+            "SELECT m.id, m.type, m.scope, m.title, m.status, m.confidence, m.applicability_json, m.source_sessions_json, m.supersedes_json, snippet(memory_fts, 2, '', '', ' … ', 24), -bm25(memory_fts) AS score, MAX(0, julianday('now') - julianday(m.updated_at))
              FROM memory_fts
              JOIN memories m ON m.id = memory_fts.id
              WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten' AND (?4 OR m.type != 'session') AND m.path NOT LIKE '%/archive/sessions/%'
@@ -192,10 +198,28 @@ impl IndexStore {
                             )
                         },
                     )?,
-                    excerpt: row.get(7)?,
-                    score: row.get(8)?,
+                    source_session_count: json_array_count(&row.get::<_, String>(7)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    supersession_count: json_array_count(&row.get::<_, String>(8)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    excerpt: row.get(9)?,
+                    score: row.get(10)?,
                     fts_rank: 0,
-                    age_days: row.get(9)?,
+                    age_days: row.get(11)?,
                 })
             },
         )?;
@@ -222,7 +246,7 @@ impl IndexStore {
             SearchScope::Global => ("scope = 'global'", ""),
         };
         let sql = format!(
-            "SELECT id, type, scope, title, status, confidence, applicability_json, substr(body, 1, 500), 0.0, MAX(0, julianday('now') - julianday(updated_at))
+            "SELECT id, type, scope, title, status, confidence, applicability_json, source_sessions_json, supersedes_json, substr(body, 1, 500), 0.0, MAX(0, julianday('now') - julianday(updated_at))
              FROM memories
              WHERE {scope_sql} AND status != 'forgotten' AND (?3 OR type != 'session') AND path NOT LIKE '%/archive/sessions/%'
              ORDER BY updated_at DESC
@@ -255,10 +279,28 @@ impl IndexStore {
                             )
                         },
                     )?,
-                    excerpt: row.get(7)?,
-                    score: row.get(8)?,
+                    source_session_count: json_array_count(&row.get::<_, String>(7)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    supersession_count: json_array_count(&row.get::<_, String>(8)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                8,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    excerpt: row.get(9)?,
+                    score: row.get(10)?,
                     fts_rank: 0,
-                    age_days: row.get(9)?,
+                    age_days: row.get(11)?,
                 })
             },
         )?;
@@ -406,6 +448,29 @@ fn configure_connection(connection: &Connection, wal: bool) -> Result<()> {
     Ok(())
 }
 
+fn ensure_memory_metadata_columns(connection: &Connection) -> Result<()> {
+    for column in ["source_sessions_json", "supersedes_json"] {
+        let exists: Option<()> = connection
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memories') WHERE name=?1",
+                [column],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if exists.is_none() {
+            connection.execute(
+                &format!("ALTER TABLE memories ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn json_array_count(value: &str) -> serde_json::Result<usize> {
+    serde_json::from_str::<Vec<serde_json::Value>>(value).map(|values| values.len())
+}
+
 fn insert_project(connection: &Connection, project: &Project, path: &Path) -> Result<()> {
     connection.execute(
         "INSERT INTO projects(id, identity, name, path, metadata_json, updated_at)
@@ -430,9 +495,9 @@ fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Resul
         [metadata.id.to_string()],
     )?;
     connection.execute(
-        "INSERT INTO memories(id, type, scope, project_id, title, status, confidence, path, body, applicability_json, tags_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-         ON CONFLICT(id) DO UPDATE SET type=excluded.type, scope=excluded.scope, project_id=excluded.project_id, title=excluded.title, status=excluded.status, confidence=excluded.confidence, path=excluded.path, body=excluded.body, applicability_json=excluded.applicability_json, tags_json=excluded.tags_json, updated_at=excluded.updated_at",
+        "INSERT INTO memories(id, type, scope, project_id, title, status, confidence, path, body, applicability_json, tags_json, created_at, updated_at, source_sessions_json, supersedes_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(id) DO UPDATE SET type=excluded.type, scope=excluded.scope, project_id=excluded.project_id, title=excluded.title, status=excluded.status, confidence=excluded.confidence, path=excluded.path, body=excluded.body, applicability_json=excluded.applicability_json, tags_json=excluded.tags_json, updated_at=excluded.updated_at, source_sessions_json=excluded.source_sessions_json, supersedes_json=excluded.supersedes_json",
         params![
             metadata.id.to_string(),
             metadata.memory_type.to_string(),
@@ -447,6 +512,8 @@ fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Resul
             serde_json::to_string(&metadata.tags)?,
             metadata.created_at.to_rfc3339(),
             metadata.updated_at.to_rfc3339(),
+            serde_json::to_string(&metadata.source_sessions)?,
+            serde_json::to_string(&metadata.supersedes)?,
         ],
     )?;
     connection.execute(
@@ -487,6 +554,7 @@ pub fn mark_forgotten(memory: &mut Memory) {
 mod tests {
     use menvane_domain::{Applicability, MemoryMetadata, MemoryType, Scope};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -527,5 +595,37 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn search_result_exposes_durable_provenance_counts() {
+        let temporary = TempDir::new().unwrap();
+        let markdown = MarkdownStore::new(temporary.path());
+        markdown.initialize().unwrap();
+        let index = IndexStore::new(temporary.path().join("index.sqlite"));
+        index.initialize().unwrap();
+        let mut memory = Memory {
+            metadata: MemoryMetadata::new(
+                MemoryType::Fact,
+                Scope::Global,
+                None,
+                1.0,
+                Vec::new(),
+                Applicability::default(),
+            ),
+            title: "Provenance marker".to_owned(),
+            body: "Durable provenance search content".to_owned(),
+        };
+        memory.metadata.source_sessions = vec![Uuid::now_v7(), Uuid::now_v7()];
+        memory.metadata.supersedes = vec![Uuid::now_v7()];
+        let path = markdown.write_memory(&memory, None).unwrap();
+        index.upsert_memory(&memory, &path).unwrap();
+        let result = index
+            .search("provenance", SearchScope::Global, 10, false, true)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(result.source_session_count, 2);
+        assert_eq!(result.supersession_count, 1);
     }
 }

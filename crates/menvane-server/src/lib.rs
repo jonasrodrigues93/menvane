@@ -260,18 +260,17 @@ async fn recall(
     let (context, diagnostics) = match request.kind.as_str() {
         "session-start" => (
             menvane
-                .session_briefing(cwd, &request.session_id)
+                .session_briefing_for_client(cwd, &request.client, &request.session_id)
                 .map_err(internal_server_error)?,
             None,
         ),
         "user-prompt" => {
             let (context, diagnostics) = menvane
-                .prompt_context_for_session(
+                .prompt_context_for_client(
                     cwd,
                     &request.client,
                     &request.session_id,
                     &request.prompt,
-                    &request.session_id,
                 )
                 .map_err(internal_server_error)?;
             (context, Some(diagnostics))
@@ -396,6 +395,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_delivery_dedupes_session_start_and_prompt_independently() {
+        let temporary = TempDir::new().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+        menvane
+            .write(
+                &project,
+                WriteMemory {
+                    title: "Session briefing decision".to_owned(),
+                    body: "Session briefing marker".to_owned(),
+                    memory_type: MemoryType::Decision,
+                    scope: Scope::Project,
+                    confidence: 1.0,
+                    tags: Vec::new(),
+                    applies_to: Applicability::default(),
+                },
+            )
+            .unwrap();
+        menvane
+            .write(
+                &project,
+                WriteMemory {
+                    title: "Prompt recall fact".to_owned(),
+                    body: "Prompt recall marker".to_owned(),
+                    memory_type: MemoryType::Fact,
+                    scope: Scope::Project,
+                    confidence: 1.0,
+                    tags: Vec::new(),
+                    applies_to: Applicability::default(),
+                },
+            )
+            .unwrap();
+        let state = Arc::new(menvane);
+        let router = app(state);
+        let event = NormalizedEvent {
+            event_id: "server-session-start".to_owned(),
+            kind: NormalizedEventKind::SessionStarted,
+            client: "claude-code".to_owned(),
+            external_session_id: "shared-session".to_owned(),
+            timestamp: Utc::now(),
+            cwd: project.to_string_lossy().into_owned(),
+            project_id: None,
+            tool_family: None,
+            bounded_input: None,
+            bounded_output: None,
+            attributed_path: None,
+            success: None,
+            model: None,
+        };
+        post_event(router.clone(), &event).await;
+        let request = serde_json::json!({
+            "client": "claude-code",
+            "cwd": project.to_string_lossy().into_owned(),
+            "session_id": "shared-session",
+            "kind": "session-start",
+            "prompt": ""
+        });
+        let first_briefing = post_recall(router.clone(), request.clone()).await;
+        let repeated_briefing = post_recall(router.clone(), request).await;
+        let request = serde_json::json!({
+            "client": "claude-code",
+            "cwd": project.to_string_lossy().into_owned(),
+            "session_id": "shared-session",
+            "kind": "user-prompt",
+            "prompt": "Prompt recall marker"
+        });
+        let first_prompt = post_recall(router.clone(), request.clone()).await;
+        let repeated_prompt = post_recall(router, request).await;
+        assert!(
+            first_briefing["context"]
+                .as_str()
+                .unwrap()
+                .contains("Session briefing decision")
+        );
+        assert_eq!(repeated_briefing["context"], "");
+        assert!(
+            first_prompt["context"]
+                .as_str()
+                .unwrap()
+                .contains("Prompt recall fact")
+        );
+        assert_eq!(repeated_prompt["context"], "");
+    }
+
+    #[tokio::test]
     async fn mandatory_ui_views_and_admin_edit_are_functional() {
         let temporary = TempDir::new().unwrap();
         let project = temporary.path().join("project");
@@ -509,6 +601,23 @@ mod tests {
             .body(Body::from(serde_json::to_vec(event).unwrap()))
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn post_recall(router: Router, payload: Value) -> Value {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/recall")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()

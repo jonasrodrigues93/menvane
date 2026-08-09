@@ -55,8 +55,61 @@ fn migration_backfills_the_deterministic_conversation_identity() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        4
+        6
     );
+}
+
+#[test]
+fn recall_identity_matches_the_resolved_project_generation() {
+    let temporary = TempDir::new().unwrap();
+    let repository = SessionRepository::new(temporary.path().join("state.sqlite"));
+    repository.initialize().unwrap();
+    repository
+        .ingest(
+            &event("a-start", "shared", NormalizedEventKind::SessionStarted, 0),
+            Some("project-a"),
+        )
+        .unwrap();
+    repository
+        .ingest(
+            &event("a-end", "shared", NormalizedEventKind::SessionEnded, 1),
+            Some("project-a"),
+        )
+        .unwrap();
+    repository
+        .ingest(
+            &event("b-start", "shared", NormalizedEventKind::SessionStarted, 2),
+            Some("project-b"),
+        )
+        .unwrap();
+    repository
+        .ingest(
+            &event("b-end", "shared", NormalizedEventKind::SessionEnded, 3),
+            Some("project-b"),
+        )
+        .unwrap();
+    repository
+        .ingest(
+            &event("g-start", "shared", NormalizedEventKind::SessionStarted, 4),
+            None,
+        )
+        .unwrap();
+
+    let project_a = repository
+        .injection_identity("client", "shared", Some("project-a"))
+        .unwrap();
+    let project_b = repository
+        .recall_context("client", "shared", Some("project-b"))
+        .unwrap()
+        .unwrap();
+    let global = repository
+        .injection_identity("client", "shared", None)
+        .unwrap();
+
+    assert_eq!(project_a.generation, 1);
+    assert_eq!(project_a.episode_id, None);
+    assert_eq!(project_b.session.generation, 2);
+    assert_eq!(global.generation, 3);
 }
 
 #[test]

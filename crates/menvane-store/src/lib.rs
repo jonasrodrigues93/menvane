@@ -4,7 +4,7 @@ mod sqlite;
 
 pub use markdown::{MarkdownStore, ParsedMarkdown};
 pub use sessions::{
-    IngestResult, IntegrationRecord, JobRecord, OrphanRecord, PromptIntentHistory, RecallContext,
-    SessionRecord, SessionRepository, conversation_key,
+    IngestResult, InjectionIdentity, IntegrationRecord, JobRecord, OrphanRecord,
+    PromptIntentHistory, RecallContext, SessionRecord, SessionRepository, conversation_key,
 };
 pub use sqlite::{IndexStore, SearchResult, SearchScope, mark_forgotten};

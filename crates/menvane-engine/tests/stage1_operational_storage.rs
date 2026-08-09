@@ -7,7 +7,7 @@ use menvane_domain::{
     Applicability, MemoryType, NormalizedEvent, NormalizedEventKind, ReinforcementSignal, Scope,
 };
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
-use menvane_store::SessionRepository;
+use menvane_store::{InjectionIdentity, SessionRepository};
 use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -46,7 +46,17 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
     legacy
         .record_access(memory_id, ReinforcementSignal::Retrieved)
         .unwrap();
-    legacy.claim_injection("legacy-key", memory_id).unwrap();
+    legacy
+        .claim_injection(
+            &InjectionIdentity {
+                client: "legacy".to_owned(),
+                conversation_key: "legacy-key".to_owned(),
+                generation: 0,
+                episode_id: None,
+            },
+            memory_id,
+        )
+        .unwrap();
     legacy
         .record_procedure_application(memory_id, first.session.id, true)
         .unwrap();
@@ -65,7 +75,7 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
             "{table}"
         );
     }
-    assert_eq!(row_count(&state_path, "operational_migration_markers"), 10);
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 11);
     assert!(has_table(&home.join("index.sqlite"), "sessions"));
     assert_eq!(
         SessionRepository::new(&state_path)
@@ -77,7 +87,7 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
     drop(menvane);
 
     let reopened = Menvane::new(&home).unwrap();
-    assert_eq!(row_count(&state_path, "operational_migration_markers"), 10);
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 11);
     assert_eq!(
         SessionRepository::new(&state_path)
             .events(first.session.id)
@@ -263,7 +273,7 @@ fn backup_restore_round_trips_index_and_state_databases() {
     assert_eq!(menvane.read(retained).unwrap().title, "Backup retained");
 }
 
-fn operational_tables() -> [&'static str; 10] {
+fn operational_tables() -> [&'static str; 11] {
     [
         "sessions",
         "session_events",
@@ -273,6 +283,7 @@ fn operational_tables() -> [&'static str; 10] {
         "access_events",
         "integration_state",
         "session_injections",
+        "briefing_deliveries",
         "procedure_applications",
         "orphan_sessions",
     ]

@@ -10,6 +10,7 @@ mod sanitizer;
 mod session_engine;
 mod technology_detector;
 
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -25,8 +26,8 @@ use menvane_domain::{
 };
 pub use menvane_store::mark_forgotten;
 pub use menvane_store::{
-    IndexStore, IntegrationRecord, JobRecord, MarkdownStore, OrphanRecord, SearchResult,
-    SessionRepository,
+    IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MarkdownStore, OrphanRecord,
+    SearchResult, SessionRepository,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -67,6 +68,8 @@ pub struct WriteMemory {
 pub struct PromptRecall {
     pub results: Vec<SearchResult>,
     pub diagnostics: RecallDiagnostics,
+    pub required_context: Vec<String>,
+    pub identity: InjectionIdentity,
 }
 
 pub struct DoctorReport {
@@ -322,14 +325,19 @@ impl Menvane {
 
     pub fn recall(&self, cwd: &Path, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let project = self.ensure_project(cwd)?;
-        Retriever::new(&self.index).retrieve(
+        let results = Retriever::new(&self.index).retrieve(
             query,
             project.as_ref(),
             RetrievalScope::Auto,
             RetrievalMode::Automatic,
             false,
             limit,
-        )
+        )?;
+        for memory in &results {
+            self.sessions
+                .record_access(memory.id, ReinforcementSignal::Retrieved)?;
+        }
+        Ok(results)
     }
 
     pub fn prompt_recall(
@@ -341,6 +349,12 @@ impl Menvane {
         limit: usize,
     ) -> Result<PromptRecall> {
         let prompt = CaptureSanitizer::new(self.config.capture.clone())?.sanitize_prompt(prompt);
+        let project = self.ensure_project(cwd)?;
+        let identity = self.sessions.injection_identity(
+            client,
+            external_session_id,
+            project.as_ref().map(|value| value.id.as_str()),
+        )?;
         if prompt.trim().is_empty() {
             return Ok(PromptRecall {
                 results: Vec::new(),
@@ -349,35 +363,44 @@ impl Menvane {
                     queries: Vec::new(),
                     results: Vec::new(),
                 },
+                required_context: Vec::new(),
+                identity,
             });
         }
-        let project = self.ensure_project(cwd)?;
-        let Some(context) = self.sessions.recall_context(
+        let context = self.sessions.recall_context(
             client,
             external_session_id,
             project.as_ref().map(|value| value.id.as_str()),
-        )?
-        else {
-            let (results, diagnostics) = Retriever::new(&self.index).retrieve_intent(
-                &prompt,
-                None,
-                project.as_ref(),
-                limit,
-            )?;
-            return Ok(PromptRecall {
-                results,
-                diagnostics,
-            });
-        };
+        )?;
+        let required_context = context.as_ref().map_or_else(Vec::new, |context| {
+            context
+                .active_corrections
+                .iter()
+                .chain(context.active_constraints.iter())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .fold(Vec::new(), |mut values, value| {
+                    if !values.iter().any(|existing| existing == &value) {
+                        values.push(value);
+                    }
+                    values
+                })
+        });
         let (results, diagnostics) = Retriever::new(&self.index).retrieve_intent(
             &prompt,
-            Some(&context),
+            context.as_ref(),
             project.as_ref(),
             limit,
         )?;
+        for memory in &results {
+            self.sessions
+                .record_access(memory.id, ReinforcementSignal::Retrieved)?;
+        }
         Ok(PromptRecall {
             results,
             diagnostics,
+            required_context,
+            identity,
         })
     }
 
@@ -442,16 +465,23 @@ impl Menvane {
     }
 
     pub fn session_briefing(&self, cwd: &Path, session_key: &str) -> Result<String> {
+        self.session_briefing_for_client(cwd, "legacy", session_key)
+    }
+
+    pub fn session_briefing_for_client(
+        &self,
+        cwd: &Path,
+        client: &str,
+        external_session_id: &str,
+    ) -> Result<String> {
         let project = self.ensure_project(cwd)?;
-        let mut memories = Vec::new();
-        for memory in Retriever::new(&self.index).briefing(project.as_ref(), 20)? {
-            if self.sessions.claim_injection(session_key, memory.id)? {
-                self.sessions
-                    .record_access(memory.id, ReinforcementSignal::Injected)?;
-                memories.push(memory);
-            }
-        }
-        let prefix = project.map_or_else(
+        let mut identity = self.sessions.injection_identity(
+            client,
+            external_session_id,
+            project.as_ref().map(|value| value.id.as_str()),
+        )?;
+        identity.episode_id = None;
+        let prefix = project.as_ref().map_or_else(
             || "Scope: global\n".to_owned(),
             |project| {
                 let technologies = [
@@ -476,26 +506,22 @@ impl Menvane {
                 )
             },
         );
-        Ok(format_memory_context(&prefix, &memories, 2_500))
+        let memories = Retriever::new(&self.index).briefing(project.as_ref(), 20)?;
+        for memory in &memories {
+            self.sessions
+                .record_access(memory.id, ReinforcementSignal::Retrieved)?;
+        }
+        let context = self.render_briefing(&prefix, &memories, &identity, 2_500)?;
+        if self.sessions.claim_briefing(&identity)? {
+            Ok(context)
+        } else {
+            Ok(String::new())
+        }
     }
 
     pub fn prompt_context(&self, cwd: &Path, prompt: &str, session_key: &str) -> Result<String> {
-        let prompt = CaptureSanitizer::new(self.config.capture.clone())?.sanitize_prompt(prompt);
-        if prompt.trim().is_empty() {
-            return Ok(String::new());
-        }
-        let mut memories = Vec::new();
-        for memory in self.recall(cwd, &prompt, 20)? {
-            if self.sessions.claim_injection(session_key, memory.id)? {
-                self.sessions
-                    .record_access(memory.id, ReinforcementSignal::Injected)?;
-                memories.push(memory);
-            }
-            if memories.len() == 6 {
-                break;
-            }
-        }
-        Ok(format_memory_context("", &memories, 6_000))
+        self.prompt_context_for_client(cwd, "direct", session_key, prompt)
+            .map(|value| value.0)
     }
 
     pub fn prompt_context_for_session(
@@ -504,24 +530,176 @@ impl Menvane {
         client: &str,
         external_session_id: &str,
         prompt: &str,
-        session_key: &str,
+        _session_key: &str,
+    ) -> Result<(String, RecallDiagnostics)> {
+        self.prompt_context_for_client(cwd, client, external_session_id, prompt)
+    }
+
+    pub fn prompt_context_for_client(
+        &self,
+        cwd: &Path,
+        client: &str,
+        external_session_id: &str,
+        prompt: &str,
     ) -> Result<(String, RecallDiagnostics)> {
         let recall = self.prompt_recall(cwd, client, external_session_id, prompt, 20)?;
-        let mut memories = Vec::new();
-        for memory in recall.results {
-            if self.sessions.claim_injection(session_key, memory.id)? {
-                self.sessions
-                    .record_access(memory.id, ReinforcementSignal::Injected)?;
-                memories.push(memory);
-            }
-            if memories.len() == 6 {
+        let context = self.render_prompt_context(
+            &recall.required_context,
+            &recall.results,
+            &recall.diagnostics,
+            &recall.identity,
+            6_000,
+        )?;
+        Ok((context, recall.diagnostics))
+    }
+
+    fn render_briefing(
+        &self,
+        prefix: &str,
+        memories: &[SearchResult],
+        identity: &InjectionIdentity,
+        max_chars: usize,
+    ) -> Result<String> {
+        let mut context = String::from(
+            "MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n",
+        );
+        context.push_str(prefix);
+        for memory in memories {
+            let entry = format_memory_entry(
+                memory,
+                "SESSION-START MEMORY",
+                "selected for session-start briefing",
+                true,
+            );
+            if !fits_context(&context, &entry, max_chars) {
                 break;
             }
+            self.append_claimed_memory(&mut context, &entry, identity, memory.id)?;
         }
-        Ok((
-            format_memory_context("", &memories, 6_000),
-            recall.diagnostics,
-        ))
+        context.push_str("\nEND MENVANE MEMORY CONTEXT");
+        Ok(context)
+    }
+
+    fn render_prompt_context(
+        &self,
+        required_context: &[String],
+        results: &[SearchResult],
+        diagnostics: &RecallDiagnostics,
+        identity: &InjectionIdentity,
+        max_chars: usize,
+    ) -> Result<String> {
+        if required_context.is_empty() && results.is_empty() {
+            return Ok(String::new());
+        }
+        let mut context = String::from(
+            "MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n",
+        );
+        let mut required_used = 0;
+        let mut included = false;
+        for value in required_context {
+            let entry = format!("\n[REQUIRED ACTIVE CONSTRAINT OR CORRECTION]\n{}\n", value);
+            if required_used + entry.chars().count() > REQUIRED_CONTEXT_BUDGET
+                || !fits_context(&context, &entry, max_chars)
+            {
+                break;
+            }
+            context.push_str(&entry);
+            required_used += entry.chars().count();
+            included = true;
+        }
+        let mut required_remaining = REQUIRED_CONTEXT_BUDGET.saturating_sub(required_used);
+        let mut required_gotchas = HashSet::new();
+        for memory in results
+            .iter()
+            .filter(|memory| memory.memory_type == "gotcha")
+        {
+            let entry = format_memory_entry(
+                memory,
+                "REQUIRED CONTEXT",
+                "critical gotcha selected for required context",
+                true,
+            );
+            if entry.chars().count() > required_remaining
+                || !fits_context(&context, &entry, max_chars)
+            {
+                break;
+            }
+            if self.append_claimed_memory(&mut context, &entry, identity, memory.id)? {
+                required_remaining -= entry.chars().count();
+                included = true;
+                required_gotchas.insert(memory.id);
+            }
+        }
+        let relevant_budget = RELEVANT_CONTEXT_BUDGET + required_remaining;
+        let mut relevant_used = 0;
+        let other_memories = results
+            .iter()
+            .filter(|memory| {
+                memory.memory_type != "gotcha" || !required_gotchas.contains(&memory.id)
+            })
+            .collect::<Vec<_>>();
+        for memory in other_memories.iter().take(6) {
+            let entry = format_memory_entry(
+                memory,
+                "RELEVANT EXCERPT",
+                relevance_reason(memory, diagnostics),
+                true,
+            );
+            if relevant_used + entry.chars().count() > relevant_budget
+                || !fits_context(&context, &entry, max_chars)
+            {
+                break;
+            }
+            if self.append_claimed_memory(&mut context, &entry, identity, memory.id)? {
+                relevant_used += entry.chars().count();
+                included = true;
+            }
+        }
+        let cards_budget = RETRIEVAL_CARD_BUDGET + relevant_budget.saturating_sub(relevant_used);
+        let mut cards_used = 0;
+        for memory in other_memories.iter().skip(6) {
+            let entry = format_memory_entry(
+                memory,
+                "RETRIEVAL CARD",
+                relevance_reason(memory, diagnostics),
+                false,
+            );
+            if cards_used + entry.chars().count() > cards_budget
+                || !fits_context(&context, &entry, max_chars)
+            {
+                break;
+            }
+            if self.append_claimed_memory(&mut context, &entry, identity, memory.id)? {
+                cards_used += entry.chars().count();
+                included = true;
+            }
+        }
+        if !included {
+            return Ok(String::new());
+        }
+        context.push_str("\nEND MENVANE MEMORY CONTEXT");
+        if context.chars().count() > max_chars {
+            bail!("rendered recall context exceeded its character budget");
+        }
+        Ok(context)
+    }
+
+    fn append_claimed_memory(
+        &self,
+        context: &mut String,
+        entry: &str,
+        identity: &InjectionIdentity,
+        memory_id: Uuid,
+    ) -> Result<bool> {
+        let previous_length = context.len();
+        context.push_str(entry);
+        if !self.sessions.claim_injection(identity, memory_id)? {
+            context.truncate(previous_length);
+            return Ok(false);
+        }
+        self.sessions
+            .record_access(memory_id, ReinforcementSignal::Injected)?;
+        Ok(true)
     }
 
     pub fn set_integration_connected(&self, client: &str, connected: bool) -> Result<()> {
@@ -1384,27 +1562,65 @@ fn format_memory_body(memory_type: MemoryType, body: &str) -> String {
     }
 }
 
-fn format_memory_context(prefix: &str, memories: &[SearchResult], max_chars: usize) -> String {
-    let mut context = String::from(
-        "MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n",
-    );
-    context.push_str(prefix);
-    for memory in memories {
-        let entry = format!(
-            "\n[{} | {} | {}]\n{}\n{}\n",
-            memory.memory_type, memory.scope, memory.status, memory.title, memory.excerpt
-        );
-        if context.chars().count() + entry.chars().count() + 28 > max_chars {
-            break;
-        }
-        context.push_str(&entry);
-    }
-    context.push_str("\nEND MENVANE MEMORY CONTEXT");
-    if context.chars().count() <= max_chars {
-        context
+const REQUIRED_CONTEXT_BUDGET: usize = 2_000;
+const RELEVANT_CONTEXT_BUDGET: usize = 3_000;
+const RETRIEVAL_CARD_BUDGET: usize = 1_000;
+
+fn format_memory_entry(
+    memory: &SearchResult,
+    tier: &str,
+    reason: &str,
+    include_excerpt: bool,
+) -> String {
+    let excerpt = if include_excerpt {
+        format!("\nExcerpt: {}", memory.excerpt.trim())
     } else {
-        context.chars().take(max_chars).collect()
-    }
+        String::new()
+    };
+    format!(
+        "\n[{}]\nID: {}\nType: {}\nScope: {}\nStatus: {}\nConfidence: {:.2}\nAge: {:.0} days\nProvenance: source sessions {}; supersession count {}\nRelevance: {}\nTitle: {}{}\n",
+        tier,
+        memory.id,
+        memory.memory_type,
+        memory.scope,
+        memory.status,
+        memory.confidence,
+        memory.age_days,
+        memory.source_session_count,
+        memory.supersession_count,
+        reason,
+        memory.title,
+        excerpt
+    )
+}
+
+fn fits_context(context: &str, entry: &str, max_chars: usize) -> bool {
+    context.chars().count() + entry.chars().count() + "\nEND MENVANE MEMORY CONTEXT".chars().count()
+        <= max_chars
+}
+
+fn relevance_reason(memory: &SearchResult, diagnostics: &RecallDiagnostics) -> &'static str {
+    diagnostics
+        .results
+        .iter()
+        .find(|diagnostic| diagnostic.memory_id == memory.id.to_string())
+        .and_then(|diagnostic| {
+            diagnostic
+                .sources
+                .iter()
+                .filter(|source| source.contribution > 0.0)
+                .max_by(|left, right| left.contribution.total_cmp(&right.contribution))
+        })
+        .map_or("selected for current intent", |source| {
+            match source.source.as_str() {
+                "current-prompt" => "matches current prompt",
+                "active-episode-goal" => "matches active episode goal",
+                source if source.starts_with("active-correction") => "matches active correction",
+                source if source.starts_with("active-constraint") => "matches active constraint",
+                "conversation-root-goal" => "matches conversation root goal",
+                _ => "selected for current intent",
+            }
+        })
 }
 
 fn provider_from_configuration(

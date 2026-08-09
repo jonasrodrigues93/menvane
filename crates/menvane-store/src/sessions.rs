@@ -94,10 +94,21 @@ CREATE TABLE IF NOT EXISTS integration_state (
     details_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS session_injections (
-    session_key TEXT NOT NULL,
+    client TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    episode_id TEXT NOT NULL DEFAULT '',
     memory_id TEXT NOT NULL,
     injected_at TEXT NOT NULL,
-    PRIMARY KEY(session_key, memory_id)
+    PRIMARY KEY(client, conversation_key, generation, episode_id, memory_id)
+);
+CREATE TABLE IF NOT EXISTS briefing_deliveries (
+    client TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    episode_id TEXT NOT NULL DEFAULT '',
+    delivered_at TEXT NOT NULL,
+    PRIMARY KEY(client, conversation_key, generation, episode_id)
 );
 CREATE TABLE IF NOT EXISTS procedure_applications (
     memory_id TEXT NOT NULL,
@@ -192,7 +203,14 @@ const OPERATIONAL_TABLES: &[(&str, &str)] = &[
         "integration_state",
         "client, connected, mcp_registered, hook_status, last_event_at, details_json",
     ),
-    ("session_injections", "session_key, memory_id, injected_at"),
+    (
+        "session_injections",
+        "client, conversation_key, generation, episode_id, memory_id, injected_at",
+    ),
+    (
+        "briefing_deliveries",
+        "client, conversation_key, generation, episode_id, delivered_at",
+    ),
     (
         "procedure_applications",
         "memory_id, source_session, signal, created_at",
@@ -235,6 +253,14 @@ pub struct RecallContext {
     pub active_corrections: Vec<String>,
     pub active_constraints: Vec<String>,
     pub conversation_root_goal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectionIdentity {
+    pub client: String,
+    pub conversation_key: String,
+    pub generation: u32,
+    pub episode_id: Option<Uuid>,
 }
 
 pub struct IngestResult {
@@ -472,7 +498,12 @@ impl SessionRepository {
         project_id: Option<&str>,
     ) -> Result<Option<RecallContext>> {
         let connection = self.open()?;
-        let Some(session) = latest_session_connection(&connection, client, external_session_id)?
+        let Some(session) = latest_session_for_project_connection(
+            &connection,
+            client,
+            external_session_id,
+            project_id,
+        )?
         else {
             return Ok(None);
         };
@@ -510,6 +541,37 @@ impl SessionRepository {
                 .collect(),
             conversation_root_goal: root_goal,
         }))
+    }
+
+    pub fn injection_identity(
+        &self,
+        client: &str,
+        external_session_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<InjectionIdentity> {
+        let connection = self.open()?;
+        let Some(session) = latest_session_for_project_connection(
+            &connection,
+            client,
+            external_session_id,
+            project_id,
+        )?
+        else {
+            return Ok(InjectionIdentity {
+                client: client.to_owned(),
+                conversation_key: conversation_key(client, external_session_id),
+                generation: 0,
+                episode_id: None,
+            });
+        };
+        let episode =
+            active_episode_connection(&connection, &session.conversation_key, project_id)?;
+        Ok(InjectionIdentity {
+            client: client.to_owned(),
+            conversation_key: session.conversation_key,
+            generation: session.generation,
+            episode_id: episode.map(|value| value.id),
+        })
     }
 
     pub fn create_episode(
@@ -981,11 +1043,32 @@ impl SessionRepository {
         Ok(())
     }
 
-    pub fn claim_injection(&self, session_key: &str, memory_id: Uuid) -> Result<bool> {
+    pub fn claim_injection(&self, identity: &InjectionIdentity, memory_id: Uuid) -> Result<bool> {
         let connection = self.open()?;
         Ok(connection.execute(
-            "INSERT OR IGNORE INTO session_injections(session_key, memory_id, injected_at) VALUES (?1, ?2, ?3)",
-            params![session_key, memory_id.to_string(), Utc::now().to_rfc3339()],
+            "INSERT OR IGNORE INTO session_injections(client, conversation_key, generation, episode_id, memory_id, injected_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                identity.client,
+                identity.conversation_key,
+                identity.generation,
+                identity.episode_id.map_or_else(String::new, |value| value.to_string()),
+                memory_id.to_string(),
+                Utc::now().to_rfc3339()
+            ],
+        )? == 1)
+    }
+
+    pub fn claim_briefing(&self, identity: &InjectionIdentity) -> Result<bool> {
+        let connection = self.open()?;
+        Ok(connection.execute(
+            "INSERT OR IGNORE INTO briefing_deliveries(client, conversation_key, generation, episode_id, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                identity.client,
+                identity.conversation_key,
+                identity.generation,
+                identity.episode_id.map_or_else(String::new, |value| value.to_string()),
+                Utc::now().to_rfc3339()
+            ],
         )? == 1)
     }
 
@@ -1188,6 +1271,22 @@ fn latest_session_connection(
         .map_err(Into::into)
 }
 
+fn latest_session_for_project_connection(
+    connection: &Connection,
+    client: &str,
+    external_session_id: &str,
+    project_id: Option<&str>,
+) -> Result<Option<SessionRecord>> {
+    connection
+        .query_row(
+            "SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, conversation_key FROM sessions WHERE client=?1 AND external_session_id=?2 AND project_id IS ?3 ORDER BY generation DESC LIMIT 1",
+            params![client, external_session_id, project_id],
+            session_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn active_episode_connection(
     connection: &Connection,
     conversation_key: &str,
@@ -1367,6 +1466,14 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
         migrate_to_version_4(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (4)", [])?;
     }
+    if current < 5 {
+        migrate_to_version_5(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (5)", [])?;
+    }
+    if current < 6 {
+        migrate_to_version_6(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (6)", [])?;
+    }
     Ok(())
 }
 
@@ -1413,12 +1520,31 @@ fn migrate_attached_operational_tables(connection: &mut Connection) -> Result<()
             |row| row.get(0),
         )?;
         if exists {
-            transaction.execute(
-                &format!(
-                    "INSERT OR IGNORE INTO {table}({columns}) SELECT {columns} FROM legacy.{table}"
-                ),
-                [],
-            )?;
+            if *table == "session_injections" {
+                let has_client: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy.pragma_table_info('session_injections') WHERE name='client')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_client {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO session_injections(client, conversation_key, generation, episode_id, memory_id, injected_at) SELECT client, conversation_key, generation, episode_id, memory_id, injected_at FROM legacy.session_injections",
+                        [],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO session_injections(client, conversation_key, generation, episode_id, memory_id, injected_at) SELECT 'legacy', session_key, 0, '', memory_id, injected_at FROM legacy.session_injections",
+                        [],
+                    )?;
+                }
+            } else {
+                transaction.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO {table}({columns}) SELECT {columns} FROM legacy.{table}"
+                    ),
+                    [],
+                )?;
+            }
         }
         transaction.execute(
             "INSERT INTO operational_migration_markers(migration, table_name, completed_at) VALUES (?1, ?2, ?3)",
@@ -1484,6 +1610,49 @@ fn migrate_to_version_4(connection: &Connection) -> Result<()> {
         )?;
     }
     ensure_conversation_keys(connection)
+}
+
+fn migrate_to_version_5(connection: &Connection) -> Result<()> {
+    let has_client = connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('session_injections') WHERE name='client'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if has_client.is_some() {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "ALTER TABLE session_injections RENAME TO session_injections_legacy;
+         CREATE TABLE session_injections (
+             client TEXT NOT NULL,
+             conversation_key TEXT NOT NULL,
+             generation INTEGER NOT NULL,
+             episode_id TEXT NOT NULL DEFAULT '',
+             memory_id TEXT NOT NULL,
+             injected_at TEXT NOT NULL,
+             PRIMARY KEY(client, conversation_key, generation, episode_id, memory_id)
+         );
+         INSERT OR IGNORE INTO session_injections(client, conversation_key, generation, episode_id, memory_id, injected_at)
+         SELECT 'legacy', session_key, 0, '', memory_id, injected_at FROM session_injections_legacy;
+         DROP TABLE session_injections_legacy;",
+    )?;
+    Ok(())
+}
+
+fn migrate_to_version_6(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS briefing_deliveries (
+             client TEXT NOT NULL,
+             conversation_key TEXT NOT NULL,
+             generation INTEGER NOT NULL,
+             episode_id TEXT NOT NULL DEFAULT '',
+             delivered_at TEXT NOT NULL,
+             PRIMARY KEY(client, conversation_key, generation, episode_id)
+         );",
+    )?;
+    Ok(())
 }
 
 fn ensure_conversation_keys(connection: &Connection) -> Result<()> {

@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.11.0
+Version: 1.12.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -81,7 +81,7 @@ The REST foundation is under `/api/v1`. Health, normalized event ingestion, and 
 
 Claude hooks normalize client payloads before domain ingestion and ensure the daemon is running. Hooks originating from `MENVANE_INTERNAL=1` are ignored. Reliably attributed ignored paths are dropped and all capture is sanitized before local daemon transport.
 
-Session start injects a briefing of project identity, detected technologies, active decisions, critical gotchas, and high-confidence applicable global facts within 2,500 characters. User prompts use the intent-aware lexical recall path and retrieve at most six relevant project and applicable global memories within 6,000 characters. Recall diagnostics expose every intent query's rank and contribution plus every reranking multiplier. Recall prompts are sanitized and bounded before search; oversized client, session, and working-directory identifiers are rejected by the daemon. No external language-model request occurs on this path, and identical memories are not repeatedly injected into one external session.
+Session start injects a separate briefing of project identity, detected technologies, active decisions, critical gotchas, and high-confidence applicable global facts within 2,500 characters, at most once per delivery identity even when it has no memory entries. User prompts use the intent-aware lexical recall path and a 6,000-character three-tier payload: required active corrections, constraints, and critical gotchas start with 2,000 characters; relevant bounded excerpts start with 3,000; and retrieval cards start with 1,000. Unused capacity flows from earlier tiers to later tiers, and secondary entries are omitted when exhausted. Every automatic memory entry and card includes its ID, type, scope, status, confidence, age, bounded provenance indicator with source-session and supersession counts, and relevance reason; full bodies are never injected automatically. Recall diagnostics expose every intent query's rank and contribution plus every reranking multiplier. Retrieval is recorded when selected, while injection is recorded only after an entry is included. Recall prompts are sanitized and bounded before search; oversized client, session, and working-directory identifiers are rejected by the daemon. No external language-model request occurs on this path, and identity-aware claims deliver each memory at most once per client, conversation, generation, episode, and memory identity.
 
 Injected memory is delimited as historical context and explicitly states that current user instructions and repository state are authoritative. Hook capture and recall require no memory instruction from the user.
 
@@ -129,7 +129,7 @@ Codex session start, user prompt, completed tool, pre- and post-compaction, stop
 
 `menvane connect opencode` preserves and extends the user OpenCode JSON configuration, registers the local Menvane MCP server, and installs one owned vanilla JavaScript plugin under the OpenCode configuration directory. The installer creates backups and is idempotent. Disconnect removes only the matching Menvane plugin URI, MCP entry, and unchanged owned plugin file.
 
-The plugin only forwards session, message, compaction, and completed-tool activity to `menvane hook opencode` and appends returned context before model dispatch. It contains no ranking, applicability, consolidation, compiler, or memory-domain logic. OpenCode payloads normalize into the same domain vocabulary and use the same daemon capture, retrieval, sanitization, trust boundary, and session lifecycle as Claude Code and Codex.
+The plugin only forwards session, message, compaction, and completed-tool activity to `menvane hook opencode`, appends returned session-start and prompt context before model dispatch, and contains no ranking, applicability, consolidation, compiler, or memory-domain logic. OpenCode payloads normalize into the same domain vocabulary and use the same daemon capture, retrieval, sanitization, trust boundary, and identity-aware delivery as Claude Code and Codex.
 
 ## Decay And Maintenance
 

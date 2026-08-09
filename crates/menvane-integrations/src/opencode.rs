@@ -163,7 +163,12 @@ export const Menvane = async ({{ directory }}) => ({{
   }},
   "chat.message": async (input, output) => {{
     const prompt = output.parts?.filter(part => part.type === "text").map(part => part.text || "").join("\n").trim() || ""
-    if (prompt) await invoke("UserPromptSubmit", {{ session_id: input.sessionID, cwd: directory, prompt, hook_event_name: "UserPromptSubmit" }})
+    if (!prompt) return
+    const response = await invoke("UserPromptSubmit", {{ session_id: input.sessionID, cwd: directory, prompt, hook_event_name: "UserPromptSubmit" }})
+    const context = response.hookSpecificOutput?.additionalContext
+    if (!context) return
+    if (Array.isArray(output.system) && !output.system.includes(context)) output.system.push(context)
+    else if (Array.isArray(output.parts)) output.parts.push({{ type: "text", text: `\n\n${{context}}` }})
   }},
   "experimental.chat.system.transform": async (input, output) => {{
     if (!input.sessionID) return
@@ -253,6 +258,8 @@ mod tests {
         assert!(source.contains("output.parts?.filter"));
         assert!(source.contains("properties.info?.id"));
         assert!(source.contains("experimental.chat.system.transform"));
+        assert!(source.contains("const response = await invoke(\"UserPromptSubmit\""));
+        assert!(source.contains("response.hookSpecificOutput?.additionalContext"));
         assert!(!source.contains("output.options.system"));
         assert!(installer.disconnect().unwrap());
         let disconnected = read_object(&paths.configuration).unwrap();
