@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.15.0
+Version: 1.16.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -41,7 +41,7 @@ Technology detection is deterministic and inspects known project files and depen
 
 ## Commands
 
-`menvane write` creates a durable memory. `menvane search` searches current-project and global memory by default. `menvane read` displays a memory. `menvane forget` marks one forgotten. `menvane reindex` reconstructs the derived index from Markdown. `menvane doctor` checks the home, index database, state database, FTS5, Git availability, and Markdown/index consistency independently.
+`menvane write` creates a durable memory. `menvane search` searches current-project and global memory by default. `menvane read` displays a memory. `menvane forget` marks one forgotten. `menvane handoff inspect <id>` displays one bounded handoff artifact with its versions and source evidence for diagnostics; normal continuation remains automatic. `menvane reindex` reconstructs the derived index from Markdown. `menvane doctor` checks the home, index database, state database, FTS5, Git availability, and Markdown/index consistency independently.
 
 ## Retrieval
 
@@ -84,6 +84,8 @@ The generated configuration contains `[handoff].nonvalidation_tool_debounce_seco
 `menvane serve` runs the Axum daemon on `127.0.0.1:47831` by default. A per-home process lock prevents duplicate daemons. `menvane daemon start`, `stop`, `restart`, and `status` manage the background process.
 
 The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture, checkpoint generation, and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, error fields, an owner, and a configurable 300-second lease timeout by default. The daemon worker claims checkpoint, finalization, and compilation jobs, recovers expired leases after restart, and retries all paths idempotently; dirty checkpoint state is conditionally completed so concurrent evidence remains pending. Graceful shutdown flushes dirty checkpoints when feasible, and capture does not wait for background work.
+
+Handoff REST is under `/api/v1/handoffs`. Bounded lists support all handoffs or one project or session, with status and limit filters. Detail returns the bounded current artifact, version history, and source-event evidence. POST lifecycle actions consume, complete, or supersede by UUID; invalid selectors, statuses, UUIDs, and limits return 400, while missing handoffs return 404. Lifecycle actions are idempotent and use the same store transitions as automatic delivery.
 
 ## Claude Code Integration
 
@@ -159,13 +161,13 @@ All importers produce client-independent normalized sessions and pass them throu
 
 ## Web Interface
 
-The daemon serves a responsive, server-rendered HTML interface with no CDN, React, or client framework. The dashboard summarizes projects, global memory, procedures, sessions, queue state, integrations, and provider health. Dedicated views cover projects, memories, procedures, sessions, search, imports, integrations, providers, and non-secret settings.
+The daemon serves a responsive, server-rendered HTML interface with no CDN, React, or client framework. The dashboard summarizes projects, global memory, procedures, sessions, queue state, integrations, and provider health. Dedicated views cover projects, memories, procedures, sessions, search, imports, integrations, providers, and non-secret settings. Project detail separates active, ready, and consumed handoffs from stale or blocked artifacts and recently completed artifacts using compact status, fingerprint, file, and next-action cards. Session rows open a session detail view with bounded evidence and generated handoffs linked to source evidence. Safe handoff lifecycle forms expose only applicable consume, complete, and supersede actions.
 
 Memory lists filter by physical scope, type, status, and technology. Detail views show rendered content, raw Markdown, metadata, confidence, applicability, source sessions, procedure successes and failures, and supersession evidence. Administrative edits use the same Markdown and index application layer, commit durable history, and update search immediately.
 
 The search view uses the runtime retrieval engine and exposes FTS rank, RRF constant, freshness, and final score. The visual interface is fully local and uses embedded assets with minimal JavaScript only for progressive page arrival.
 
-REST endpoints under `/api/v1` cover health, projects, memories, sessions, imports, integrations, settings, jobs, providers, normalized events, and recall. Recall accepts the integration client and external session identifier and returns bounded context with intent-ranking diagnostics. HTTP handlers delegate to the same engine used by CLI, MCP, hooks, and UI.
+REST endpoints under `/api/v1` cover health, projects, memories, sessions, imports, integrations, settings, jobs, providers, normalized events, recall, and handoffs. Recall accepts the integration client and external session identifier and returns bounded context with intent-ranking diagnostics. HTTP handlers delegate to the same engine used by CLI, MCP, hooks, and UI.
 
 ## Backup, Restore, And Distribution
 

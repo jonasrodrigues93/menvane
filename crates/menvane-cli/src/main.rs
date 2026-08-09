@@ -45,7 +45,24 @@ enum Command {
     Reindex,
     Doctor,
     Gc,
+    Handoff(HandoffArgs),
     Mcp,
+}
+
+#[derive(Args)]
+struct HandoffArgs {
+    #[command(subcommand)]
+    command: HandoffCommand,
+}
+
+#[derive(Subcommand)]
+enum HandoffCommand {
+    Inspect(HandoffInspectArgs),
+}
+
+#[derive(Args)]
+struct HandoffInspectArgs {
+    id: Uuid,
 }
 
 #[derive(Args)]
@@ -88,7 +105,8 @@ fn parse_days(value: &str) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_days;
+    use super::{Cli, parse_days};
+    use clap::Parser;
 
     #[test]
     fn parses_only_positive_day_windows() {
@@ -96,6 +114,19 @@ mod tests {
         assert!(parse_days("7").is_err());
         assert!(parse_days("7h").is_err());
         assert!(parse_days("0d").is_err());
+    }
+
+    #[test]
+    fn parses_handoff_inspection_diagnostics() {
+        assert!(
+            Cli::try_parse_from([
+                "menvane",
+                "handoff",
+                "inspect",
+                "018f2c20-7a1e-7c3b-9f4a-1a2b3c4d5e6f"
+            ])
+            .is_ok()
+        );
     }
 }
 
@@ -635,6 +666,14 @@ async fn main() -> Result<()> {
         Command::Gc => {
             println!("archived {} sessions", menvane.gc()?);
         }
+        Command::Handoff(arguments) => match arguments.command {
+            HandoffCommand::Inspect(arguments) => {
+                let detail = menvane
+                    .handoff_detail(arguments.id)?
+                    .ok_or_else(|| anyhow::anyhow!("handoff {} not found", arguments.id))?;
+                println!("{}", serde_json::to_string_pretty(&detail)?);
+            }
+        },
         Command::Mcp => {
             let cwd = std::env::current_dir()?;
             let stdin = std::io::stdin();

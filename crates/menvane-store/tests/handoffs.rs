@@ -407,6 +407,46 @@ fn evidence_relationships_and_bounds_are_checked_before_persistence() {
 }
 
 #[test]
+fn bounded_handoff_surfaces_cover_all_project_session_and_detail() {
+    let (_temporary, repository, session, episode) = setup();
+    let handoff = handoff(&session, &episode, "surface", "ready", "state");
+    repository.create_or_update_handoff(&handoff).unwrap();
+
+    assert_eq!(
+        repository
+            .all_handoffs(None, 10)
+            .unwrap()
+            .first()
+            .unwrap()
+            .id,
+        handoff.id
+    );
+    assert_eq!(
+        repository
+            .project_handoffs("project-a", None, 10)
+            .unwrap()
+            .first()
+            .unwrap()
+            .id,
+        handoff.id
+    );
+    assert_eq!(
+        repository
+            .session_handoffs(session.id, None, 10)
+            .unwrap()
+            .first()
+            .unwrap()
+            .id,
+        handoff.id
+    );
+    let detail = repository.handoff_detail(handoff.id).unwrap().unwrap();
+    assert_eq!(detail.handoff.id, handoff.id);
+    assert!(detail.versions.is_empty());
+    assert_eq!(detail.evidence[0].event_id, "prompt-a");
+    assert!(repository.handoff_detail(Uuid::now_v7()).unwrap().is_none());
+}
+
+#[test]
 fn state_reopen_preserves_handoffs_versions_and_evidence() {
     let temporary = TempDir::new().unwrap();
     let path = temporary.path().join("state.sqlite");

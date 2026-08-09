@@ -9,6 +9,7 @@ use menvane_domain::{
     PromptIntent, PromptIntentKind, ReinforcementSignal, SessionState, TaskEpisode, TaskHandoff,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -265,6 +266,7 @@ pub const MAX_HANDOFF_MEMORY_IDS: usize = 64;
 pub const MAX_HANDOFF_SOURCE_EVENTS: usize = 128;
 pub const MAX_HANDOFF_CHANGED_FILES: usize = 128;
 pub const MAX_HANDOFF_TOTAL_BYTES: usize = 32_768;
+pub const MAX_HANDOFF_VERSIONS: usize = 100;
 pub const MAX_CHECKPOINT_DEBOUNCE_SECONDS: i64 = 86_400;
 
 const OPERATIONAL_TABLES: &[(&str, &str)] = &[
@@ -430,7 +432,7 @@ pub struct CheckpointState {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HandoffEvidence {
     pub handoff_id: Uuid,
     pub source_session_id: Uuid,
@@ -438,13 +440,20 @@ pub struct HandoffEvidence {
     pub ordinal: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HandoffVersion {
     pub handoff_id: Uuid,
     pub revision: u32,
     pub status: HandoffStatus,
     pub snapshot: TaskHandoff,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HandoffDetail {
+    pub handoff: TaskHandoff,
+    pub versions: Vec<HandoffVersion>,
+    pub evidence: Vec<HandoffEvidence>,
 }
 
 pub struct IntegrationRecord {
@@ -1047,6 +1056,30 @@ impl SessionRepository {
         handoff_by_id(&connection, id)
     }
 
+    pub fn handoff_detail(&self, id: Uuid) -> Result<Option<HandoffDetail>> {
+        let Some(handoff) = self.handoff_optional(id)? else {
+            return Ok(None);
+        };
+        Ok(Some(HandoffDetail {
+            versions: self
+                .handoff_versions(id)?
+                .into_iter()
+                .take(MAX_HANDOFF_VERSIONS)
+                .collect(),
+            evidence: self
+                .handoff_evidence_records(id)?
+                .into_iter()
+                .take(MAX_HANDOFF_SOURCE_EVENTS)
+                .collect(),
+            handoff,
+        }))
+    }
+
+    pub fn handoff_optional(&self, id: Uuid) -> Result<Option<TaskHandoff>> {
+        let connection = self.open()?;
+        handoff_by_id_optional(&connection, id)
+    }
+
     pub fn handoff_for_episode(&self, episode_id: Uuid) -> Result<Option<TaskHandoff>> {
         let connection = self.open()?;
         connection
@@ -1086,6 +1119,68 @@ impl SessionRepository {
             .collect()
     }
 
+    pub fn all_handoffs(
+        &self,
+        status: Option<HandoffStatus>,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        validate_handoff_limit(limit)?;
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at
+             FROM handoffs
+             WHERE (?1 IS NULL OR status=?1)
+             ORDER BY updated_at DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![status.map(handoff_status), i64::try_from(limit)?],
+            handoff_from_row,
+        )?;
+        rows.take(limit)
+            .map(|row| row.map_err(Into::into))
+            .collect()
+    }
+
+    pub fn project_handoffs(
+        &self,
+        project_id: &str,
+        status: Option<HandoffStatus>,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        if project_id.trim().is_empty() || project_id.contains('\0') {
+            bail!("project id cannot be empty or contain NUL");
+        }
+        self.list_handoffs(Some(project_id), status, limit)
+    }
+
+    pub fn session_handoffs(
+        &self,
+        session_id: Uuid,
+        status: Option<HandoffStatus>,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        validate_handoff_limit(limit)?;
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at
+             FROM handoffs
+             WHERE (source_session_id=?1 OR EXISTS (SELECT 1 FROM handoff_evidence e WHERE e.handoff_id=handoffs.id AND e.source_session_id=?1))
+               AND (?2 IS NULL OR status=?2)
+             ORDER BY updated_at DESC, id DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                session_id.to_string(),
+                status.map(handoff_status),
+                i64::try_from(limit)?
+            ],
+            handoff_from_row,
+        )?;
+        rows.take(limit)
+            .map(|row| row.map_err(Into::into))
+            .collect()
+    }
+
     pub fn newest_handoff_candidates(
         &self,
         project_id: Option<&str>,
@@ -1111,9 +1206,9 @@ impl SessionRepository {
     pub fn handoff_versions(&self, id: Uuid) -> Result<Vec<HandoffVersion>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT handoff_id, revision, status, snapshot_json, created_at FROM handoff_versions WHERE handoff_id=?1 ORDER BY revision",
+            "SELECT handoff_id, revision, status, snapshot_json, created_at FROM handoff_versions WHERE handoff_id=?1 ORDER BY revision DESC LIMIT ?2",
         )?;
-        let rows = statement.query_map([id.to_string()], |row| {
+        let rows = statement.query_map(params![id.to_string(), MAX_HANDOFF_VERSIONS], |row| {
             let handoff_id: String = row.get(0)?;
             let status: String = row.get(2)?;
             let snapshot: String = row.get(3)?;
@@ -1132,34 +1227,42 @@ impl SessionRepository {
                 created_at: parse_timestamp(&created_at).map_err(sql_conversion_error)?,
             })
         })?;
-        rows.map(|row| row.map_err(Into::into)).collect()
+        let mut versions = rows
+            .map(|row| row.map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?;
+        versions.reverse();
+        Ok(versions)
     }
 
     pub fn handoff_evidence(&self, id: Uuid) -> Result<Vec<String>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT event_id FROM handoff_evidence WHERE handoff_id=?1 ORDER BY ordinal, event_id",
+            "SELECT event_id FROM handoff_evidence WHERE handoff_id=?1 ORDER BY ordinal, event_id LIMIT ?2",
         )?;
-        let rows = statement.query_map([id.to_string()], |row| row.get(0))?;
+        let rows = statement
+            .query_map(params![id.to_string(), MAX_HANDOFF_SOURCE_EVENTS], |row| {
+                row.get(0)
+            })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn handoff_evidence_records(&self, id: Uuid) -> Result<Vec<HandoffEvidence>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT handoff_id, source_session_id, event_id, ordinal FROM handoff_evidence WHERE handoff_id=?1 ORDER BY ordinal, event_id",
+            "SELECT handoff_id, source_session_id, event_id, ordinal FROM handoff_evidence WHERE handoff_id=?1 ORDER BY ordinal, event_id LIMIT ?2",
         )?;
-        let rows = statement.query_map([id.to_string()], |row| {
-            let handoff_id: String = row.get(0)?;
-            let source_session_id: String = row.get(1)?;
-            Ok(HandoffEvidence {
-                handoff_id: Uuid::parse_str(&handoff_id).map_err(sql_conversion_error)?,
-                source_session_id: Uuid::parse_str(&source_session_id)
-                    .map_err(sql_conversion_error)?,
-                event_id: row.get(2)?,
-                ordinal: row.get(3)?,
-            })
-        })?;
+        let rows =
+            statement.query_map(params![id.to_string(), MAX_HANDOFF_SOURCE_EVENTS], |row| {
+                let handoff_id: String = row.get(0)?;
+                let source_session_id: String = row.get(1)?;
+                Ok(HandoffEvidence {
+                    handoff_id: Uuid::parse_str(&handoff_id).map_err(sql_conversion_error)?,
+                    source_session_id: Uuid::parse_str(&source_session_id)
+                        .map_err(sql_conversion_error)?,
+                    event_id: row.get(2)?,
+                    ordinal: row.get(3)?,
+                })
+            })?;
         rows.map(|row| row.map_err(Into::into)).collect()
     }
 

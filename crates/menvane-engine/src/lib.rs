@@ -27,8 +27,9 @@ use menvane_domain::{
 };
 pub use menvane_store::mark_forgotten;
 pub use menvane_store::{
-    IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MarkdownStore, OrphanRecord,
-    SearchResult, SessionRepository,
+    HandoffDetail, HandoffEvidence, HandoffVersion, IndexStore, InjectionIdentity,
+    IntegrationRecord, JobRecord, MAX_HANDOFF_ITEM_BYTES, MAX_HANDOFF_LIST_LIMIT, MarkdownStore,
+    OrphanRecord, SearchResult, SessionRepository,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -488,12 +489,58 @@ impl Menvane {
             .list_handoffs(project_id.as_deref(), None, 100)
     }
 
+    pub fn all_handoffs(
+        &self,
+        status: Option<HandoffStatus>,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        self.sessions.all_handoffs(status, limit)
+    }
+
+    pub fn project_handoffs(
+        &self,
+        project_id: &str,
+        status: Option<HandoffStatus>,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        self.sessions.project_handoffs(project_id, status, limit)
+    }
+
+    pub fn session_handoffs(
+        &self,
+        session_id: Uuid,
+        status: Option<HandoffStatus>,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        self.sessions.session_handoffs(session_id, status, limit)
+    }
+
+    pub fn handoff_detail(&self, id: Uuid) -> Result<Option<HandoffDetail>> {
+        self.sessions.handoff_detail(id)
+    }
+
+    pub fn handoff_versions(&self, id: Uuid) -> Result<Vec<HandoffVersion>> {
+        self.sessions.handoff_versions(id)
+    }
+
+    pub fn handoff_evidence(&self, id: Uuid) -> Result<Vec<HandoffEvidence>> {
+        self.sessions.handoff_evidence_records(id)
+    }
+
+    pub fn session_events(&self, id: Uuid) -> Result<Vec<NormalizedEvent>> {
+        self.sessions.events(id)
+    }
+
     pub fn consume_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
         self.sessions.consume_handoff(id)
     }
 
     pub fn complete_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
         self.sessions.complete_handoff(id)
+    }
+
+    pub fn supersede_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
+        self.sessions.supersede_handoff(id)
     }
 
     pub fn classifier_diagnostics(&self) -> ClassifierDiagnostics {
