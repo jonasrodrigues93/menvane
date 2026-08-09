@@ -4,7 +4,8 @@ use std::path::Path;
 use chrono::{TimeZone, Utc};
 use fs2::FileExt;
 use menvane_domain::{
-    Applicability, MemoryType, NormalizedEvent, NormalizedEventKind, ReinforcementSignal, Scope,
+    Applicability, HandoffStatus, MemoryType, NormalizedEvent, NormalizedEventKind,
+    ReinforcementSignal, Scope, TaskHandoff,
 };
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use menvane_store::{InjectionIdentity, SessionRepository};
@@ -75,7 +76,7 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
             "{table}"
         );
     }
-    assert_eq!(row_count(&state_path, "operational_migration_markers"), 11);
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 19);
     assert!(has_table(&home.join("index.sqlite"), "sessions"));
     assert_eq!(
         SessionRepository::new(&state_path)
@@ -87,7 +88,7 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
     drop(menvane);
 
     let reopened = Menvane::new(&home).unwrap();
-    assert_eq!(row_count(&state_path, "operational_migration_markers"), 11);
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 19);
     assert_eq!(
         SessionRepository::new(&state_path)
             .events(first.session.id)
@@ -143,6 +144,76 @@ fn reindex_replaces_only_the_derived_index() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[test]
+fn reindex_preserves_handoff_state_and_evidence() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path().join("home");
+    let menvane = Menvane::new(&home).unwrap();
+    let state = SessionRepository::new(home.join("state.sqlite"));
+    let session = state
+        .ingest(
+            &event(
+                "handoff-session",
+                "handoff-reindex",
+                NormalizedEventKind::SessionStarted,
+                Path::new("/tmp/menvane-handoff-project"),
+            ),
+            None,
+        )
+        .unwrap()
+        .session;
+    state
+        .ingest(
+            &event(
+                "handoff-prompt",
+                "handoff-reindex",
+                NormalizedEventKind::UserPrompt,
+                Path::new("/tmp/menvane-handoff-project"),
+            ),
+            None,
+        )
+        .unwrap();
+    let episode = state
+        .create_episode(session.id, "handoff-prompt", "preserve handoff")
+        .unwrap();
+    let handoff = TaskHandoff {
+        id: Uuid::now_v7(),
+        project_id: None,
+        conversation_key: episode.conversation_key.clone(),
+        episode_id: episode.id,
+        source_session_id: session.id,
+        source_client: session.client.clone(),
+        status: HandoffStatus::Ready,
+        goal: "preserve handoff".to_owned(),
+        current_state: "captured".to_owned(),
+        completed_work: vec!["session captured".to_owned()],
+        pending_work: vec!["resume".to_owned()],
+        next_action: Some("continue".to_owned()),
+        blockers: Vec::new(),
+        changed_files: Vec::new(),
+        decisions: Vec::new(),
+        validation: Vec::new(),
+        relevant_memory_ids: Vec::new(),
+        source_event_ids: vec!["handoff-prompt".to_owned()],
+        git_head: None,
+        worktree_state_hash: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    state.create_or_update_handoff(&handoff).unwrap();
+    drop(state);
+
+    menvane.reindex().unwrap();
+
+    let reopened = SessionRepository::new(home.join("state.sqlite"));
+    reopened.initialize().unwrap();
+    assert_eq!(reopened.handoff(handoff.id).unwrap(), handoff);
+    assert_eq!(
+        reopened.handoff_evidence(handoff.id).unwrap(),
+        vec!["handoff-prompt"]
     );
 }
 
@@ -273,7 +344,7 @@ fn backup_restore_round_trips_index_and_state_databases() {
     assert_eq!(menvane.read(retained).unwrap().title, "Backup retained");
 }
 
-fn operational_tables() -> [&'static str; 11] {
+fn operational_tables() -> [&'static str; 19] {
     [
         "sessions",
         "session_events",
@@ -286,6 +357,14 @@ fn operational_tables() -> [&'static str; 11] {
         "briefing_deliveries",
         "procedure_applications",
         "orphan_sessions",
+        "conversations",
+        "task_episodes",
+        "prompt_intents",
+        "prompt_intent_history",
+        "handoffs",
+        "handoff_versions",
+        "handoff_evidence",
+        "checkpoint_state",
     ]
 }
 

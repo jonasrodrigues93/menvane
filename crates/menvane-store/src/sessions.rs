@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use menvane_domain::{
-    EpisodeState, IntentClassificationSource, NormalizedEvent, NormalizedEventKind, PromptIntent,
-    PromptIntentKind, ReinforcementSignal, SessionState, TaskEpisode,
+    EpisodeState, HandoffStatus, IntentClassificationSource, NormalizedEvent, NormalizedEventKind,
+    PromptIntent, PromptIntentKind, ReinforcementSignal, SessionState, TaskEpisode, TaskHandoff,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -167,6 +167,67 @@ CREATE TABLE IF NOT EXISTS prompt_intent_history (
     FOREIGN KEY(event_id) REFERENCES session_events(event_id)
 );
 CREATE INDEX IF NOT EXISTS prompt_intent_history_event ON prompt_intent_history(event_id, revision);
+CREATE TABLE IF NOT EXISTS handoffs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    conversation_key TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    source_client TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active', 'ready', 'consumed', 'completed', 'stale', 'superseded')),
+    goal TEXT NOT NULL,
+    current_state TEXT NOT NULL,
+    completed_work_json TEXT NOT NULL,
+    pending_work_json TEXT NOT NULL,
+    next_action TEXT,
+    blockers_json TEXT NOT NULL,
+    changed_files_json TEXT NOT NULL,
+    decisions_json TEXT NOT NULL,
+    validation_json TEXT NOT NULL,
+    relevant_memory_ids_json TEXT NOT NULL,
+    source_event_ids_json TEXT NOT NULL,
+    git_head TEXT,
+    worktree_state_hash TEXT,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(episode_id) REFERENCES task_episodes(id),
+    FOREIGN KEY(source_session_id) REFERENCES sessions(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS handoffs_current_episode
+    ON handoffs(episode_id)
+    WHERE status IN ('active', 'ready', 'consumed');
+CREATE INDEX IF NOT EXISTS handoffs_project_status ON handoffs(project_id, status, updated_at DESC);
+CREATE TABLE IF NOT EXISTS handoff_versions (
+    handoff_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(handoff_id, revision),
+    FOREIGN KEY(handoff_id) REFERENCES handoffs(id)
+);
+CREATE INDEX IF NOT EXISTS handoff_versions_handoff ON handoff_versions(handoff_id, revision);
+CREATE TABLE IF NOT EXISTS handoff_evidence (
+    handoff_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    PRIMARY KEY(handoff_id, event_id),
+    FOREIGN KEY(handoff_id) REFERENCES handoffs(id),
+    FOREIGN KEY(source_session_id) REFERENCES sessions(id),
+    FOREIGN KEY(event_id) REFERENCES session_events(event_id)
+);
+CREATE INDEX IF NOT EXISTS handoff_evidence_event ON handoff_evidence(event_id);
+CREATE TABLE IF NOT EXISTS checkpoint_state (
+    episode_id TEXT PRIMARY KEY,
+    dirty INTEGER NOT NULL CHECK(dirty IN (0, 1)),
+    debounce_until TEXT,
+    last_checkpoint_at TEXT,
+    revision INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(episode_id) REFERENCES task_episodes(id)
+);
 CREATE TABLE IF NOT EXISTS operational_migration_markers (
     migration TEXT NOT NULL,
     table_name TEXT NOT NULL,
@@ -176,6 +237,17 @@ CREATE TABLE IF NOT EXISTS operational_migration_markers (
 "#;
 
 const OPERATIONAL_MIGRATION: &str = "index-to-state-v1";
+pub const MAX_HANDOFF_LIST_LIMIT: usize = 100;
+pub const MAX_HANDOFF_TEXT_BYTES: usize = 4_096;
+pub const MAX_HANDOFF_GOAL_BYTES: usize = 2_048;
+pub const MAX_HANDOFF_LIST_ITEMS: usize = 32;
+pub const MAX_HANDOFF_ITEM_BYTES: usize = 1_024;
+pub const MAX_HANDOFF_VALIDATIONS: usize = 32;
+pub const MAX_HANDOFF_MEMORY_IDS: usize = 64;
+pub const MAX_HANDOFF_SOURCE_EVENTS: usize = 128;
+pub const MAX_HANDOFF_CHANGED_FILES: usize = 128;
+pub const MAX_HANDOFF_TOTAL_BYTES: usize = 32_768;
+pub const MAX_CHECKPOINT_DEBOUNCE_SECONDS: i64 = 86_400;
 
 const OPERATIONAL_TABLES: &[(&str, &str)] = &[
     (
@@ -218,6 +290,38 @@ const OPERATIONAL_TABLES: &[(&str, &str)] = &[
     (
         "orphan_sessions",
         "client, external_session_id, payload_json, created_at",
+    ),
+    (
+        "conversations",
+        "conversation_key, client, external_session_id, created_at, updated_at",
+    ),
+    (
+        "task_episodes",
+        "id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at",
+    ),
+    (
+        "prompt_intents",
+        "event_id, episode_id, conversation_key, kind, confidence, weight, classifier_version, source, classified_at",
+    ),
+    (
+        "prompt_intent_history",
+        "event_id, revision, conversation_key, episode_id, kind, confidence, weight, classifier_version, source, classified_at, replaced_at",
+    ),
+    (
+        "handoffs",
+        "id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, revision, created_at, updated_at",
+    ),
+    (
+        "handoff_versions",
+        "handoff_id, revision, status, snapshot_json, created_at",
+    ),
+    (
+        "handoff_evidence",
+        "handoff_id, source_session_id, event_id, ordinal",
+    ),
+    (
+        "checkpoint_state",
+        "episode_id, dirty, debounce_until, last_checkpoint_at, revision, updated_at",
     ),
 ];
 
@@ -281,6 +385,33 @@ pub struct JobRecord {
     pub owner: Option<String>,
     pub lease_started_at: Option<DateTime<Utc>>,
     pub lease_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointState {
+    pub episode_id: Uuid,
+    pub dirty: bool,
+    pub debounce_until: Option<DateTime<Utc>>,
+    pub last_checkpoint_at: Option<DateTime<Utc>>,
+    pub revision: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffEvidence {
+    pub handoff_id: Uuid,
+    pub source_session_id: Uuid,
+    pub event_id: String,
+    pub ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandoffVersion {
+    pub handoff_id: Uuid,
+    pub revision: u32,
+    pub status: HandoffStatus,
+    pub snapshot: TaskHandoff,
+    pub created_at: DateTime<Utc>,
 }
 
 pub struct IntegrationRecord {
@@ -711,6 +842,321 @@ impl SessionRepository {
         )?;
         let rows = statement.query_map(params![conversation_key, project_id], episode_from_row)?;
         rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn create_or_update_handoff(&self, handoff: &TaskHandoff) -> Result<TaskHandoff> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let handoff = validate_handoff(&transaction, handoff)?;
+        let current_id: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM handoffs WHERE episode_id=?1 AND status IN ('active', 'ready', 'consumed')",
+                [handoff.episode_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existing = handoff_by_id_optional(&transaction, handoff.id)?;
+        if let Some(current_id) = current_id {
+            let current = handoff_by_id(&transaction, Uuid::parse_str(&current_id)?)?;
+            if current.id == handoff.id {
+                let mut comparable = handoff.clone();
+                comparable.created_at = current.created_at;
+                if current.status == HandoffStatus::Consumed {
+                    comparable.status = HandoffStatus::Consumed;
+                }
+                if current == comparable {
+                    transaction.commit()?;
+                    return Ok(current);
+                }
+                if !is_current_handoff_status(current.status) {
+                    bail!("terminal handoff cannot be updated");
+                }
+                let mut next = comparable;
+                next.created_at = current.created_at;
+                store_handoff_revision(&transaction, &current)?;
+                update_handoff(
+                    &transaction,
+                    &next,
+                    current_revision(&transaction, current.id)? + 1,
+                )?;
+                replace_handoff_evidence(&transaction, &next)?;
+                transaction.commit()?;
+                return Ok(next);
+            }
+            if existing.is_some() {
+                bail!("handoff id is already used by another snapshot");
+            }
+            store_handoff_revision(&transaction, &current)?;
+            update_handoff_status(
+                &transaction,
+                current.id,
+                HandoffStatus::Superseded,
+                current_revision(&transaction, current.id)? + 1,
+            )?;
+        } else if let Some(existing) = existing {
+            if existing == handoff {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            bail!("terminal handoff cannot be updated");
+        }
+        insert_handoff(&transaction, &handoff)?;
+        replace_handoff_evidence(&transaction, &handoff)?;
+        transaction.commit()?;
+        Ok(handoff)
+    }
+
+    pub fn handoff(&self, id: Uuid) -> Result<TaskHandoff> {
+        let connection = self.open()?;
+        handoff_by_id(&connection, id)
+    }
+
+    pub fn handoff_for_episode(&self, episode_id: Uuid) -> Result<Option<TaskHandoff>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                CURRENT_HANDOFF_BY_EPISODE_SELECT,
+                [episode_id.to_string()],
+                handoff_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_handoffs(
+        &self,
+        project_id: Option<&str>,
+        status: Option<HandoffStatus>,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        validate_handoff_limit(limit)?;
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at
+             FROM handoffs
+             WHERE project_id IS ?1 AND (?2 IS NULL OR status=?2)
+             ORDER BY updated_at DESC, id DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                project_id,
+                status.map(handoff_status),
+                i64::try_from(limit)?
+            ],
+            handoff_from_row,
+        )?;
+        rows.take(limit)
+            .map(|row| row.map_err(Into::into))
+            .collect()
+    }
+
+    pub fn newest_handoff_candidates(
+        &self,
+        project_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        let connection = self.open()?;
+        list_handoffs_for_candidates(&connection, project_id, None, limit)
+    }
+
+    pub fn newest_handoff_candidates_for_conversation(
+        &self,
+        project_id: Option<&str>,
+        conversation_key: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskHandoff>> {
+        if conversation_key.trim().is_empty() {
+            bail!("conversation key cannot be empty");
+        }
+        let connection = self.open()?;
+        list_handoffs_for_candidates(&connection, project_id, Some(conversation_key), limit)
+    }
+
+    pub fn handoff_versions(&self, id: Uuid) -> Result<Vec<HandoffVersion>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT handoff_id, revision, status, snapshot_json, created_at FROM handoff_versions WHERE handoff_id=?1 ORDER BY revision",
+        )?;
+        let rows = statement.query_map([id.to_string()], |row| {
+            let handoff_id: String = row.get(0)?;
+            let status: String = row.get(2)?;
+            let snapshot: String = row.get(3)?;
+            let created_at: String = row.get(4)?;
+            Ok(HandoffVersion {
+                handoff_id: Uuid::parse_str(&handoff_id).map_err(sql_conversion_error)?,
+                revision: row.get(1)?,
+                status: parse_handoff_status(&status).map_err(sql_conversion_error)?,
+                snapshot: serde_json::from_str(&snapshot).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                created_at: parse_timestamp(&created_at).map_err(sql_conversion_error)?,
+            })
+        })?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn handoff_evidence(&self, id: Uuid) -> Result<Vec<String>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT event_id FROM handoff_evidence WHERE handoff_id=?1 ORDER BY ordinal, event_id",
+        )?;
+        let rows = statement.query_map([id.to_string()], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn handoff_evidence_records(&self, id: Uuid) -> Result<Vec<HandoffEvidence>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT handoff_id, source_session_id, event_id, ordinal FROM handoff_evidence WHERE handoff_id=?1 ORDER BY ordinal, event_id",
+        )?;
+        let rows = statement.query_map([id.to_string()], |row| {
+            let handoff_id: String = row.get(0)?;
+            let source_session_id: String = row.get(1)?;
+            Ok(HandoffEvidence {
+                handoff_id: Uuid::parse_str(&handoff_id).map_err(sql_conversion_error)?,
+                source_session_id: Uuid::parse_str(&source_session_id)
+                    .map_err(sql_conversion_error)?,
+                event_id: row.get(2)?,
+                ordinal: row.get(3)?,
+            })
+        })?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn mark_handoff_dirty(
+        &self,
+        episode_id: Uuid,
+        debounce: Duration,
+    ) -> Result<CheckpointState> {
+        self.mark_handoff_dirty_at(episode_id, debounce, Utc::now())
+    }
+
+    pub fn mark_dirty(&self, episode_id: Uuid, debounce: Duration) -> Result<CheckpointState> {
+        self.mark_handoff_dirty(episode_id, debounce)
+    }
+
+    pub fn mark_handoff_dirty_at(
+        &self,
+        episode_id: Uuid,
+        debounce: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<CheckpointState> {
+        let debounce_seconds = i64::try_from(debounce.as_secs())?;
+        if debounce.subsec_nanos() != 0 || debounce_seconds > MAX_CHECKPOINT_DEBOUNCE_SECONDS {
+            bail!("checkpoint debounce exceeds the supported bound");
+        }
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        episode_by_id(&transaction, episode_id)?;
+        let now_text = now.to_rfc3339();
+        let debounce_until = (now + chrono::Duration::seconds(debounce_seconds)).to_rfc3339();
+        transaction.execute(
+            "INSERT INTO checkpoint_state(episode_id, dirty, debounce_until, last_checkpoint_at, revision, updated_at)
+             VALUES (?1, 1, ?2, NULL, 1, ?3)
+             ON CONFLICT(episode_id) DO UPDATE SET dirty=1, debounce_until=excluded.debounce_until, revision=checkpoint_state.revision + 1, updated_at=excluded.updated_at",
+            params![episode_id.to_string(), debounce_until, now_text],
+        )?;
+        enqueue_checkpoint_job(&transaction, episode_id, &debounce_until, &now_text)?;
+        let state = checkpoint_state_connection(&transaction, episode_id)?;
+        transaction.commit()?;
+        Ok(state)
+    }
+
+    pub fn checkpoint_state(&self, episode_id: Uuid) -> Result<CheckpointState> {
+        let connection = self.open()?;
+        checkpoint_state_connection(&connection, episode_id)
+    }
+
+    pub fn complete_checkpoint(&self, episode_id: Uuid) -> Result<CheckpointState> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        episode_by_id(&transaction, episode_id)?;
+        let current = checkpoint_state_connection(&transaction, episode_id)?;
+        if !current.dirty {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        let now = Utc::now().to_rfc3339();
+        transaction.execute(
+            "UPDATE checkpoint_state SET dirty=0, debounce_until=NULL, last_checkpoint_at=?1, revision=revision + 1, updated_at=?1 WHERE episode_id=?2 AND revision=?3 AND updated_at=?4",
+            params![now, episode_id.to_string(), current.revision, current.updated_at.to_rfc3339()],
+        )?;
+        let state = checkpoint_state_connection(&transaction, episode_id)?;
+        transaction.commit()?;
+        Ok(state)
+    }
+
+    pub fn complete_checkpoint_if_unchanged(
+        &self,
+        episode_id: Uuid,
+        observed_updated_at: DateTime<Utc>,
+        observed_revision: u32,
+    ) -> Result<CheckpointState> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        episode_by_id(&transaction, episode_id)?;
+        let now = Utc::now().to_rfc3339();
+        transaction.execute(
+            "UPDATE checkpoint_state SET dirty=0, debounce_until=NULL, last_checkpoint_at=?1, revision=revision + 1, updated_at=?1 WHERE episode_id=?2 AND dirty=1 AND revision=?3 AND updated_at=?4",
+            params![
+                now,
+                episode_id.to_string(),
+                observed_revision,
+                observed_updated_at.to_rfc3339()
+            ],
+        )?;
+        let state = checkpoint_state_connection(&transaction, episode_id)?;
+        transaction.commit()?;
+        Ok(state)
+    }
+
+    pub fn consume_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
+        self.update_handoff_lifecycle(id, HandoffStatus::Consumed)
+    }
+
+    pub fn complete_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
+        self.update_handoff_lifecycle(id, HandoffStatus::Completed)
+    }
+
+    pub fn stale_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
+        self.update_handoff_lifecycle(id, HandoffStatus::Stale)
+    }
+
+    pub fn supersede_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
+        self.update_handoff_lifecycle(id, HandoffStatus::Superseded)
+    }
+
+    fn update_handoff_lifecycle(
+        &self,
+        id: Uuid,
+        next_status: HandoffStatus,
+    ) -> Result<TaskHandoff> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = handoff_by_id(&transaction, id)?;
+        if current.status == next_status
+            || !is_current_handoff_status(current.status)
+            || (next_status == HandoffStatus::Consumed
+                && current.status != HandoffStatus::Active
+                && current.status != HandoffStatus::Ready)
+        {
+            transaction.commit()?;
+            return Ok(current);
+        }
+        store_handoff_revision(&transaction, &current)?;
+        update_handoff_status(
+            &transaction,
+            id,
+            next_status,
+            current_revision(&transaction, id)? + 1,
+        )?;
+        let updated = handoff_by_id(&transaction, id)?;
+        transaction.commit()?;
+        Ok(updated)
     }
 
     pub fn record_prompt_intent(&self, intent: &PromptIntent) -> Result<bool> {
@@ -1211,6 +1657,572 @@ impl SessionRepository {
     }
 }
 
+const CURRENT_HANDOFF_BY_EPISODE_SELECT: &str = "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE episode_id=?1 AND status IN ('active', 'ready', 'consumed')";
+
+fn list_handoffs_for_candidates(
+    connection: &Connection,
+    project_id: Option<&str>,
+    conversation_key: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TaskHandoff>> {
+    validate_handoff_limit(limit)?;
+    let limit = i64::try_from(limit)?;
+    let mut statement = if conversation_key.is_some() {
+        connection.prepare(
+            "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE project_id IS ?1 AND conversation_key=?2 AND status IN ('active', 'ready', 'consumed') ORDER BY updated_at DESC, id DESC LIMIT ?3",
+        )?
+    } else {
+        connection.prepare(
+            "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE project_id IS ?1 AND status IN ('active', 'ready', 'consumed') ORDER BY updated_at DESC, id DESC LIMIT ?2",
+        )?
+    };
+    let rows = if let Some(conversation_key) = conversation_key {
+        statement.query_map(
+            params![project_id, conversation_key, limit],
+            handoff_from_row,
+        )?
+    } else {
+        statement.query_map(params![project_id, limit], handoff_from_row)?
+    };
+    rows.map(|row| row.map_err(Into::into)).collect()
+}
+
+fn handoff_by_id(connection: &Connection, id: Uuid) -> Result<TaskHandoff> {
+    handoff_by_id_optional(connection, id)?
+        .ok_or_else(|| anyhow::anyhow!("handoff not found: {id}"))
+}
+
+fn handoff_by_id_optional(connection: &Connection, id: Uuid) -> Result<Option<TaskHandoff>> {
+    connection
+        .query_row(
+            "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE id=?1",
+            [id.to_string()],
+            handoff_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn handoff_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskHandoff> {
+    let parse_json = |index: usize| -> rusqlite::Result<String> { row.get(index) };
+    let id: String = row.get(0)?;
+    let episode_id: String = row.get(3)?;
+    let source_session_id: String = row.get(4)?;
+    let status: String = row.get(6)?;
+    let created_at: String = row.get(20)?;
+    let updated_at: String = row.get(21)?;
+    Ok(TaskHandoff {
+        id: Uuid::parse_str(&id).map_err(sql_conversion_error)?,
+        project_id: row.get(1)?,
+        conversation_key: row.get(2)?,
+        episode_id: Uuid::parse_str(&episode_id).map_err(sql_conversion_error)?,
+        source_session_id: Uuid::parse_str(&source_session_id).map_err(sql_conversion_error)?,
+        source_client: row.get(5)?,
+        status: parse_handoff_status(&status).map_err(sql_conversion_error)?,
+        goal: row.get(7)?,
+        current_state: row.get(8)?,
+        completed_work: parse_json_array(&parse_json(9)?).map_err(sql_conversion_error)?,
+        pending_work: parse_json_array(&parse_json(10)?).map_err(sql_conversion_error)?,
+        next_action: row.get(11)?,
+        blockers: parse_json_array(&parse_json(12)?).map_err(sql_conversion_error)?,
+        changed_files: parse_json_array(&parse_json(13)?).map_err(sql_conversion_error)?,
+        decisions: parse_json_array(&parse_json(14)?).map_err(sql_conversion_error)?,
+        validation: serde_json::from_str(&parse_json(15)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                15,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        relevant_memory_ids: parse_json_array(&parse_json(16)?)
+            .map_err(sql_conversion_error)?
+            .into_iter()
+            .map(|value| Uuid::parse_str(&value).map_err(sql_conversion_error))
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        source_event_ids: parse_json_array(&parse_json(17)?).map_err(sql_conversion_error)?,
+        git_head: row.get(18)?,
+        worktree_state_hash: row.get(19)?,
+        created_at: parse_timestamp(&created_at).map_err(sql_conversion_error)?,
+        updated_at: parse_timestamp(&updated_at).map_err(sql_conversion_error)?,
+    })
+}
+
+fn parse_json_array(value: &str) -> std::io::Result<Vec<String>> {
+    serde_json::from_str(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn validate_handoff_limit(limit: usize) -> Result<()> {
+    if limit == 0 || limit > MAX_HANDOFF_LIST_LIMIT {
+        bail!("handoff list limit must be between 1 and {MAX_HANDOFF_LIST_LIMIT}");
+    }
+    Ok(())
+}
+
+fn validate_handoff(transaction: &Transaction<'_>, input: &TaskHandoff) -> Result<TaskHandoff> {
+    if !matches!(input.status, HandoffStatus::Active | HandoffStatus::Ready) {
+        bail!("handoff creation and update require active or ready status");
+    }
+    let mut handoff = input.clone();
+    handoff.project_id = handoff
+        .project_id
+        .map(|value| bounded_identifier(&value, "project id", MAX_HANDOFF_ITEM_BYTES))
+        .transpose()?;
+    handoff.conversation_key = bounded_identifier(
+        &handoff.conversation_key,
+        "conversation key",
+        MAX_HANDOFF_ITEM_BYTES,
+    )?;
+    handoff.source_client = bounded_identifier(
+        &handoff.source_client,
+        "source client",
+        MAX_HANDOFF_ITEM_BYTES,
+    )?;
+    handoff.goal = bounded_text(&handoff.goal, "goal", MAX_HANDOFF_GOAL_BYTES)?;
+    handoff.current_state = bounded_text(
+        &handoff.current_state,
+        "current state",
+        MAX_HANDOFF_TEXT_BYTES,
+    )?;
+    handoff.next_action = handoff
+        .next_action
+        .as_deref()
+        .map(|value| bounded_text(value, "next action", MAX_HANDOFF_TEXT_BYTES))
+        .transpose()?;
+    handoff.git_head = handoff
+        .git_head
+        .as_deref()
+        .map(|value| bounded_identifier(value, "git head", MAX_HANDOFF_ITEM_BYTES))
+        .transpose()?;
+    handoff.worktree_state_hash = handoff
+        .worktree_state_hash
+        .as_deref()
+        .map(|value| bounded_identifier(value, "worktree state hash", MAX_HANDOFF_ITEM_BYTES))
+        .transpose()?;
+    handoff.completed_work = bounded_list(handoff.completed_work, "completed work")?;
+    handoff.pending_work = bounded_list(handoff.pending_work, "pending work")?;
+    handoff.blockers = bounded_list(handoff.blockers, "blockers")?;
+    handoff.changed_files = bounded_list_with_limit(
+        handoff.changed_files,
+        "changed files",
+        MAX_HANDOFF_CHANGED_FILES,
+    )?;
+    handoff.decisions = bounded_list(handoff.decisions, "decisions")?;
+    if handoff.validation.len() > MAX_HANDOFF_VALIDATIONS {
+        bail!("validation list exceeds {MAX_HANDOFF_VALIDATIONS} items");
+    }
+    for validation in &mut handoff.validation {
+        validation.event_id = bounded_identifier(
+            &validation.event_id,
+            "validation event id",
+            MAX_HANDOFF_ITEM_BYTES,
+        )?;
+        validation.command = validation
+            .command
+            .as_deref()
+            .map(|value| bounded_text(value, "validation command", MAX_HANDOFF_ITEM_BYTES))
+            .transpose()?;
+        validation.summary = bounded_text(
+            &validation.summary,
+            "validation summary",
+            MAX_HANDOFF_TEXT_BYTES,
+        )?;
+    }
+    if handoff.relevant_memory_ids.len() > MAX_HANDOFF_MEMORY_IDS {
+        bail!("relevant memory list exceeds {MAX_HANDOFF_MEMORY_IDS} items");
+    }
+    if handoff.source_event_ids.is_empty() {
+        bail!("handoff must reference at least one source event");
+    }
+    if handoff.source_event_ids.len() > MAX_HANDOFF_SOURCE_EVENTS {
+        bail!("source event list exceeds {MAX_HANDOFF_SOURCE_EVENTS} items");
+    }
+    for event_id in &mut handoff.source_event_ids {
+        *event_id = bounded_identifier(event_id, "source event id", MAX_HANDOFF_ITEM_BYTES)?;
+    }
+    if handoff
+        .source_event_ids
+        .iter()
+        .enumerate()
+        .any(|(index, value)| handoff.source_event_ids[index + 1..].contains(value))
+    {
+        bail!("source event references must be unique");
+    }
+    if serde_json::to_vec(&handoff)?.len() > MAX_HANDOFF_TOTAL_BYTES {
+        bail!("handoff exceeds {MAX_HANDOFF_TOTAL_BYTES} bytes");
+    }
+    validate_handoff_relationships(transaction, &handoff)?;
+    Ok(handoff)
+}
+
+fn bounded_list(values: Vec<String>, name: &str) -> Result<Vec<String>> {
+    bounded_list_with_limit(values, name, MAX_HANDOFF_LIST_ITEMS)
+}
+
+fn bounded_list_with_limit(values: Vec<String>, name: &str, limit: usize) -> Result<Vec<String>> {
+    if values.len() > limit {
+        bail!("{name} list exceeds {limit} items");
+    }
+    values
+        .into_iter()
+        .map(|value| bounded_text(&value, name, MAX_HANDOFF_ITEM_BYTES))
+        .collect()
+}
+
+fn bounded_identifier(value: &str, name: &str, limit: usize) -> Result<String> {
+    let value = sanitize_text(value);
+    if value.trim().is_empty() {
+        bail!("{name} cannot be empty");
+    }
+    if value.len() > limit {
+        bail!("{name} exceeds {limit} bytes");
+    }
+    Ok(value)
+}
+
+fn bounded_text(value: &str, name: &str, limit: usize) -> Result<String> {
+    let value = sanitize_text(value);
+    if value.trim().is_empty() {
+        bail!("{name} cannot be empty");
+    }
+    if value.len() > limit {
+        bail!("{name} exceeds {limit} bytes");
+    }
+    if contains_unbounded_evidence(&value) {
+        bail!("{name} contains a diff or tool dump");
+    }
+    Ok(value)
+}
+
+fn sanitize_text(value: &str) -> String {
+    let normalized: String = value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .collect();
+    normalized
+        .lines()
+        .map(|line| {
+            let lowercase = line.to_ascii_lowercase();
+            [
+                "authorization:",
+                "api_key=",
+                "api-key=",
+                "access_token=",
+                "access-token=",
+                "password=",
+                "secret=",
+            ]
+            .iter()
+            .find_map(|marker| {
+                lowercase
+                    .find(marker)
+                    .map(|index| format!("{}[REDACTED]", &line[..index + marker.len()]))
+            })
+            .unwrap_or_else(|| line.to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn contains_unbounded_evidence(value: &str) -> bool {
+    let lowercase = value.to_ascii_lowercase();
+    [
+        "diff --git",
+        "@@ -",
+        "--- a/",
+        "+++ b/",
+        "*** begin patch",
+        "tool_input",
+        "tool_output",
+        "tool_result",
+        "<tool_result>",
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+}
+
+fn validate_handoff_relationships(
+    transaction: &Transaction<'_>,
+    handoff: &TaskHandoff,
+) -> Result<()> {
+    let episode: (Option<String>, String) = transaction.query_row(
+        "SELECT project_id, conversation_key FROM task_episodes WHERE id=?1",
+        [handoff.episode_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if episode.0 != handoff.project_id || episode.1 != handoff.conversation_key {
+        bail!("handoff episode project or conversation does not match");
+    }
+    let source: (String, Option<String>, String) = transaction.query_row(
+        "SELECT client, project_id, conversation_key FROM sessions WHERE id=?1",
+        [handoff.source_session_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if source.0 != handoff.source_client
+        || source.1 != handoff.project_id
+        || source.2 != handoff.conversation_key
+    {
+        bail!("handoff source session does not match its episode");
+    }
+    for event_id in &handoff.source_event_ids {
+        validate_handoff_event(transaction, handoff, event_id)?;
+    }
+    for validation in &handoff.validation {
+        validate_handoff_event(transaction, handoff, &validation.event_id)?;
+    }
+    Ok(())
+}
+
+fn validate_handoff_event(
+    transaction: &Transaction<'_>,
+    handoff: &TaskHandoff,
+    event_id: &str,
+) -> Result<String> {
+    let (source_session_id, project_id, conversation_key): (String, Option<String>, String) =
+        transaction.query_row(
+            "SELECT e.session_id, s.project_id, s.conversation_key FROM session_events e JOIN sessions s ON s.id=e.session_id WHERE e.event_id=?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if project_id != handoff.project_id || conversation_key != handoff.conversation_key {
+        bail!("handoff evidence event does not match its conversation or project");
+    }
+    let assigned_episode: Option<String> = transaction
+        .query_row(
+            "SELECT episode_id FROM prompt_intents WHERE event_id=?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let episode_id = handoff.episode_id.to_string();
+    if assigned_episode
+        .as_deref()
+        .is_some_and(|assigned| assigned != episode_id.as_str())
+    {
+        bail!("handoff evidence prompt belongs to another episode");
+    }
+    Ok(source_session_id)
+}
+
+fn insert_handoff(transaction: &Transaction<'_>, handoff: &TaskHandoff) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO handoffs(id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, revision, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 1, ?21, ?22)",
+        params![
+            handoff.id.to_string(),
+            handoff.project_id,
+            handoff.conversation_key,
+            handoff.episode_id.to_string(),
+            handoff.source_session_id.to_string(),
+            handoff.source_client,
+            handoff_status(handoff.status),
+            handoff.goal,
+            handoff.current_state,
+            serde_json::to_string(&handoff.completed_work)?,
+            serde_json::to_string(&handoff.pending_work)?,
+            handoff.next_action,
+            serde_json::to_string(&handoff.blockers)?,
+            serde_json::to_string(&handoff.changed_files)?,
+            serde_json::to_string(&handoff.decisions)?,
+            serde_json::to_string(&handoff.validation)?,
+            serde_json::to_string(&handoff.relevant_memory_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())?,
+            serde_json::to_string(&handoff.source_event_ids)?,
+            handoff.git_head,
+            handoff.worktree_state_hash,
+            handoff.created_at.to_rfc3339(),
+            handoff.updated_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_handoff(
+    transaction: &Transaction<'_>,
+    handoff: &TaskHandoff,
+    revision: u32,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE handoffs SET project_id=?1, conversation_key=?2, episode_id=?3, source_session_id=?4, source_client=?5, status=?6, goal=?7, current_state=?8, completed_work_json=?9, pending_work_json=?10, next_action=?11, blockers_json=?12, changed_files_json=?13, decisions_json=?14, validation_json=?15, relevant_memory_ids_json=?16, source_event_ids_json=?17, git_head=?18, worktree_state_hash=?19, revision=?20, updated_at=?21 WHERE id=?22",
+        params![
+            handoff.project_id,
+            handoff.conversation_key,
+            handoff.episode_id.to_string(),
+            handoff.source_session_id.to_string(),
+            handoff.source_client,
+            handoff_status(handoff.status),
+            handoff.goal,
+            handoff.current_state,
+            serde_json::to_string(&handoff.completed_work)?,
+            serde_json::to_string(&handoff.pending_work)?,
+            handoff.next_action,
+            serde_json::to_string(&handoff.blockers)?,
+            serde_json::to_string(&handoff.changed_files)?,
+            serde_json::to_string(&handoff.decisions)?,
+            serde_json::to_string(&handoff.validation)?,
+            serde_json::to_string(&handoff.relevant_memory_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())?,
+            serde_json::to_string(&handoff.source_event_ids)?,
+            handoff.git_head,
+            handoff.worktree_state_hash,
+            revision,
+            handoff.updated_at.to_rfc3339(),
+            handoff.id.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_handoff_status(
+    transaction: &Transaction<'_>,
+    id: Uuid,
+    status: HandoffStatus,
+    revision: u32,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE handoffs SET status=?1, revision=?2, updated_at=?3 WHERE id=?4",
+        params![
+            handoff_status(status),
+            revision,
+            Utc::now().to_rfc3339(),
+            id.to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+fn current_revision(transaction: &Transaction<'_>, id: Uuid) -> Result<u32> {
+    Ok(transaction.query_row(
+        "SELECT revision FROM handoffs WHERE id=?1",
+        [id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+fn store_handoff_revision(transaction: &Transaction<'_>, handoff: &TaskHandoff) -> Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO handoff_versions(handoff_id, revision, status, snapshot_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            handoff.id.to_string(),
+            current_revision(transaction, handoff.id)?,
+            handoff_status(handoff.status),
+            serde_json::to_string(handoff)?,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn replace_handoff_evidence(transaction: &Transaction<'_>, handoff: &TaskHandoff) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM handoff_evidence WHERE handoff_id=?1",
+        [handoff.id.to_string()],
+    )?;
+    for (ordinal, event_id) in handoff.source_event_ids.iter().enumerate() {
+        let source_session_id: String = transaction.query_row(
+            "SELECT session_id FROM session_events WHERE event_id=?1",
+            [event_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO handoff_evidence(handoff_id, source_session_id, event_id, ordinal) VALUES (?1, ?2, ?3, ?4)",
+            params![handoff.id.to_string(), source_session_id, event_id, ordinal],
+        )?;
+    }
+    Ok(())
+}
+
+fn enqueue_checkpoint_job(
+    transaction: &Transaction<'_>,
+    episode_id: Uuid,
+    debounce_until: &str,
+    now: &str,
+) -> Result<()> {
+    let dedupe_key = episode_id.to_string();
+    transaction.execute(
+        "INSERT OR IGNORE INTO jobs(id, job_type, dedupe_key, status, payload_json, next_retry_at, created_at, updated_at) VALUES (?1, 'checkpoint_handoff', ?2, 'pending', ?3, ?4, ?5, ?5)",
+        params![
+            Uuid::now_v7().to_string(),
+            dedupe_key,
+            serde_json::json!({"episode_id": episode_id}).to_string(),
+            debounce_until,
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE jobs SET status='pending', attempt_count=0, next_retry_at=?1, last_error=NULL, provider=NULL, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?2 WHERE job_type='checkpoint_handoff' AND dedupe_key=?3 AND status IN ('completed', 'failed')",
+        params![debounce_until, now, dedupe_key],
+    )?;
+    transaction.execute(
+        "UPDATE jobs SET next_retry_at=CASE WHEN next_retry_at < ?1 THEN ?1 ELSE next_retry_at END, updated_at=?2 WHERE job_type='checkpoint_handoff' AND dedupe_key=?3 AND status='pending'",
+        params![debounce_until, now, dedupe_key],
+    )?;
+    Ok(())
+}
+
+fn checkpoint_state_connection(
+    connection: &Connection,
+    episode_id: Uuid,
+) -> Result<CheckpointState> {
+    connection
+        .query_row(
+            "SELECT episode_id, dirty, debounce_until, last_checkpoint_at, revision, updated_at FROM checkpoint_state WHERE episode_id=?1",
+            [episode_id.to_string()],
+            |row| {
+                let id: String = row.get(0)?;
+                let debounce_until: Option<String> = row.get(2)?;
+                let last_checkpoint_at: Option<String> = row.get(3)?;
+                let updated_at: String = row.get(5)?;
+                Ok(CheckpointState {
+                    episode_id: Uuid::parse_str(&id).map_err(sql_conversion_error)?,
+                    dirty: row.get(1)?,
+                    debounce_until: debounce_until
+                        .map(|value| parse_timestamp(&value).map_err(sql_conversion_error))
+                        .transpose()?,
+                    last_checkpoint_at: last_checkpoint_at
+                        .map(|value| parse_timestamp(&value).map_err(sql_conversion_error))
+                        .transpose()?,
+                    revision: row.get(4)?,
+                    updated_at: parse_timestamp(&updated_at).map_err(sql_conversion_error)?,
+                })
+            },
+        )
+        .map_err(Into::into)
+}
+
+fn is_current_handoff_status(status: HandoffStatus) -> bool {
+    matches!(
+        status,
+        HandoffStatus::Active | HandoffStatus::Ready | HandoffStatus::Consumed
+    )
+}
+
+fn handoff_status(status: HandoffStatus) -> &'static str {
+    match status {
+        HandoffStatus::Active => "active",
+        HandoffStatus::Ready => "ready",
+        HandoffStatus::Consumed => "consumed",
+        HandoffStatus::Completed => "completed",
+        HandoffStatus::Stale => "stale",
+        HandoffStatus::Superseded => "superseded",
+    }
+}
+
+fn parse_handoff_status(value: &str) -> std::io::Result<HandoffStatus> {
+    match value {
+        "active" => Ok(HandoffStatus::Active),
+        "ready" => Ok(HandoffStatus::Ready),
+        "consumed" => Ok(HandoffStatus::Consumed),
+        "completed" => Ok(HandoffStatus::Completed),
+        "stale" => Ok(HandoffStatus::Stale),
+        "superseded" => Ok(HandoffStatus::Superseded),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid handoff status: {value}"),
+        )),
+    }
+}
+
 fn create_session(
     transaction: &Transaction<'_>,
     event: &NormalizedEvent,
@@ -1474,6 +2486,14 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
         migrate_to_version_6(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (6)", [])?;
     }
+    if current < 7 {
+        migrate_to_version_7(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (7)", [])?;
+    }
+    if current < 8 {
+        migrate_to_version_8(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (8)", [])?;
+    }
     Ok(())
 }
 
@@ -1534,6 +2554,25 @@ fn migrate_attached_operational_tables(connection: &mut Connection) -> Result<()
                 } else {
                     transaction.execute(
                         "INSERT OR IGNORE INTO session_injections(client, conversation_key, generation, episode_id, memory_id, injected_at) SELECT 'legacy', session_key, 0, '', memory_id, injected_at FROM legacy.session_injections",
+                        [],
+                    )?;
+                }
+            } else if *table == "checkpoint_state" {
+                let has_revision: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy.pragma_table_info('checkpoint_state') WHERE name='revision')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if has_revision {
+                    transaction.execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO {table}({columns}) SELECT {columns} FROM legacy.{table}"
+                        ),
+                        [],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO checkpoint_state(episode_id, dirty, debounce_until, last_checkpoint_at, revision, updated_at) SELECT episode_id, dirty, debounce_until, last_checkpoint_at, 0, updated_at FROM legacy.checkpoint_state",
                         [],
                     )?;
                 }
@@ -1652,6 +2691,88 @@ fn migrate_to_version_6(connection: &Connection) -> Result<()> {
              PRIMARY KEY(client, conversation_key, generation, episode_id)
          );",
     )?;
+    Ok(())
+}
+
+fn migrate_to_version_7(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS handoffs (
+             id TEXT PRIMARY KEY,
+             project_id TEXT,
+             conversation_key TEXT NOT NULL,
+             episode_id TEXT NOT NULL,
+             source_session_id TEXT NOT NULL,
+             source_client TEXT NOT NULL,
+             status TEXT NOT NULL CHECK(status IN ('active', 'ready', 'consumed', 'completed', 'stale', 'superseded')),
+             goal TEXT NOT NULL,
+             current_state TEXT NOT NULL,
+             completed_work_json TEXT NOT NULL,
+             pending_work_json TEXT NOT NULL,
+             next_action TEXT,
+             blockers_json TEXT NOT NULL,
+             changed_files_json TEXT NOT NULL,
+             decisions_json TEXT NOT NULL,
+             validation_json TEXT NOT NULL,
+             relevant_memory_ids_json TEXT NOT NULL,
+             source_event_ids_json TEXT NOT NULL,
+             git_head TEXT,
+             worktree_state_hash TEXT,
+             revision INTEGER NOT NULL CHECK(revision > 0),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             FOREIGN KEY(episode_id) REFERENCES task_episodes(id),
+             FOREIGN KEY(source_session_id) REFERENCES sessions(id)
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS handoffs_current_episode ON handoffs(episode_id) WHERE status IN ('active', 'ready', 'consumed');
+         CREATE INDEX IF NOT EXISTS handoffs_project_status ON handoffs(project_id, status, updated_at DESC);
+         CREATE TABLE IF NOT EXISTS handoff_versions (
+             handoff_id TEXT NOT NULL,
+             revision INTEGER NOT NULL,
+             status TEXT NOT NULL,
+             snapshot_json TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             PRIMARY KEY(handoff_id, revision),
+             FOREIGN KEY(handoff_id) REFERENCES handoffs(id)
+         );
+         CREATE INDEX IF NOT EXISTS handoff_versions_handoff ON handoff_versions(handoff_id, revision);
+         CREATE TABLE IF NOT EXISTS handoff_evidence (
+             handoff_id TEXT NOT NULL,
+             source_session_id TEXT NOT NULL,
+             event_id TEXT NOT NULL,
+             ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+             PRIMARY KEY(handoff_id, event_id),
+             FOREIGN KEY(handoff_id) REFERENCES handoffs(id),
+             FOREIGN KEY(source_session_id) REFERENCES sessions(id),
+             FOREIGN KEY(event_id) REFERENCES session_events(event_id)
+         );
+         CREATE INDEX IF NOT EXISTS handoff_evidence_event ON handoff_evidence(event_id);
+         CREATE TABLE IF NOT EXISTS checkpoint_state (
+             episode_id TEXT PRIMARY KEY,
+             dirty INTEGER NOT NULL CHECK(dirty IN (0, 1)),
+             debounce_until TEXT,
+             last_checkpoint_at TEXT,
+             revision INTEGER NOT NULL DEFAULT 0,
+             updated_at TEXT NOT NULL,
+             FOREIGN KEY(episode_id) REFERENCES task_episodes(id)
+         );",
+    )?;
+    Ok(())
+}
+
+fn migrate_to_version_8(connection: &Connection) -> Result<()> {
+    let exists: Option<()> = connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('checkpoint_state') WHERE name='revision'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if exists.is_none() {
+        connection.execute(
+            "ALTER TABLE checkpoint_state ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 

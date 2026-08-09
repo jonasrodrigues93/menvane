@@ -67,6 +67,14 @@ const LEGACY_OPERATIONAL_TABLES: &[&str] = &[
     "briefing_deliveries",
     "procedure_applications",
     "orphan_sessions",
+    "conversations",
+    "task_episodes",
+    "prompt_intents",
+    "prompt_intent_history",
+    "handoffs",
+    "handoff_versions",
+    "handoff_evidence",
+    "checkpoint_state",
 ];
 
 #[derive(Debug, Clone, Copy)]
