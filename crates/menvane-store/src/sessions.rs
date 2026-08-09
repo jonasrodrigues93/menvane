@@ -525,6 +525,30 @@ impl SessionRepository {
             .is_some())
     }
 
+    pub fn requeue_import_compilation(
+        &self,
+        client: &str,
+        external_session_id: &str,
+    ) -> Result<()> {
+        let connection = self.open()?;
+        let session_id: Option<String> = connection
+            .query_row(
+                "SELECT id FROM sessions WHERE client=?1 AND external_session_id=?2 AND markdown_path IS NOT NULL ORDER BY generation DESC LIMIT 1",
+                params![client, external_session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(session_id) = session_id else {
+            return Ok(());
+        };
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "UPDATE jobs SET status='pending', attempt_count=0, next_retry_at=?1, last_error=NULL, provider=NULL, updated_at=?1 WHERE job_type='compile_session' AND dedupe_key=?2",
+            params![now, session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn record_import(
         &self,
         client: &str,

@@ -471,6 +471,8 @@ impl Menvane {
             .sessions
             .import_exists(&session.client, &session.external_session_id)?
         {
+            self.sessions
+                .requeue_import_compilation(&session.client, &session.external_session_id)?;
             return Ok(ImportOutcome::AlreadyImported);
         }
         let Some(cwd) = session.cwd.as_deref() else {
@@ -837,15 +839,53 @@ impl Menvane {
                 .map(Path::new)
                 .find(|path| path.exists())
                 .context("session project has no available checkout")?;
+            let events = self.sessions.events(session_id)?;
+            let important_prompts = events
+                .iter()
+                .filter(|event| event.kind == NormalizedEventKind::UserPrompt)
+                .filter_map(|event| event.bounded_input.clone())
+                .collect();
+            let important_tool_events = events
+                .iter()
+                .filter(|event| event.kind == NormalizedEventKind::ToolCompleted)
+                .map(|event| {
+                    format!(
+                        "{}\ninput: {}\noutput: {}\nsuccess: {}",
+                        event.tool_family.as_deref().unwrap_or("tool"),
+                        event.bounded_input.as_deref().unwrap_or("none"),
+                        event.bounded_output.as_deref().unwrap_or("none"),
+                        event
+                            .success
+                            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+                    )
+                })
+                .collect();
+            let errors = events
+                .iter()
+                .filter(|event| event.success == Some(false))
+                .filter_map(|event| event.bounded_output.clone())
+                .collect();
+            let validation_results = events
+                .iter()
+                .filter(|event| event.kind == NormalizedEventKind::ToolCompleted)
+                .filter(|event| event.success == Some(true))
+                .filter(|event| {
+                    event
+                        .tool_family
+                        .as_deref()
+                        .is_some_and(Self::is_validation_tool)
+                })
+                .filter_map(|event| event.tool_family.clone())
+                .collect();
             self.compile_and_store(
                 cwd,
                 CompilationInput {
                     session_summary: session.body,
-                    important_prompts: Vec::new(),
-                    important_tool_events: Vec::new(),
-                    errors: Vec::new(),
+                    important_prompts,
+                    important_tool_events,
+                    errors,
                     decisions: Vec::new(),
-                    validation_results: Vec::new(),
+                    validation_results,
                     existing_related_memories: Vec::new(),
                     technology_profile: serde_json::to_value(project.technologies)?,
                     source_session: Some(session_id),
@@ -864,6 +904,11 @@ impl Menvane {
             }
         }
         Ok(true)
+    }
+
+    fn is_validation_tool(tool: &str) -> bool {
+        let tool = tool.to_ascii_lowercase();
+        tool.contains("test") || tool.contains("build") || tool.contains("check")
     }
 
     pub fn configured_provider(&self) -> Result<std::sync::Arc<dyn LlmProvider>> {

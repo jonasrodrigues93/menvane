@@ -288,13 +288,45 @@ impl OpenCodeImporter {
 
 fn normalize_record(record: &Value) -> Option<ImportedEvent> {
     let role = find_string(record, &["role", "type"])?;
-    let content = find_value(record, &["content", "message", "text"]).map(|value| {
-        value
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| value.to_string())
-    });
-    if role.contains("user") {
+    let content = find_value(record, &["content", "message", "text"]).and_then(content_text);
+    let blocks = find_value(record, &["content"])
+        .or_else(|| {
+            record
+                .get("message")
+                .and_then(|message| message.get("content"))
+        })
+        .and_then(Value::as_array);
+    if blocks.is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+    }) {
+        let block = blocks?
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))?;
+        Some((
+            NormalizedEventKind::ToolCompleted,
+            block.get("tool_use_id").map(Value::to_string),
+            block.get("content").and_then(content_text),
+            Some("tool".to_owned()),
+            Some(block.get("is_error").and_then(Value::as_bool) != Some(true)),
+        ))
+    } else if blocks.is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+    }) {
+        let block = blocks?
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))?;
+        Some((
+            NormalizedEventKind::ToolCompleted,
+            block.get("input").map(Value::to_string),
+            None,
+            find_string(block, &["name"]).map(str::to_owned),
+            None,
+        ))
+    } else if role.contains("user") {
         Some((NormalizedEventKind::UserPrompt, content, None, None, None))
     } else if role.contains("tool") || record.get("tool_name").is_some() {
         Some((
@@ -310,6 +342,19 @@ fn normalize_record(record: &Value) -> Option<ImportedEvent> {
     } else {
         None
     }
+}
+
+fn content_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_owned());
+    }
+    let blocks = value.as_array()?;
+    let text = blocks
+        .iter()
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn find_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -447,5 +492,27 @@ mod tests {
             menvane.import_session(session).unwrap(),
             ImportOutcome::AlreadyImported
         );
+    }
+
+    #[test]
+    fn claude_message_blocks_become_prompts_and_tools() {
+        let prompt: Value = serde_json::json!({
+            "type": "user",
+            "sessionId": "session-1",
+            "cwd": "/tmp",
+            "message": {"role": "user", "content": [{"type": "text", "text": "remember this"}]}
+        });
+        let tool: Value = serde_json::json!({
+            "type": "assistant",
+            "sessionId": "session-1",
+            "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}}]}
+        });
+        let result = normalize_record(&prompt).unwrap();
+        assert_eq!(result.0, NormalizedEventKind::UserPrompt);
+        assert_eq!(result.1.as_deref(), Some("remember this"));
+        let result = normalize_record(&tool).unwrap();
+        assert_eq!(result.0, NormalizedEventKind::ToolCompleted);
+        assert_eq!(result.3.as_deref(), Some("Bash"));
+        assert_eq!(result.1.as_deref(), Some("{\"command\":\"cargo test\"}"));
     }
 }
