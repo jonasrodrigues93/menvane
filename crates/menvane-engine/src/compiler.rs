@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use menvane_domain::{
-    Applicability, JsonSchema, LlmError, LlmErrorKind, LlmProvider, LlmRequest, MemoryType, Scope,
+    Applicability, EpisodeEvidencePacket, JsonSchema, LlmError, LlmErrorKind, LlmProvider,
+    LlmRequest, MemoryType, Scope,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,15 +11,11 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct CompilationInput {
-    pub session_summary: String,
-    pub important_prompts: Vec<String>,
-    pub important_tool_events: Vec<String>,
-    pub errors: Vec<String>,
-    pub decisions: Vec<String>,
-    pub validation_results: Vec<String>,
+    pub evidence: EpisodeEvidencePacket,
     pub existing_related_memories: Vec<String>,
     pub technology_profile: Value,
     pub source_session: Option<Uuid>,
+    pub source_episode: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,12 +57,7 @@ impl MemoryCompiler {
         let request = LlmRequest {
             system: compiler_system_prompt().to_owned(),
             prompt: serde_json::to_string_pretty(&json!({
-                "session_summary": input.session_summary,
-                "important_prompts": input.important_prompts,
-                "important_tool_events": input.important_tool_events,
-                "errors": input.errors,
-                "decisions": input.decisions,
-                "validation_results": input.validation_results,
+                "episode_evidence": input.evidence,
                 "existing_related_memories": input.existing_related_memories,
                 "technology_profile": input.technology_profile
             }))
@@ -368,7 +360,7 @@ fn compiler_schema() -> Value {
 }
 
 fn compiler_system_prompt() -> &'static str {
-    "Consolidate only durable, reusable knowledge supported by the session evidence. Return zero memories when evidence is temporary or insufficient. Use only fact, decision, procedure, or gotcha. Prefer project scope whenever global validity is uncertain. Never include private reasoning or unsupported claims. Procedure content must include trigger, preconditions, steps, decision_points, validation, failure_handling, and expected_outcome. Leave all applicability dimensions (languages, frameworks, tools, databases, platforms) empty when the memory is not tied to specific technologies."
+    "Consolidate only durable, reusable knowledge supported by the episode evidence packet. Return zero memories when evidence is temporary or insufficient. Use only fact, decision, procedure, or gotcha. Preserve only event IDs supplied by evidence when reporting evidence. Prefer project scope whenever global validity is uncertain. Never include private reasoning or unsupported claims. Procedure content must include trigger, preconditions, steps, decision_points, validation, failure_handling, and expected_outcome. Leave all applicability dimensions (languages, frameworks, tools, databases, platforms) empty when the memory is not tied to specific technologies."
 }
 
 fn invalid_schema(message: impl ToString) -> LlmError {
@@ -391,21 +383,28 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use menvane_domain::{ProviderCapabilities, ProviderHealth, StructuredResponse};
+    use menvane_domain::{
+        EvidenceItem, EvidenceKind, ProviderCapabilities, ProviderHealth, StructuredResponse,
+    };
 
     use super::*;
 
     struct FakeProvider {
         responses: Mutex<VecDeque<Value>>,
+        requests: Mutex<Vec<Value>>,
     }
 
     #[async_trait]
     impl LlmProvider for FakeProvider {
         async fn generate_structured(
             &self,
-            _request: LlmRequest,
+            request: LlmRequest,
             _schema: JsonSchema,
         ) -> Result<StructuredResponse, LlmError> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(&request.prompt).unwrap());
             Ok(StructuredResponse {
                 value: self.responses.lock().unwrap().pop_front().unwrap(),
                 provider: "fake".to_owned(),
@@ -438,6 +437,7 @@ mod tests {
     async fn accepts_zero_memories_without_forcing_creation() {
         let compiler = MemoryCompiler::new(Arc::new(FakeProvider {
             responses: Mutex::new(VecDeque::from([json!({ "memories": [] })])),
+            requests: Mutex::new(Vec::new()),
         }));
         let result = compiler.compile(input()).await.unwrap();
         assert!(result.memories.is_empty());
@@ -467,6 +467,7 @@ mod tests {
         });
         let compiler = MemoryCompiler::new(Arc::new(FakeProvider {
             responses: Mutex::new(VecDeque::from([json!({ "unexpected": [] }), valid])),
+            requests: Mutex::new(Vec::new()),
         }));
         let result = compiler.compile(input()).await.unwrap();
         assert_eq!(result.memories.len(), 1);
@@ -491,6 +492,7 @@ mod tests {
         });
         let compiler = MemoryCompiler::new(Arc::new(FakeProvider {
             responses: Mutex::new(VecDeque::from([valid])),
+            requests: Mutex::new(Vec::new()),
         }));
         let result = compiler.compile(input()).await.unwrap();
         assert_eq!(result.memories.len(), 1);
@@ -502,6 +504,20 @@ mod tests {
     fn compiler_schema_is_structurally_strict() {
         let schema = compiler_schema();
         assert_schema_is_strict(&schema);
+    }
+
+    #[tokio::test]
+    async fn compiler_receives_only_packet_evidence() {
+        let provider = Arc::new(FakeProvider {
+            responses: Mutex::new(VecDeque::from([json!({ "memories": [] })])),
+            requests: Mutex::new(Vec::new()),
+        });
+        let compiler = MemoryCompiler::new(provider.clone());
+        compiler.compile(input()).await.unwrap();
+        let request = provider.requests.lock().unwrap().pop().unwrap();
+        assert!(request.get("episode_evidence").is_some());
+        assert!(request.get("important_prompts").is_none());
+        assert_eq!(request["episode_evidence"]["goal"]["event_id"], "goal");
     }
 
     fn assert_schema_is_strict(schema: &Value) {
@@ -544,15 +560,35 @@ mod tests {
 
     fn input() -> CompilationInput {
         CompilationInput {
-            session_summary: "A migration was validated.".to_owned(),
-            important_prompts: Vec::new(),
-            important_tool_events: Vec::new(),
-            errors: Vec::new(),
-            decisions: Vec::new(),
-            validation_results: vec!["tests passed".to_owned()],
+            evidence: EpisodeEvidencePacket {
+                episode_id: Uuid::from_u128(1),
+                goal: EvidenceItem {
+                    event_id: "goal".to_owned(),
+                    kind: EvidenceKind::Goal,
+                    timestamp: chrono::Utc::now(),
+                    content: "A migration was validated.".to_owned(),
+                    importance: 1.0,
+                },
+                prompts: Vec::new(),
+                actions: Vec::new(),
+                decisions: Vec::new(),
+                discoveries: Vec::new(),
+                errors: Vec::new(),
+                validations: vec![EvidenceItem {
+                    event_id: "validation".to_owned(),
+                    kind: EvidenceKind::Validation,
+                    timestamp: chrono::Utc::now(),
+                    content: "tests passed".to_owned(),
+                    importance: 1.0,
+                }],
+                files: Vec::new(),
+                compaction_context: Vec::new(),
+                unresolved_questions: Vec::new(),
+            },
             existing_related_memories: Vec::new(),
             technology_profile: json!({ "databases": ["sqlite"] }),
             source_session: None,
+            source_episode: None,
         }
     }
 }

@@ -11,6 +11,7 @@ use menvane_store::{JobRecord, SessionRecord};
 
 use crate::IntentEngine;
 use crate::Menvane;
+use crate::evidence::{EvidenceBuilder, MAX_SESSION_MARKDOWN_BYTES, render_session_markdown};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureOutcome {
@@ -99,21 +100,39 @@ impl<'a> SessionEngine<'a> {
 
     fn finalize_session(&self, session: &SessionRecord, job: &JobRecord) -> Result<()> {
         if let Some(path) = &session.markdown_path {
-            let memory = self
+            let episodes = self
                 .menvane
-                .index
-                .read_memory(&self.menvane.markdown, session.id)?
-                .0;
+                .sessions
+                .episode_events_for_session(session.id)?;
             self.menvane.sessions.mark_finalized(
                 session.id,
                 path,
-                is_session_worth_compiling(&memory),
+                &episodes,
                 job.id,
                 job.owner.as_deref().unwrap_or_default(),
             )?;
             return Ok(());
         }
         let events = self.menvane.sessions.events(session.id)?;
+        let episode_ids = self
+            .menvane
+            .sessions
+            .episode_events_for_session(session.id)?;
+        let packets = episode_ids
+            .iter()
+            .map(|episode_id| {
+                let episode = self.menvane.sessions.episode(*episode_id)?;
+                let events = self.menvane.sessions.episode_events(*episode_id)?;
+                let intents = self.menvane.sessions.episode_prompt_intents(*episode_id)?;
+                EvidenceBuilder::new(
+                    self.menvane
+                        .config
+                        .compilation
+                        .aggregate_evidence_budget_bytes,
+                )
+                .build(&episode, &events, &intents)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let project = session
             .project_id
             .as_deref()
@@ -152,10 +171,22 @@ impl<'a> SessionEngine<'a> {
         metadata.ended_at = session.ended_at;
         metadata.imported = Some(session.imported);
         metadata.generation = Some(session.generation);
+        let body = if packets.is_empty()
+            && events
+                .iter()
+                .any(|event| event.kind == NormalizedEventKind::ToolCompleted)
+        {
+            format!(
+                "{}\n\nObserved tool activity was captured without a linked task episode and remains operational evidence.",
+                render_session_markdown(&packets, MAX_SESSION_MARKDOWN_BYTES)
+            )
+        } else {
+            render_session_markdown(&packets, MAX_SESSION_MARKDOWN_BYTES)
+        };
         let memory = Memory {
             metadata,
             title,
-            body: session_body(&events),
+            body,
         };
         let path = self
             .menvane
@@ -165,7 +196,7 @@ impl<'a> SessionEngine<'a> {
         self.menvane.sessions.mark_finalized(
             session.id,
             &path,
-            is_session_worth_compiling(&memory),
+            &episode_ids,
             job.id,
             job.owner.as_deref().unwrap_or_default(),
         )?;
@@ -215,72 +246,6 @@ fn session_title(session: &SessionRecord, events: &[NormalizedEvent]) -> String 
                 session.client, session.external_session_id, session.generation
             )
         })
-}
-
-fn session_body(events: &[NormalizedEvent]) -> String {
-    let goal = events
-        .iter()
-        .find(|event| event.kind == NormalizedEventKind::UserPrompt)
-        .and_then(|event| event.bounded_input.as_deref())
-        .map(|value| excerpt(value, 1_000))
-        .unwrap_or_else(|| "No explicit goal was captured.".to_owned());
-    let actions = events
-        .iter()
-        .filter(|event| event.kind == NormalizedEventKind::ToolCompleted)
-        .map(|event| {
-            let family = event.tool_family.as_deref().unwrap_or("tool");
-            let result = match event.success {
-                Some(true) => "succeeded",
-                Some(false) => "failed",
-                None => "completed",
-            };
-            format!("- {family} {result}")
-        })
-        .collect::<Vec<_>>();
-    let errors = events
-        .iter()
-        .filter(|event| event.success == Some(false))
-        .filter_map(|event| event.bounded_output.as_deref())
-        .map(|output| format!("- {}", excerpt(output, 500)))
-        .collect::<Vec<_>>();
-    let validation = events
-        .iter()
-        .filter(|event| event.success == Some(true))
-        .filter_map(|event| event.tool_family.as_deref())
-        .filter(|family| {
-            let family = family.to_ascii_lowercase();
-            family.contains("test") || family.contains("build") || family.contains("check")
-        })
-        .map(|family| format!("- {family} succeeded"))
-        .collect::<Vec<_>>();
-    let files = events
-        .iter()
-        .filter_map(|event| event.attributed_path.as_deref())
-        .map(|path| format!("- {path}"))
-        .collect::<Vec<_>>();
-    format!(
-        "## Goal\n\n{goal}\n\n## Outcome\n\nSession evidence was captured and finalized.\n\n## Important actions\n\n{}\n\n## Decisions\n\nNo explicit decisions were extracted during deterministic capture.\n\n## Errors and discoveries\n\n{}\n\n## Validation\n\n{}\n\n## Files involved\n\n{}",
-        section(&actions),
-        section(&errors),
-        section(&validation),
-        section(&files)
-    )
-}
-
-fn section(values: &[String]) -> String {
-    if values.is_empty() {
-        "None captured.".to_owned()
-    } else {
-        values.join("\n")
-    }
-}
-
-fn excerpt(value: &str, max_chars: usize) -> String {
-    let mut excerpt = value.chars().take(max_chars).collect::<String>();
-    if value.chars().count() > max_chars {
-        excerpt.push_str(" [TRUNCATED]");
-    }
-    excerpt
 }
 
 pub fn is_session_worth_compiling(memory: &Memory) -> bool {

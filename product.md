@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.16.0
+Version: 1.17.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -67,7 +67,7 @@ Sessions are open, idle, or finalized. Session end queues deterministic finaliza
 
 Each conversation can contain multiple task episodes spanning session generations. The first user prompt creates a root episode. Deterministic provider-free classification records root goals, new goals, refinements, constraints, corrections, follow-ups, and operational prompts with a version and observable signal weights. Strong lexical or topic changes create a new episode and make prior active episodes dormant; corrections update the active goal, while refinements, constraints, short follow-ups, turn stops, and elapsed time do not create a new task. Episodes continue only within the same project identity, and project changes create an isolated root episode. Duplicate event delivery repairs missing episode or intent state idempotently against the event's owning session.
 
-Finalization writes concise episodic Markdown containing the goal, outcome, important actions, explicit deterministic evidence, errors, validation, and involved files. It does not copy complete transcripts or tool outputs. Finalization is asynchronous, idempotent, and recoverable through the daemon worker; it queues compilation without requiring an available language-model provider.
+Finalization writes bounded episodic Markdown with one section per touched task episode. Sections contain observed goal and outcome, important actions, decisions, discoveries, errors, validation, involved files, unresolved questions, and stable source-event references. Repetitive tools are summarized with counts and representative references; complete transcripts and tool outputs remain operational evidence only. Finalization is asynchronous, idempotent, and recoverable through the daemon worker; it queues one idempotent compilation job per touched episode without requiring an available language-model provider.
 
 Meaningful captured progress is associated with the active task episode through an idempotent operational link. Episode evidence continues across session generations only for the same conversation and project identity; unrelated episodes and projects remain isolated. Tool progress marks checkpoint state dirty with debounce, while compaction, validation state changes, turn stops, session ends, idle finalization, and lifecycle boundaries request immediate checkpoint work. Capture does not wait for checkpoint generation.
 
@@ -117,7 +117,7 @@ An explicit fallback provider may be configured under `[llm.fallback]`. Fallback
 
 ## Memory Compilation
 
-The memory compiler receives bounded session evidence, important prompts and tools, errors, decisions, validation results, existing related memories, and the project technology profile. It requests schema-constrained JSON and never allows a provider to write Markdown directly. Invalid structured output receives one bounded retry and then fails.
+The memory compiler receives a bounded structured evidence packet for one task episode, existing related memories, and the project technology profile. Packets contain only linked episode events, preserve resolvable event identifiers, prioritize goals, corrections, constraints, failures, final successful changes, and validation, and treat compaction summaries as context rather than validation. Repetitive tool noise is collapsed and unrelated episodes are excluded. The aggregate packet budget is configurable under `[compilation].aggregate_evidence_budget_bytes` and defaults to 32,768 bytes. The compiler requests schema-constrained JSON and never allows a provider to write Markdown directly. Invalid structured output receives one bounded retry and then fails.
 
 Compiler output may contain zero memories. Valid output uses only facts, decisions, procedures, and gotchas. Applicability is optional; empty dimensions indicate the memory is not tied to specific technologies. Procedure content contains trigger, preconditions, ordered steps, decision points, validation, failure handling, and expected outcome. Global classification requires high scope confidence; uncertainty resolves to project scope.
 

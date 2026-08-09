@@ -690,6 +690,15 @@ impl SessionRepository {
         .map_err(Into::into)
     }
 
+    pub fn episode_prompt_intents(&self, episode_id: Uuid) -> Result<Vec<PromptIntent>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT i.event_id, i.episode_id, i.kind, i.confidence, i.weight, i.classifier_version, i.source, i.classified_at FROM prompt_intents i WHERE i.episode_id=?1 ORDER BY i.classified_at, i.event_id",
+        )?;
+        let rows = statement.query_map([episode_id.to_string()], prompt_intent_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
     pub fn episode_events_for_session(&self, session_id: Uuid) -> Result<Vec<Uuid>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
@@ -730,7 +739,7 @@ impl SessionRepository {
         &self,
         session_id: Uuid,
         markdown_path: &Path,
-        enqueue_compile: bool,
+        compile_episodes: &[Uuid],
         job_id: Uuid,
         owner: &str,
     ) -> Result<()> {
@@ -745,8 +754,12 @@ impl SessionRepository {
             "UPDATE jobs SET status='completed', owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE id=?2 AND status='running' AND owner=?3",
             params![now, job_id.to_string(), owner],
         )?;
-        if enqueue_compile {
-            enqueue_job(&transaction, "compile_session", &session_id.to_string())?;
+        for episode_id in compile_episodes {
+            enqueue_job(
+                &transaction,
+                "compile_session",
+                &format!("{session_id}:{episode_id}"),
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -907,6 +920,18 @@ impl SessionRepository {
     pub fn episode(&self, id: Uuid) -> Result<TaskEpisode> {
         let connection = self.open()?;
         episode_by_id(&connection, id)
+    }
+
+    pub fn episode_optional(&self, id: Uuid) -> Result<Option<TaskEpisode>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT id, project_id, conversation_key, root_event_id, goal, ordinal, state, created_at, updated_at FROM task_episodes WHERE id=?1",
+                [id.to_string()],
+                episode_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn episode_for_root_event(&self, root_event_id: &str) -> Result<Option<TaskEpisode>> {
@@ -1977,8 +2002,8 @@ impl SessionRepository {
         };
         let now = Utc::now().to_rfc3339();
         connection.execute(
-            "UPDATE jobs SET status='pending', attempt_count=0, next_retry_at=?1, last_error=NULL, provider=NULL, updated_at=?1 WHERE job_type='compile_session' AND dedupe_key=?2",
-            params![now, session_id],
+            "UPDATE jobs SET status='pending', attempt_count=0, next_retry_at=?1, last_error=NULL, provider=NULL, updated_at=?1 WHERE job_type='compile_session' AND (dedupe_key=?2 OR EXISTS (SELECT 1 FROM event_episode_links l JOIN session_events e ON e.event_id=l.event_id JOIN sessions s ON s.id=e.session_id WHERE s.client=?3 AND s.external_session_id=?4 AND (jobs.dedupe_key=l.episode_id OR jobs.dedupe_key LIKE '%:' || l.episode_id)))",
+            params![now, session_id, client, external_session_id],
         )?;
         Ok(())
     }

@@ -1,5 +1,6 @@
 mod compiler;
 mod decay;
+mod evidence;
 mod global_promoter;
 mod handoff;
 mod intent_engine;
@@ -37,6 +38,10 @@ use uuid::Uuid;
 
 pub use compiler::{CompilationInput, CompilationResult, CompiledMemory, MemoryCompiler};
 pub use decay::DecayEngine;
+pub use evidence::{
+    DEFAULT_EVIDENCE_BUDGET_BYTES, EvidenceBuilder, MAX_SESSION_MARKDOWN_BYTES,
+    render_episode_markdown, render_session_markdown,
+};
 pub use global_promoter::GlobalPromoter;
 pub use handoff::HandoffGenerator;
 pub use intent_engine::{
@@ -127,6 +132,8 @@ struct MenvaneConfig {
     sessions: SessionConfiguration,
     #[serde(default)]
     handoff: HandoffConfiguration,
+    #[serde(default)]
+    compilation: CompilationConfiguration,
     #[serde(default)]
     jobs: JobConfiguration,
     #[serde(default)]
@@ -226,6 +233,24 @@ impl Default for HandoffConfiguration {
 
 fn default_handoff_debounce_seconds() -> u64 {
     2
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CompilationConfiguration {
+    #[serde(default = "default_evidence_budget_bytes")]
+    aggregate_evidence_budget_bytes: usize,
+}
+
+impl Default for CompilationConfiguration {
+    fn default() -> Self {
+        Self {
+            aggregate_evidence_budget_bytes: default_evidence_budget_bytes(),
+        }
+    }
+}
+
+fn default_evidence_budget_bytes() -> usize {
+    evidence::DEFAULT_EVIDENCE_BUDGET_BYTES
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1468,84 +1493,51 @@ impl Menvane {
             if job.job_type != "compile_session" {
                 bail!("unsupported job type: {}", job.job_type);
             }
-            let session_id = Uuid::parse_str(&job.dedupe_key)?;
-            let session = self.index.read_memory(&self.markdown, session_id)?.0;
-            if !is_session_worth_compiling(&session) {
+            let episode_id = job
+                .dedupe_key
+                .rsplit_once(':')
+                .map_or(job.dedupe_key.as_str(), |(_, episode_id)| episode_id);
+            let episode_id = Uuid::parse_str(episode_id)?;
+            let Some(episode) = self.sessions.episode_optional(episode_id)? else {
                 return Ok(Some("skipped".to_owned()));
-            }
-            let events = self.sessions.events(session_id)?;
-            let (cwd, technology_profile) =
-                if let Some(project_id) = session.metadata.project_id.as_deref() {
-                    let project = self
-                        .all_projects()?
-                        .into_iter()
-                        .find(|project| project.id == project_id)
-                        .context("session project is missing")?;
-                    let cwd = project
-                        .known_paths
-                        .iter()
-                        .map(PathBuf::from)
-                        .find(|path| path.exists())
-                        .context("session project has no available checkout")?;
-                    (cwd, serde_json::to_value(project.technologies)?)
-                } else {
-                    let cwd = events
-                        .iter()
-                        .map(|event| PathBuf::from(&event.cwd))
-                        .find(|path| path.exists())
-                        .context("global session has no available working directory")?;
-                    (cwd, serde_json::json!({}))
-                };
-            let important_prompts = events
-                .iter()
-                .filter(|event| event.kind == NormalizedEventKind::UserPrompt)
-                .filter_map(|event| event.bounded_input.clone())
-                .collect();
-            let important_tool_events = events
-                .iter()
-                .filter(|event| event.kind == NormalizedEventKind::ToolCompleted)
-                .map(|event| {
-                    format!(
-                        "{}\ninput: {}\noutput: {}\nsuccess: {}",
-                        event.tool_family.as_deref().unwrap_or("tool"),
-                        event.bounded_input.as_deref().unwrap_or("none"),
-                        event.bounded_output.as_deref().unwrap_or("none"),
-                        event
-                            .success
-                            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
-                    )
-                })
-                .collect();
-            let errors = events
-                .iter()
-                .filter(|event| event.success == Some(false))
-                .filter_map(|event| event.bounded_output.clone())
-                .collect();
-            let validation_results = events
-                .iter()
-                .filter(|event| event.kind == NormalizedEventKind::ToolCompleted)
-                .filter(|event| event.success == Some(true))
-                .filter(|event| {
-                    event
-                        .tool_family
-                        .as_deref()
-                        .is_some_and(Self::is_validation_tool)
-                })
-                .filter_map(|event| event.tool_family.clone())
-                .collect();
+            };
+            let events = self.sessions.episode_events(episode_id)?;
+            let intents = self.sessions.episode_prompt_intents(episode_id)?;
+            let evidence =
+                EvidenceBuilder::new(self.config.compilation.aggregate_evidence_budget_bytes)
+                    .build(&episode, &events, &intents)?;
+            let (cwd, technology_profile) = if let Some(project_id) = episode.project_id.as_deref()
+            {
+                let project = self
+                    .all_projects()?
+                    .into_iter()
+                    .find(|project| project.id == project_id)
+                    .context("session project is missing")?;
+                let cwd = project
+                    .known_paths
+                    .iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.exists())
+                    .context("session project has no available checkout")?;
+                (cwd, serde_json::to_value(project.technologies)?)
+            } else {
+                let cwd = events
+                    .iter()
+                    .map(|event| PathBuf::from(&event.event.cwd))
+                    .find(|path| path.exists())
+                    .context("global session has no available working directory")?;
+                (cwd, serde_json::json!({}))
+            };
+            let source_session = events.last().map(|event| event.session_id);
             let (_, provider) = self
                 .compile_and_store(
                     &cwd,
                     CompilationInput {
-                        session_summary: session.body,
-                        important_prompts,
-                        important_tool_events,
-                        errors,
-                        decisions: Vec::new(),
-                        validation_results,
+                        evidence,
                         existing_related_memories: Vec::new(),
                         technology_profile,
-                        source_session: Some(session_id),
+                        source_session,
+                        source_episode: Some(episode_id),
                     },
                 )
                 .await?;
@@ -1636,11 +1628,6 @@ impl Menvane {
         self.sessions.prepare_checkpoint_flush()?;
         while self.process_next_checkpoint_job().await? {}
         Ok(())
-    }
-
-    fn is_validation_tool(tool: &str) -> bool {
-        let tool = tool.to_ascii_lowercase();
-        tool.contains("test") || tool.contains("build") || tool.contains("check")
     }
 
     pub fn configured_provider(&self) -> Result<std::sync::Arc<dyn LlmProvider>> {

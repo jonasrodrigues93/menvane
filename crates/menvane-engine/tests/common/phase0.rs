@@ -3,8 +3,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use menvane_domain::{
-    JsonSchema, LlmError, LlmProvider, LlmRequest, NormalizedSession, ProviderCapabilities,
-    ProviderHealth, StructuredResponse,
+    EpisodeEvidencePacket, EvidenceItem, EvidenceKind, JsonSchema, LlmError, LlmProvider,
+    LlmRequest, NormalizedEventKind, NormalizedSession, ProviderCapabilities, ProviderHealth,
+    StructuredResponse,
 };
 use menvane_engine::CompilationInput;
 use serde::Deserialize;
@@ -143,27 +144,54 @@ pub fn load_corpus() -> Corpus {
 }
 
 pub fn compilation_input(fixture: &Fixture) -> CompilationInput {
+    let events = &fixture.session.events;
+    let goal_event = events
+        .iter()
+        .find(|event| event.kind == NormalizedEventKind::UserPrompt)
+        .or_else(|| events.first())
+        .unwrap();
+    let goal = EvidenceItem {
+        event_id: goal_event.event_id.clone(),
+        kind: EvidenceKind::Goal,
+        timestamp: goal_event.timestamp,
+        content: goal_event
+            .bounded_input
+            .clone()
+            .unwrap_or_else(|| fixture.id.clone()),
+        importance: 1.0,
+    };
     let prompts = fixture
         .session
         .events
         .iter()
-        .filter(|event| event.kind == menvane_domain::NormalizedEventKind::UserPrompt)
-        .filter_map(|event| event.bounded_input.clone())
+        .filter(|event| event.kind == NormalizedEventKind::UserPrompt)
+        .map(|event| EvidenceItem {
+            event_id: event.event_id.clone(),
+            kind: EvidenceKind::Prompt,
+            timestamp: event.timestamp,
+            content: event.bounded_input.clone().unwrap_or_default(),
+            importance: 0.5,
+        })
         .collect();
-    let tool_events = fixture
+    let actions = fixture
         .session
         .events
         .iter()
-        .filter(|event| event.kind == menvane_domain::NormalizedEventKind::ToolCompleted)
-        .map(|event| {
-            json!({
-                "tool": event.tool_family,
-                "input": event.bounded_input,
-                "output": event.bounded_output,
-                "success": event.success,
-                "path": event.attributed_path,
-            })
-            .to_string()
+        .filter(|event| event.kind == NormalizedEventKind::ToolCompleted)
+        .map(|event| EvidenceItem {
+            event_id: event.event_id.clone(),
+            kind: EvidenceKind::Action,
+            timestamp: event.timestamp,
+            content: format!(
+                "{} {}",
+                event.tool_family.as_deref().unwrap_or("tool"),
+                event.success.map_or("completed", |success| if success {
+                    "succeeded"
+                } else {
+                    "failed"
+                })
+            ),
+            importance: 0.5,
         })
         .collect();
     let errors = fixture
@@ -171,24 +199,46 @@ pub fn compilation_input(fixture: &Fixture) -> CompilationInput {
         .events
         .iter()
         .filter(|event| event.success == Some(false))
-        .filter_map(|event| event.bounded_output.clone())
+        .map(|event| EvidenceItem {
+            event_id: event.event_id.clone(),
+            kind: EvidenceKind::Error,
+            timestamp: event.timestamp,
+            content: event.bounded_output.clone().unwrap_or_default(),
+            importance: 0.8,
+        })
         .collect();
     let validation_results = fixture
         .session
         .events
         .iter()
         .filter(|event| event.success == Some(true))
-        .filter_map(|event| event.tool_family.clone())
+        .filter_map(|event| {
+            event.tool_family.clone().map(|family| EvidenceItem {
+                event_id: event.event_id.clone(),
+                kind: EvidenceKind::Validation,
+                timestamp: event.timestamp,
+                content: family,
+                importance: 0.8,
+            })
+        })
         .collect();
     CompilationInput {
-        session_summary: format!("fixture:{}", fixture.id),
-        important_prompts: prompts,
-        important_tool_events: tool_events,
-        errors,
-        decisions: Vec::new(),
-        validation_results,
+        evidence: EpisodeEvidencePacket {
+            episode_id: uuid::Uuid::from_u128(1),
+            goal,
+            prompts,
+            actions,
+            decisions: Vec::new(),
+            discoveries: Vec::new(),
+            errors,
+            validations: validation_results,
+            files: Vec::new(),
+            compaction_context: Vec::new(),
+            unresolved_questions: Vec::new(),
+        },
         existing_related_memories: Vec::new(),
         technology_profile: json!({ "fixture_id": fixture.id }),
         source_session: None,
+        source_episode: Some(uuid::Uuid::from_u128(1)),
     }
 }

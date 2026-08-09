@@ -151,7 +151,7 @@ fn concurrent_events_and_idle_finalization_are_safe() {
             .iter()
             .filter(|job| job.job_type == "compile_session")
             .count(),
-        1
+        0
     );
 }
 
