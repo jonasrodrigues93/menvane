@@ -134,6 +134,74 @@ fn handoff_lifecycle_is_idempotent_and_preserves_versions() {
 }
 
 #[test]
+fn full_delivery_claim_and_consumption_are_atomic_and_idempotent() {
+    let (temporary, repository, session, episode) = setup();
+    let original = handoff(&session, &episode, "atomic", "active", "state");
+    repository.create_or_update_handoff(&original).unwrap();
+    let identity = menvane_store::InjectionIdentity {
+        client: "target".to_owned(),
+        conversation_key: "target-conversation".to_owned(),
+        generation: 4,
+        episode_id: None,
+    };
+    assert!(repository.deliver_handoff(&identity, original.id).unwrap());
+    assert_eq!(
+        repository.handoff(original.id).unwrap().status,
+        HandoffStatus::Consumed
+    );
+    assert_eq!(repository.handoff_versions(original.id).unwrap().len(), 1);
+    assert!(!repository.deliver_handoff(&identity, original.id).unwrap());
+    assert_eq!(repository.handoff_versions(original.id).unwrap().len(), 1);
+    let connection = rusqlite::Connection::open(temporary.path().join("state.sqlite")).unwrap();
+    let deliveries: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM handoff_deliveries WHERE delivery_kind='full'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deliveries, 1);
+}
+
+#[test]
+fn card_delivery_claim_does_not_consume_or_duplicate() {
+    let (temporary, repository, session, episode) = setup();
+    let original = handoff(&session, &episode, "card", "ready", "state");
+    repository.create_or_update_handoff(&original).unwrap();
+    let identity = menvane_store::InjectionIdentity {
+        client: "target".to_owned(),
+        conversation_key: "target-conversation".to_owned(),
+        generation: 4,
+        episode_id: None,
+    };
+    assert!(
+        repository
+            .claim_handoff_delivery(&identity, original.id, "card")
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .claim_handoff_delivery(&identity, original.id, "card")
+            .unwrap()
+    );
+    assert_eq!(
+        repository.handoff(original.id).unwrap().status,
+        HandoffStatus::Ready
+    );
+    repository.stale_handoff(original.id).unwrap();
+    assert!(!repository.deliver_handoff(&identity, original.id).unwrap());
+    let connection = rusqlite::Connection::open(temporary.path().join("state.sqlite")).unwrap();
+    let full_deliveries: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM handoff_deliveries WHERE delivery_kind='full'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(full_deliveries, 0);
+}
+
+#[test]
 fn checkpoint_triggers_are_deduplicated_and_completed_jobs_requeue() {
     let (_temporary, repository, _session, episode) = setup();
     let now = timestamp(10);

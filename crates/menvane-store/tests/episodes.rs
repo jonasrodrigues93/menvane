@@ -55,7 +55,7 @@ fn migration_backfills_the_deterministic_conversation_identity() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        9
+        10
     );
 }
 

@@ -129,13 +129,13 @@ impl<'a> HandoffGenerator<'a> {
     }
 }
 
-struct RepositoryState {
-    changed_files: Vec<String>,
-    git_head: Option<String>,
-    worktree_state_hash: Option<String>,
+pub(crate) struct RepositoryState {
+    pub(crate) changed_files: Vec<String>,
+    pub(crate) git_head: Option<String>,
+    pub(crate) worktree_state_hash: Option<String>,
 }
 
-fn repository_state(cwd: &Path, events: &[EpisodeEvent]) -> RepositoryState {
+pub(crate) fn repository_state(cwd: &Path, events: &[EpisodeEvent]) -> RepositoryState {
     let cwd_text = cwd.to_string_lossy().into_owned();
     let status = Command::new("git")
         .args([

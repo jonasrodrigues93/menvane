@@ -46,6 +46,47 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
     let episode = legacy
         .create_episode(prompt.session.id, "prompt", "legacy linked episode")
         .unwrap();
+    let handoff_id = Uuid::now_v7();
+    legacy
+        .create_or_update_handoff(&TaskHandoff {
+            id: handoff_id,
+            project_id: None,
+            conversation_key: prompt.session.conversation_key.clone(),
+            episode_id: episode.id,
+            source_session_id: prompt.session.id,
+            source_client: prompt.session.client.clone(),
+            status: HandoffStatus::Ready,
+            goal: "legacy delivery".to_owned(),
+            current_state: "legacy state".to_owned(),
+            completed_work: Vec::new(),
+            pending_work: vec!["continue".to_owned()],
+            next_action: Some("continue".to_owned()),
+            blockers: Vec::new(),
+            changed_files: Vec::new(),
+            decisions: Vec::new(),
+            validation: Vec::new(),
+            relevant_memory_ids: Vec::new(),
+            source_event_ids: vec!["prompt".to_owned()],
+            git_head: None,
+            worktree_state_hash: Some("legacy-hash".to_owned()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .unwrap();
+    assert!(
+        legacy
+            .claim_handoff_delivery(
+                &InjectionIdentity {
+                    client: "legacy".to_owned(),
+                    conversation_key: "legacy-key".to_owned(),
+                    generation: 0,
+                    episode_id: None,
+                },
+                handoff_id,
+                "card",
+            )
+            .unwrap()
+    );
     assert_eq!(
         legacy
             .associate_event_with_active_episode("prompt")
@@ -96,7 +137,9 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
             "{table}"
         );
     }
-    assert_eq!(row_count(&state_path, "operational_migration_markers"), 20);
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 21);
+    assert_eq!(row_count(&state_path, "handoff_deliveries"), 1);
+    assert_eq!(max_schema_version(&state_path), 10);
     assert!(has_table(&home.join("index.sqlite"), "sessions"));
     assert_eq!(
         SessionRepository::new(&state_path)
@@ -108,7 +151,7 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
     drop(menvane);
 
     let reopened = Menvane::new(&home).unwrap();
-    assert_eq!(row_count(&state_path, "operational_migration_markers"), 20);
+    assert_eq!(row_count(&state_path, "operational_migration_markers"), 21);
     assert_eq!(
         SessionRepository::new(&state_path)
             .events(first.session.id)
@@ -370,7 +413,7 @@ fn backup_restore_round_trips_index_and_state_databases() {
     assert_eq!(menvane.read(retained).unwrap().title, "Backup retained");
 }
 
-fn operational_tables() -> [&'static str; 20] {
+fn operational_tables() -> [&'static str; 21] {
     [
         "sessions",
         "session_events",
@@ -389,10 +432,20 @@ fn operational_tables() -> [&'static str; 20] {
         "prompt_intents",
         "prompt_intent_history",
         "handoffs",
+        "handoff_deliveries",
         "handoff_versions",
         "handoff_evidence",
         "checkpoint_state",
     ]
+}
+
+fn max_schema_version(path: &Path) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
 }
 
 fn row_count(path: &Path, table: &str) -> i64 {

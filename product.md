@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.14.0
+Version: 1.15.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -72,6 +72,10 @@ Finalization writes concise episodic Markdown containing the goal, outcome, impo
 Meaningful captured progress is associated with the active task episode through an idempotent operational link. Episode evidence continues across session generations only for the same conversation and project identity; unrelated episodes and projects remain isolated. Tool progress marks checkpoint state dirty with debounce, while compaction, validation state changes, turn stops, session ends, idle finalization, and lifecycle boundaries request immediate checkpoint work. Capture does not wait for checkpoint generation.
 
 An automatic handoff is one current, versioned operational artifact per episode. It contains bounded deterministic project, conversation, session, client, goal, state, work, blockers, changed-file, decision, validation, source-event, repository fingerprint, and optional relevant-memory references. Repository facts override prior handoff text. Full diffs, tool dumps, environment values, credentials, and private reasoning are never stored. Git fingerprints are optional when Git is unavailable. Handoff generation works without a language-model provider and preserves the artifact identifier and creation time on update.
+
+Automatic handoff delivery computes the current repository fingerprint with the same deterministic Git HEAD and worktree-status algorithm used during generation. A fingerprint mismatch marks the candidate stale without deleting it; current repository state and current user instructions remain authoritative. When Git is unavailable, selection falls back to project, conversation, intent, files, and recency and labels the fingerprint confidence as weaker. Session start directly injects one newest unambiguous current handoff, while multiple plausible candidates produce compact cards. The first prompt ranks current candidates using same-conversation continuity, sanitized lexical intent, active episode goal, touched files, recency, and fingerprint; it injects at most one bounded full handoff and uses bounded cards for additional or stale historical candidates. Completed, superseded, and stale handoffs are never full current-state injections.
+
+Handoff required context precedes memory excerpts and cards and includes bounded goal, operational state warning, completed and pending work, next action, blockers, files, decisions, validation, fingerprint confidence, and evidence references. Full and card deliveries are claimed by target client, conversation, generation, handoff, and delivery kind only after inclusion. Full delivery consumes the handoff only after inclusion; consumed handoffs remain current until completed or superseded and new evidence can reactivate them. Delivery is provider-free and deduplicated across session start and first-prompt delivery within one generation.
 
 The generated configuration contains `[handoff].nonvalidation_tool_debounce_seconds = 2`. This setting debounces non-validation tool progress; validation tools and lifecycle events enqueue immediate checkpoint work.
 

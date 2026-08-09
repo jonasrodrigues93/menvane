@@ -1,4 +1,5 @@
 use std::fs;
+use std::process::Command;
 
 use chrono::{Duration, Utc};
 use menvane_domain::{NormalizedEvent, NormalizedEventKind};
@@ -104,6 +105,16 @@ fn event_links_are_idempotent_cross_generation_and_isolated() {
         NormalizedEventKind::UserPrompt,
         Some("Now review the dashboard colors."),
     );
+    let topic_change_context = menvane
+        .prompt_context_for_client(
+            &project,
+            "test-client",
+            "external-session",
+            "Now review the dashboard colors.",
+        )
+        .unwrap()
+        .0;
+    assert!(!topic_change_context.contains("[TASK HANDOFF]"));
     assert!(menvane.process_next_checkpoint_job_blocking());
     let handoffs = menvane.handoffs(&project).unwrap();
     assert_eq!(handoffs.len(), 2);
@@ -317,6 +328,415 @@ fn nonvalidation_tool_debounce_uses_handoff_configuration() {
     assert!(menvane.process_next_job_blocking());
 }
 
+#[test]
+fn session_start_injects_one_unambiguous_handoff_and_first_prompt_dedupes_it() {
+    let (temporary, project, menvane) = setup();
+    ingest_as(
+        &menvane,
+        &project,
+        "source-client",
+        "source-session",
+        "source-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest_as(
+        &menvane,
+        &project,
+        "source-client",
+        "source-session",
+        "source-prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Implement the export parser."),
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    ingest_as(
+        &menvane,
+        &project,
+        "source-client",
+        "source-session",
+        "source-end",
+        NormalizedEventKind::SessionEnded,
+        None,
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+
+    ingest_as(
+        &menvane,
+        &project,
+        "resume-client",
+        "resume-session",
+        "resume-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    let briefing = menvane
+        .session_briefing_for_client(&project, "resume-client", "resume-session")
+        .unwrap();
+    assert!(briefing.contains("[TASK HANDOFF]"));
+    assert!(briefing.contains("Implement the export parser."));
+    assert!(briefing.contains("Fingerprint confidence: medium"));
+    let handoff_id = menvane.handoffs(&project).unwrap()[0].id;
+    assert_eq!(
+        menvane.handoffs(&project).unwrap()[0].status,
+        menvane_domain::HandoffStatus::Consumed
+    );
+    let connection = Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
+    let full_deliveries: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM handoff_deliveries WHERE delivery_kind='full'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(full_deliveries, 1);
+
+    ingest_as(
+        &menvane,
+        &project,
+        "resume-client",
+        "resume-session",
+        "resume-prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Continue the export parser."),
+    );
+    let prompt = menvane
+        .prompt_context_for_client(
+            &project,
+            "resume-client",
+            "resume-session",
+            "Continue the export parser.",
+        )
+        .unwrap()
+        .0;
+    assert!(!prompt.contains(&handoff_id.to_string()));
+}
+
+#[test]
+fn repeated_briefing_does_not_consume_a_handoff_created_after_delivery() {
+    let (_temporary, project, menvane) = setup();
+    ingest(
+        &menvane,
+        &project,
+        "start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    let first = menvane
+        .session_briefing_for_client(&project, "test-client", "external-session")
+        .unwrap();
+    assert!(!first.is_empty());
+    ingest(
+        &menvane,
+        &project,
+        "prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Implement delayed handoff delivery."),
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    let handoff = menvane.handoffs(&project).unwrap().remove(0);
+
+    let repeated = menvane
+        .session_briefing_for_client(&project, "test-client", "external-session")
+        .unwrap();
+
+    assert!(repeated.is_empty());
+    assert_eq!(
+        menvane.handoffs(&project).unwrap().remove(0).status,
+        handoff.status
+    );
+}
+
+#[test]
+fn ambiguous_session_start_returns_cards_without_guessing_current_state() {
+    let (temporary, project, menvane) = setup();
+    for (index, goal) in ["Implement export parsing.", "Implement dashboard colors."]
+        .into_iter()
+        .enumerate()
+    {
+        let session = format!("source-{index}");
+        ingest_as(
+            &menvane,
+            &project,
+            "source-client",
+            &session,
+            &format!("start-{index}"),
+            NormalizedEventKind::SessionStarted,
+            None,
+        );
+        ingest_as(
+            &menvane,
+            &project,
+            "source-client",
+            &session,
+            &format!("prompt-{index}"),
+            NormalizedEventKind::UserPrompt,
+            Some(goal),
+        );
+        assert!(menvane.process_next_checkpoint_job_blocking());
+        ingest_as(
+            &menvane,
+            &project,
+            "source-client",
+            &session,
+            &format!("end-{index}"),
+            NormalizedEventKind::SessionEnded,
+            None,
+        );
+        assert!(menvane.process_next_checkpoint_job_blocking());
+    }
+    ingest_as(
+        &menvane,
+        &project,
+        "resume-client",
+        "resume-session",
+        "resume-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    let context = menvane
+        .session_briefing_for_client(&project, "resume-client", "resume-session")
+        .unwrap();
+    assert!(!context.contains("[TASK HANDOFF]"));
+    assert!(context.contains("[HISTORICAL HANDOFF CARD]"));
+    assert_eq!(context.matches("[HISTORICAL HANDOFF CARD]").count(), 2);
+    let connection = Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
+    let card_deliveries: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM handoff_deliveries WHERE delivery_kind='card'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(card_deliveries, 2);
+    assert!(
+        menvane
+            .handoffs(&project)
+            .unwrap()
+            .iter()
+            .all(|handoff| handoff.status == menvane_domain::HandoffStatus::Ready)
+    );
+}
+
+#[test]
+fn first_prompt_can_resume_from_another_client_when_intent_matches() {
+    let (_temporary, project, menvane) = setup();
+    ingest_as(
+        &menvane,
+        &project,
+        "client-a",
+        "old-session",
+        "old-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest_as(
+        &menvane,
+        &project,
+        "client-a",
+        "old-session",
+        "old-prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Implement the export parser."),
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    ingest_as(
+        &menvane,
+        &project,
+        "client-a",
+        "old-session",
+        "old-end",
+        NormalizedEventKind::SessionEnded,
+        None,
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    ingest_as(
+        &menvane,
+        &project,
+        "client-b",
+        "new-session",
+        "new-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest_as(
+        &menvane,
+        &project,
+        "client-b",
+        "new-session",
+        "new-prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Continue implementing the export parser."),
+    );
+    let context = menvane
+        .prompt_context_for_client(
+            &project,
+            "client-b",
+            "new-session",
+            "Continue implementing the export parser.",
+        )
+        .unwrap()
+        .0;
+    assert!(context.contains("[TASK HANDOFF]"));
+    assert!(context.contains("Implement the export parser."));
+}
+
+#[test]
+fn fingerprint_mismatch_marks_stale_and_only_prompt_cards_are_historical() {
+    let (_temporary, project, menvane) = setup();
+    fs::write(project.join("tracked.rs"), "fn old() {}\n").unwrap();
+    git(&project, ["add", "."]);
+    git(&project, ["commit", "-m", "initial"]);
+    ingest(
+        &menvane,
+        &project,
+        "start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest(
+        &menvane,
+        &project,
+        "prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Implement tracked parser."),
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    ingest(
+        &menvane,
+        &project,
+        "end",
+        NormalizedEventKind::SessionEnded,
+        None,
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    fs::write(project.join("tracked.rs"), "fn new() {}\n").unwrap();
+    ingest_as(
+        &menvane,
+        &project,
+        "resume-client",
+        "resume-session",
+        "resume-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    let _ = menvane
+        .session_briefing_for_client(&project, "resume-client", "resume-session")
+        .unwrap();
+    assert_eq!(
+        menvane.handoffs(&project).unwrap()[0].status,
+        menvane_domain::HandoffStatus::Stale
+    );
+    ingest_as(
+        &menvane,
+        &project,
+        "resume-client",
+        "resume-session",
+        "resume-prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Continue implementing tracked parser."),
+    );
+    let context = menvane
+        .prompt_context_for_client(
+            &project,
+            "resume-client",
+            "resume-session",
+            "Continue implementing tracked parser.",
+        )
+        .unwrap()
+        .0;
+    assert!(!context.contains("[TASK HANDOFF]"));
+    assert!(context.contains("[HISTORICAL HANDOFF CARD]"));
+    assert!(context.contains("never current repository truth"));
+}
+
+#[test]
+fn unborn_repository_hash_mismatch_marks_stale_without_a_head() {
+    let (_temporary, project, menvane) = setup();
+    fs::write(project.join("unborn.rs"), "fn old() {}\n").unwrap();
+    git(&project, ["add", "unborn.rs"]);
+    ingest(
+        &menvane,
+        &project,
+        "start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest(
+        &menvane,
+        &project,
+        "prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Implement the unborn parser."),
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    let generated = menvane.handoffs(&project).unwrap().remove(0);
+    assert_eq!(generated.git_head, None);
+    assert!(generated.worktree_state_hash.is_some());
+    ingest(
+        &menvane,
+        &project,
+        "end",
+        NormalizedEventKind::SessionEnded,
+        None,
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    fs::write(project.join("unborn.rs"), "fn new() {}\n").unwrap();
+    ingest_as(
+        &menvane,
+        &project,
+        "resume-client",
+        "resume-session",
+        "resume-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    let _ = menvane
+        .session_briefing_for_client(&project, "resume-client", "resume-session")
+        .unwrap();
+    assert_eq!(
+        menvane.handoffs(&project).unwrap()[0].status,
+        menvane_domain::HandoffStatus::Stale
+    );
+}
+
+#[test]
+fn completed_handoff_is_excluded_and_delivery_is_bounded_and_sanitized() {
+    let (_temporary, project, menvane) = setup();
+    ingest(
+        &menvane,
+        &project,
+        "start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest(
+        &menvane,
+        &project,
+        "prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Implement bounded delivery password=do-not-leak."),
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    let id = menvane.handoffs(&project).unwrap()[0].id;
+    menvane.complete_handoff(id).unwrap();
+    ingest_as(
+        &menvane,
+        &project,
+        "resume-client",
+        "resume-session",
+        "resume-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    let context = menvane
+        .session_briefing_for_client(&project, "resume-client", "resume-session")
+        .unwrap();
+    assert!(!context.contains(&id.to_string()));
+    assert!(context.chars().count() <= 2_500);
+    assert!(!context.contains("do-not-leak"));
+}
+
 fn setup() -> (TempDir, std::path::PathBuf, Menvane) {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
@@ -333,9 +753,36 @@ fn ingest(
     kind: NormalizedEventKind,
     input: Option<&str>,
 ) {
+    ingest_as(
+        menvane,
+        project,
+        "test-client",
+        "external-session",
+        id,
+        kind,
+        input,
+    );
+}
+
+fn ingest_as(
+    menvane: &Menvane,
+    project: &std::path::Path,
+    client: &str,
+    external_session_id: &str,
+    id: &str,
+    kind: NormalizedEventKind,
+    input: Option<&str>,
+) {
     assert_eq!(
         menvane
-            .ingest_event(event(project, id, kind, input))
+            .ingest_event(event_as(
+                project,
+                client,
+                external_session_id,
+                id,
+                kind,
+                input,
+            ))
             .unwrap(),
         CaptureOutcome::Stored
     );
@@ -370,11 +817,22 @@ fn event(
     kind: NormalizedEventKind,
     input: Option<&str>,
 ) -> NormalizedEvent {
+    event_as(project, "test-client", "external-session", id, kind, input)
+}
+
+fn event_as(
+    project: &std::path::Path,
+    client: &str,
+    external_session_id: &str,
+    id: &str,
+    kind: NormalizedEventKind,
+    input: Option<&str>,
+) -> NormalizedEvent {
     NormalizedEvent {
         event_id: id.to_owned(),
         kind,
-        client: "test-client".to_owned(),
-        external_session_id: "external-session".to_owned(),
+        client: client.to_owned(),
+        external_session_id: external_session_id.to_owned(),
         timestamp: Utc::now() + Duration::milliseconds(id.len() as i64),
         cwd: project.to_string_lossy().into_owned(),
         project_id: None,
@@ -387,6 +845,18 @@ fn event(
         success: None,
         model: None,
     }
+}
+
+fn git<const N: usize>(project: &std::path::Path, args: [&str; N]) {
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(project)
+            .args(args)
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 fn handoff_count(temporary: &TempDir) -> u64 {

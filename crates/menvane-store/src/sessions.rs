@@ -118,6 +118,16 @@ CREATE TABLE IF NOT EXISTS briefing_deliveries (
     delivered_at TEXT NOT NULL,
     PRIMARY KEY(client, conversation_key, generation, episode_id)
 );
+CREATE TABLE IF NOT EXISTS handoff_deliveries (
+    client TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    handoff_id TEXT NOT NULL,
+    delivery_kind TEXT NOT NULL CHECK(delivery_kind IN ('full', 'card')),
+    delivered_at TEXT NOT NULL,
+    PRIMARY KEY(client, conversation_key, generation, handoff_id, delivery_kind),
+    FOREIGN KEY(handoff_id) REFERENCES handoffs(id)
+);
 CREATE TABLE IF NOT EXISTS procedure_applications (
     memory_id TEXT NOT NULL,
     source_session TEXT NOT NULL,
@@ -319,6 +329,10 @@ const OPERATIONAL_TABLES: &[(&str, &str)] = &[
     (
         "handoffs",
         "id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, revision, created_at, updated_at",
+    ),
+    (
+        "handoff_deliveries",
+        "client, conversation_key, generation, handoff_id, delivery_kind, delivered_at",
     ),
     (
         "handoff_versions",
@@ -1697,6 +1711,81 @@ impl SessionRepository {
         )? == 1)
     }
 
+    pub fn briefing_was_delivered(&self, identity: &InjectionIdentity) -> Result<bool> {
+        let connection = self.open()?;
+        Ok(connection
+            .query_row(
+                "SELECT 1 FROM briefing_deliveries WHERE client=?1 AND conversation_key=?2 AND generation=?3 AND episode_id=?4",
+                params![
+                    identity.client,
+                    identity.conversation_key,
+                    identity.generation,
+                    identity.episode_id.map_or_else(String::new, |value| value.to_string())
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn deliver_handoff(&self, identity: &InjectionIdentity, handoff_id: Uuid) -> Result<bool> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = handoff_by_id(&transaction, handoff_id)?;
+        if !is_current_handoff_status(current.status) {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO handoff_deliveries(client, conversation_key, generation, handoff_id, delivery_kind, delivered_at) VALUES (?1, ?2, ?3, ?4, 'full', ?5)",
+            params![
+                identity.client,
+                identity.conversation_key,
+                identity.generation,
+                handoff_id.to_string(),
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        if inserted == 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        if current.status != HandoffStatus::Consumed {
+            store_handoff_revision(&transaction, &current)?;
+            update_handoff_status(
+                &transaction,
+                handoff_id,
+                HandoffStatus::Consumed,
+                current_revision(&transaction, handoff_id)? + 1,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn claim_handoff_delivery(
+        &self,
+        identity: &InjectionIdentity,
+        handoff_id: Uuid,
+        delivery_kind: &str,
+    ) -> Result<bool> {
+        if !matches!(delivery_kind, "full" | "card") {
+            bail!("unsupported handoff delivery kind: {delivery_kind}");
+        }
+        let connection = self.open()?;
+        Ok(connection.execute(
+            "INSERT OR IGNORE INTO handoff_deliveries(client, conversation_key, generation, handoff_id, delivery_kind, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                identity.client,
+                identity.conversation_key,
+                identity.generation,
+                handoff_id.to_string(),
+                delivery_kind,
+                Utc::now().to_rfc3339()
+            ],
+        )? == 1)
+    }
+
     pub fn set_integration_connected(&self, client: &str, connected: bool) -> Result<()> {
         let connection = self.open()?;
         connection.execute(
@@ -2694,6 +2783,10 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
         migrate_to_version_9(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (9)", [])?;
     }
+    if current < 10 {
+        migrate_to_version_10(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (10)", [])?;
+    }
     Ok(())
 }
 
@@ -2986,6 +3079,22 @@ fn migrate_to_version_9(connection: &Connection) -> Result<()> {
              FOREIGN KEY(episode_id) REFERENCES task_episodes(id) ON DELETE CASCADE
          );
          CREATE INDEX IF NOT EXISTS event_episode_links_episode ON event_episode_links(episode_id, event_id);",
+    )?;
+    Ok(())
+}
+
+fn migrate_to_version_10(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS handoff_deliveries (
+             client TEXT NOT NULL,
+             conversation_key TEXT NOT NULL,
+             generation INTEGER NOT NULL,
+             handoff_id TEXT NOT NULL,
+             delivery_kind TEXT NOT NULL CHECK(delivery_kind IN ('full', 'card')),
+             delivered_at TEXT NOT NULL,
+             PRIMARY KEY(client, conversation_key, generation, handoff_id, delivery_kind),
+             FOREIGN KEY(handoff_id) REFERENCES handoffs(id)
+         );",
     )?;
     Ok(())
 }
