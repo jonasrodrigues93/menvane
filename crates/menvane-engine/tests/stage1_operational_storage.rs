@@ -1,7 +1,8 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::Path;
 
 use chrono::{TimeZone, Utc};
+use fs2::FileExt;
 use menvane_domain::{
     Applicability, MemoryType, NormalizedEvent, NormalizedEventKind, ReinforcementSignal, Scope,
 };
@@ -132,6 +133,29 @@ fn reindex_replaces_only_the_derived_index() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[test]
+fn reindex_refuses_to_replace_an_index_used_by_the_daemon() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path().join("home");
+    let menvane = Menvane::new(&home).unwrap();
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.join("daemon.lock"))
+        .unwrap();
+    lock.try_lock_exclusive().unwrap();
+
+    let error = menvane.reindex().unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot reindex while the Menvane daemon is running")
     );
 }
 

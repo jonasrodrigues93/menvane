@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.8.0
+Version: 1.9.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -12,7 +12,7 @@ The home contains `config.toml`, `index.sqlite`, `state.sqlite`, operational dir
 
 Markdown writes use a temporary file, filesystem synchronization, and atomic rename before the derived index is updated. If Git is available, the memory directory is initialized as a local repository and durable memory changes are committed automatically. Menvane remains functional when Git is unavailable.
 
-Deleting `index.sqlite` does not delete durable knowledge or operational evidence. `menvane reindex` validates all Markdown into a temporary SQLite database and atomically installs the rebuilt derived index without changing `state.sqlite`. Existing homes migrate operational tables from the legacy `index.sqlite` to `state.sqlite` with durable, resumable table markers; legacy tables remain until the derived index is safely rebuilt.
+Deleting `index.sqlite` does not delete durable knowledge or operational evidence. `menvane reindex` validates all Markdown into a temporary SQLite database and atomically installs the rebuilt derived index without changing `state.sqlite`. Reindex acquires the daemon process lock and refuses to replace an index in active use. Existing homes migrate operational tables from the legacy `index.sqlite` to `state.sqlite` with durable, resumable table markers; legacy tables remain until the derived index is safely rebuilt.
 
 ## Memory Model
 

@@ -10,12 +10,13 @@ mod session_engine;
 mod technology_detector;
 
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use fs2::FileExt;
 use menvane_domain::{
     Applicability, JsonSchema, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryType,
     NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProviderHealth,
@@ -331,6 +332,7 @@ impl Menvane {
     }
 
     pub fn reindex(&self) -> Result<(usize, usize)> {
+        let _lock = acquire_daemon_lock(&self.home)?;
         self.index.reindex(&self.markdown)
     }
 
@@ -1435,6 +1437,18 @@ fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn acquire_daemon_lock(home: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.join("daemon.lock"))?;
+    file.try_lock_exclusive()
+        .with_context(|| "cannot reindex while the Menvane daemon is running")?;
+    Ok(file)
 }
 
 #[cfg(test)]
