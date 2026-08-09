@@ -13,6 +13,24 @@ pub struct SessionScan {
     pub estimated_bytes: u64,
 }
 
+impl SessionScan {
+    pub fn retain_since(&mut self, since: DateTime<Utc>) {
+        self.sessions.retain(|session| {
+            session
+                .events
+                .iter()
+                .map(|event| event.timestamp)
+                .max()
+                .is_some_and(|timestamp| timestamp >= since)
+        });
+        self.estimated_bytes = self
+            .sessions
+            .iter()
+            .map(|session| session.estimated_bytes)
+            .sum();
+    }
+}
+
 pub struct JsonlImporter {
     client: String,
     roots: Vec<PathBuf>,
@@ -230,6 +248,7 @@ impl OpenCodeImporter {
                 .map_err(|error| error.to_string())?;
             let mut events = Vec::new();
             let cwd = find_string(&summary, &["directory", "cwd"]).map(str::to_owned);
+            let session_timestamp = find_timestamp(&summary).unwrap_or_else(Utc::now);
             for (index, message) in messages.into_iter().enumerate() {
                 if let Some((kind, input, output, tool, success)) = normalize_record(&message) {
                     events.push(NormalizedEvent {
@@ -239,7 +258,7 @@ impl OpenCodeImporter {
                         kind,
                         client: "opencode".to_owned(),
                         external_session_id: id.to_owned(),
-                        timestamp: Utc::now(),
+                        timestamp: find_timestamp(&message).unwrap_or(session_timestamp),
                         cwd: cwd.clone().unwrap_or_default(),
                         project_id: None,
                         tool_family: tool,
@@ -257,7 +276,7 @@ impl OpenCodeImporter {
                     "opencode",
                     id,
                     cwd.as_deref().unwrap_or_default(),
-                    Utc::now(),
+                    session_timestamp,
                     NormalizedEventKind::SessionStarted,
                     "import-start",
                 ),
@@ -266,7 +285,7 @@ impl OpenCodeImporter {
                 "opencode",
                 id,
                 cwd.as_deref().unwrap_or_default(),
-                Utc::now(),
+                session_timestamp,
                 NormalizedEventKind::SessionEnded,
                 "import-end",
             ));
@@ -359,6 +378,20 @@ fn content_text(value: &Value) -> Option<String> {
 
 fn find_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     find_value(value, keys)?.as_str()
+}
+
+fn find_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    let raw = find_value(value, &["timestamp", "created_at", "updated_at"]).or_else(|| {
+        value
+            .get("time")
+            .and_then(|time| find_value(time, &["created", "updated"]))
+    })?;
+    if let Some(number) = raw.as_i64() {
+        return DateTime::from_timestamp_millis(number);
+    }
+    raw.as_str()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn find_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -514,5 +547,52 @@ mod tests {
         assert_eq!(result.0, NormalizedEventKind::ToolCompleted);
         assert_eq!(result.3.as_deref(), Some("Bash"));
         assert_eq!(result.1.as_deref(), Some("{\"command\":\"cargo test\"}"));
+    }
+
+    #[test]
+    fn session_scan_filters_by_latest_activity() {
+        let old = Utc::now() - chrono::Duration::days(8);
+        let recent = Utc::now() - chrono::Duration::days(2);
+        let event = |timestamp: DateTime<Utc>| NormalizedEvent {
+            event_id: timestamp.to_rfc3339(),
+            kind: NormalizedEventKind::UserPrompt,
+            client: "claude-code".to_owned(),
+            external_session_id: timestamp.to_rfc3339(),
+            timestamp,
+            cwd: "/tmp".to_owned(),
+            project_id: None,
+            tool_family: None,
+            bounded_input: None,
+            bounded_output: None,
+            attributed_path: None,
+            success: None,
+            model: None,
+        };
+        let mut scan = SessionScan {
+            sessions: vec![
+                NormalizedSession {
+                    client: "claude-code".to_owned(),
+                    external_session_id: "old".to_owned(),
+                    cwd: Some("/tmp".to_owned()),
+                    events: vec![event(old)],
+                    estimated_bytes: 10,
+                },
+                NormalizedSession {
+                    client: "claude-code".to_owned(),
+                    external_session_id: "recent".to_owned(),
+                    cwd: Some("/tmp".to_owned()),
+                    events: vec![event(recent)],
+                    estimated_bytes: 20,
+                },
+            ],
+            invalid_records: 0,
+            estimated_bytes: 30,
+        };
+
+        scan.retain_since(Utc::now() - chrono::Duration::days(7));
+
+        assert_eq!(scan.sessions.len(), 1);
+        assert_eq!(scan.sessions[0].external_session_id, "recent");
+        assert_eq!(scan.estimated_bytes, 20);
     }
 }

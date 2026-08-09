@@ -2,6 +2,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
+use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use menvane_domain::{Applicability, MemoryType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
@@ -63,10 +64,39 @@ struct RestoreArgs {
 struct ImportArgs {
     #[arg(value_enum)]
     client: Client,
+    #[arg(value_name = "DAYS", value_parser = parse_days)]
+    days: Option<i64>,
     #[arg(long)]
     dry_run: bool,
     #[arg(long, default_value = "http://127.0.0.1:4096")]
     url: String,
+}
+
+fn parse_days(value: &str) -> Result<i64, String> {
+    let days = value
+        .strip_suffix('d')
+        .ok_or_else(|| "the time window must use days, for example 7d".to_owned())?
+        .parse::<i64>()
+        .map_err(|_| {
+            "the time window must be a positive number of days, for example 7d".to_owned()
+        })?;
+    if days <= 0 {
+        return Err("the time window must be a positive number of days, for example 7d".to_owned());
+    }
+    Ok(days)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_days;
+
+    #[test]
+    fn parses_only_positive_day_windows() {
+        assert_eq!(parse_days("7d"), Ok(7));
+        assert!(parse_days("7").is_err());
+        assert!(parse_days("7h").is_err());
+        assert!(parse_days("0d").is_err());
+    }
 }
 
 #[derive(Args)]
@@ -467,6 +497,12 @@ async fn main() -> Result<()> {
                     .await
                     .map_err(anyhow::Error::msg)?,
             };
+            let mut scan = scan;
+            if let Some(days) = arguments.days {
+                let window = Duration::try_days(days)
+                    .ok_or_else(|| anyhow::anyhow!("the time window is too large"))?;
+                scan.retain_since(Utc::now() - window);
+            }
             if arguments.dry_run {
                 println!("sessions discovered\t{}", scan.sessions.len());
                 println!("invalid\t{}", scan.invalid_records);

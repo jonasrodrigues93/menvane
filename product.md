@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.5.0
+Version: 1.6.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -139,7 +139,7 @@ Menvane records retrieved, injected, explicitly read, successfully applied, and 
 
 ## Historical Import
 
-`menvane import claude` and `menvane import codex` recursively discover supported JSONL session files under configured client homes. Readers stream line by line, enforce a one-megabyte record bound, skip and count malformed records, ignore unknown event types, and retain only useful user and tool evidence. Codex checks both active and archived session directories. `menvane import opencode` uses the configured local OpenCode HTTP API rather than scraping private storage.
+`menvane import claude` and `menvane import codex` recursively discover supported JSONL session files under configured client homes. Readers stream line by line, enforce a one-megabyte record bound, skip and count malformed records, ignore unknown event types, and retain only useful user and tool evidence. Codex checks both active and archived session directories. `menvane import opencode` uses the configured local OpenCode HTTP API rather than scraping private storage. An optional positional window such as `7d` imports only sessions with activity in the last seven days; only day-based windows are supported.
 
 All importers produce client-independent normalized sessions and pass them through the session engine; they never create consolidated knowledge directly. External formats are treated as versioned best-effort input. Reimport uses client plus external session identifier and is idempotent.
 
