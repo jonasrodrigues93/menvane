@@ -38,12 +38,7 @@ impl ProjectResolver {
         }
         let root = PathBuf::from(root).canonicalize()?;
         let identity = canonical_git_identity(&root)?;
-        let name = identity
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("project")
-            .to_owned();
+        let name = project_name(&identity, &root);
         Ok(Some(resolution(identity, name, root)))
     }
 }
@@ -89,6 +84,23 @@ fn split_host_path(remote: &str) -> Result<(&str, &str)> {
     remote
         .split_once('/')
         .context("Git remote must contain a host and repository path")
+}
+
+fn project_name(identity: &str, root: &Path) -> String {
+    if identity.starts_with("git-common-dir:") {
+        return root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("project")
+            .to_owned();
+    }
+    identity
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("project")
+        .to_owned()
 }
 
 fn find_override(cwd: &Path) -> Result<Option<(PathBuf, String)>> {
@@ -180,5 +192,22 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn uses_checkout_name_when_git_has_no_remote() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("tiguy-agent");
+        fs::create_dir(&checkout).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["-C", checkout.to_str().unwrap(), "init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let resolution = ProjectResolver::resolve(&checkout).unwrap().unwrap();
+        assert_eq!(resolution.name, "tiguy-agent");
+        assert!(resolution.identity.starts_with("git-common-dir:"));
     }
 }

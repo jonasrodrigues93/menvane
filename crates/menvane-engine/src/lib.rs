@@ -2066,6 +2066,11 @@ impl Menvane {
         };
         let known_path = resolution.root.to_string_lossy().into_owned();
         let mut changed = false;
+        if project.identity != resolution.identity || project.name != resolution.name {
+            project.identity = resolution.identity;
+            project.name = resolution.name;
+            changed = true;
+        }
         if !project.known_paths.contains(&known_path) {
             project.known_paths.push(known_path);
             project.known_paths.sort();
