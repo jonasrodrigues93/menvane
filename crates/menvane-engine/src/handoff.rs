@@ -14,7 +14,7 @@ use menvane_store::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{Menvane, RetrievalMode, RetrievalScope, Retriever};
+use crate::{CaptureSanitizer, Menvane, RetrievalMode, RetrievalScope, Retriever};
 
 pub struct HandoffGenerator<'a> {
     menvane: &'a Menvane,
@@ -28,11 +28,12 @@ impl<'a> HandoffGenerator<'a> {
     pub fn generate(&self, episode_id: Uuid) -> Result<TaskHandoff> {
         let episode = self.menvane.sessions.episode(episode_id)?;
         let events = self.menvane.sessions.episode_events(episode_id)?;
+        let sanitizer = CaptureSanitizer::new(self.menvane.config.capture.clone())?;
         let latest = events
             .last()
             .ok_or_else(|| anyhow::anyhow!("episode has no linked evidence"))?;
         let cwd = Path::new(&latest.event.cwd);
-        let repository = repository_state(cwd, &events);
+        let repository = repository_state(cwd, &events, &sanitizer);
         let project_name = self
             .menvane
             .all_projects()
@@ -135,7 +136,11 @@ pub(crate) struct RepositoryState {
     pub(crate) worktree_state_hash: Option<String>,
 }
 
-pub(crate) fn repository_state(cwd: &Path, events: &[EpisodeEvent]) -> RepositoryState {
+pub(crate) fn repository_state(
+    cwd: &Path,
+    events: &[EpisodeEvent],
+    sanitizer: &CaptureSanitizer,
+) -> RepositoryState {
     let cwd_text = cwd.to_string_lossy().into_owned();
     let status = Command::new("git")
         .args([
@@ -149,12 +154,12 @@ pub(crate) fn repository_state(cwd: &Path, events: &[EpisodeEvent]) -> Repositor
         .output();
     let Some(status) = status.ok().filter(|value| value.status.success()) else {
         return RepositoryState {
-            changed_files: attributed_files(events),
+            changed_files: attributed_files(events, sanitizer),
             git_head: None,
             worktree_state_hash: None,
         };
     };
-    let changed_files = changed_files_from_git_status(&status.stdout);
+    let changed_files = changed_files_from_git_status(&status.stdout, sanitizer);
     let git_head = Command::new("git")
         .args(["-C", &cwd_text, "rev-parse", "HEAD"])
         .output()
@@ -172,12 +177,13 @@ pub(crate) fn repository_state(cwd: &Path, events: &[EpisodeEvent]) -> Repositor
     }
 }
 
-fn attributed_files(events: &[EpisodeEvent]) -> Vec<String> {
+fn attributed_files(events: &[EpisodeEvent], sanitizer: &CaptureSanitizer) -> Vec<String> {
     events
         .iter()
         .filter_map(|value| value.event.attributed_path.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|value| !sanitizer.path_is_ignored(value))
         .map(str::to_owned)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -186,7 +192,7 @@ fn attributed_files(events: &[EpisodeEvent]) -> Vec<String> {
         .collect()
 }
 
-fn changed_files_from_git_status(status: &[u8]) -> Vec<String> {
+fn changed_files_from_git_status(status: &[u8], sanitizer: &CaptureSanitizer) -> Vec<String> {
     let records = status
         .split(|value| *value == 0)
         .filter(|record| !record.is_empty())
@@ -199,11 +205,17 @@ fn changed_files_from_git_status(status: &[u8]) -> Vec<String> {
             index += 1;
             continue;
         }
-        paths.insert(String::from_utf8_lossy(&record[3..]).into_owned());
+        let path = String::from_utf8_lossy(&record[3..]).into_owned();
+        if !sanitizer.path_is_ignored(&path) {
+            paths.insert(path);
+        }
         let renamed = matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C');
         if renamed {
             if let Some(previous) = records.get(index + 1) {
-                paths.insert(String::from_utf8_lossy(previous).into_owned());
+                let path = String::from_utf8_lossy(previous).into_owned();
+                if !sanitizer.path_is_ignored(&path) {
+                    paths.insert(path);
+                }
             }
             index += 2;
         } else {
@@ -409,19 +421,32 @@ fn is_validation_tool(tool: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::CaptureSanitizer;
+
     use super::{changed_files_from_git_status, truncate_utf8};
 
     #[test]
     fn parses_nul_delimited_changes_and_renames() {
         let status = b" M src/current.rs\0R  src/new.rs\0src/old.rs\0?? odd name.rs\0";
+        let sanitizer = CaptureSanitizer::new(Default::default()).unwrap();
         assert_eq!(
-            changed_files_from_git_status(status),
+            changed_files_from_git_status(status, &sanitizer),
             vec![
                 "odd name.rs".to_owned(),
                 "src/current.rs".to_owned(),
                 "src/new.rs".to_owned(),
                 "src/old.rs".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn excludes_instruction_files_from_changed_files() {
+        let status = b" M AGENTS.md\0 M src/lib.rs\0?? skills/custom/SKILL.md\0";
+        let sanitizer = CaptureSanitizer::new(Default::default()).unwrap();
+        assert_eq!(
+            changed_files_from_git_status(status, &sanitizer),
+            vec!["src/lib.rs".to_owned()]
         );
     }
 

@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.18.0
+Version: 1.20.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index.
 
@@ -61,7 +61,7 @@ MCP search returns identifiers, type, scope, title, score, status, confidence, a
 
 Clients send a normalized vocabulary of session-started, user-prompt, tool-completed, context-compacted, turn-stopped, and session-ended events. Events carry stable event identifiers and are ingested idempotently. Concurrent delivery uses SQLite WAL and a busy timeout.
 
-Capture removes authentication headers, likely API keys and tokens, bounds prompts and tool inputs and outputs, and drops reliably attributed ignored paths before persistence. Default limits are 16,384 bytes for prompts and 4,096 bytes for tool input and output. Default ignored paths include environment files, secret directories, and SSH directories. Menvane never captures private model reasoning.
+Capture removes authentication headers, likely API keys and tokens, bounds prompts and tool inputs and outputs, and drops reliably attributed ignored paths before persistence. Default limits are 16,384 bytes for prompts and 4,096 bytes for tool input and output. Default ignored paths include environment files, secret directories, SSH directories, `AGENTS.md`, `SKILL.md`, and files under `skills` directories, because agent instructions and skill instructions are configuration rather than durable knowledge. Menvane never captures private model reasoning.
 
 Sessions are open, idle, or finalized. Session end queues deterministic finalization without waiting for background work. Turn stop marks idle, and idle sessions queue finalization after 120 seconds by default. Events arriving after finalization reuse the external session identifier in a new generation and process only new evidence.
 
@@ -71,7 +71,7 @@ Finalization writes bounded episodic Markdown with one section per touched task 
 
 Meaningful captured progress is associated with the active task episode through an idempotent operational link. Episode evidence continues across session generations only for the same conversation and project identity; unrelated episodes and projects remain isolated. Tool progress marks checkpoint state dirty with debounce, while compaction, validation state changes, turn stops, session ends, idle finalization, and lifecycle boundaries request immediate checkpoint work. Capture does not wait for checkpoint generation.
 
-An automatic handoff is one current, versioned operational artifact per episode. It contains bounded deterministic project, conversation, session, client, goal, state, work, blockers, changed-file, decision, validation, source-event, repository fingerprint, and optional relevant-memory references. Repository facts override prior handoff text. Full diffs, tool dumps, environment values, credentials, and private reasoning are never stored. Git fingerprints are optional when Git is unavailable. Handoff generation works without a language-model provider and preserves the artifact identifier and creation time on update.
+An automatic handoff is one current, versioned operational artifact per episode. It contains bounded deterministic project, conversation, session, client, goal, state, work, blockers, changed-file, decision, validation, source-event, repository fingerprint, and optional relevant-memory references. Handoff processing uses the same capture path filter as memory processing, so `AGENTS.md`, `SKILL.md`, and files under `skills` directories are excluded from attributed and repository-changed files. Repository facts override prior handoff text. Full diffs, tool dumps, environment values, credentials, and private reasoning are never stored. Git fingerprints are optional when Git is unavailable. Handoff generation works without a language-model provider and preserves the artifact identifier and creation time on update.
 
 Automatic handoff delivery computes the current repository fingerprint with the same deterministic Git HEAD and worktree-status algorithm used during generation. A fingerprint mismatch marks the candidate stale without deleting it; current repository state and current user instructions remain authoritative. When Git is unavailable, selection falls back to project, conversation, intent, files, and recency and labels the fingerprint confidence as weaker. Session start directly injects one newest unambiguous current handoff, while multiple plausible candidates produce compact cards. The first prompt ranks current candidates using same-conversation continuity, sanitized lexical intent, active episode goal, touched files, recency, and fingerprint; it injects at most one bounded full handoff and uses bounded cards for additional or stale historical candidates. Completed, superseded, and stale handoffs are never full current-state injections.
 

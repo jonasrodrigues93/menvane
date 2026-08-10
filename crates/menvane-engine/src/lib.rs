@@ -739,7 +739,8 @@ impl Menvane {
                 })
                 .collect()
         };
-        let repository = handoff::repository_state(target.cwd, &events);
+        let sanitizer = CaptureSanitizer::new(self.config.capture.clone())?;
+        let repository = handoff::repository_state(target.cwd, &events, &sanitizer);
         let candidates = self.sessions.list_handoffs(target.project_id, None, 100)?;
         let mut stale_cards = Vec::new();
         let mut current_candidates = Vec::new();

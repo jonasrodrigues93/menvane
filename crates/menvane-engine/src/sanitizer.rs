@@ -44,6 +44,9 @@ impl CaptureSanitizer {
         for pattern in &config.ignore_paths {
             builder.add(Glob::new(pattern)?);
         }
+        for pattern in instruction_ignore_paths() {
+            builder.add(Glob::new(pattern)?);
+        }
         Ok(Self {
             config,
             ignored_paths: builder.build()?,
@@ -91,7 +94,7 @@ impl CaptureSanitizer {
         )
     }
 
-    fn path_is_ignored(&self, path: &str) -> bool {
+    pub fn path_is_ignored(&self, path: &str) -> bool {
         let normalized = path.replace('\\', "/");
         self.ignored_paths.is_match(&normalized)
             || std::path::Path::new(&normalized)
@@ -141,11 +144,21 @@ fn default_tool_input_bytes() -> usize {
 }
 
 fn default_ignore_paths() -> Vec<String> {
-    vec![
-        ".env".to_owned(),
-        ".env.*".to_owned(),
-        "**/secrets/**".to_owned(),
-        "**/.ssh/**".to_owned(),
+    [".env", ".env.*", "**/secrets/**", "**/.ssh/**"]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(instruction_ignore_paths().into_iter().map(str::to_owned))
+        .collect()
+}
+
+fn instruction_ignore_paths() -> [&'static str; 6] {
+    [
+        "AGENTS.md",
+        "**/AGENTS.md",
+        "SKILL.md",
+        "**/SKILL.md",
+        "skills/**",
+        "**/skills/**",
     ]
 }
 
@@ -171,6 +184,21 @@ mod tests {
         assert!(!output.contains("very-secret"));
         assert!(!output.contains("12345678901234567890"));
         assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn drops_agent_and_skill_instruction_paths() {
+        let sanitizer = CaptureSanitizer::new(CaptureSanitizerConfig::default()).unwrap();
+        for path in [
+            "AGENTS.md",
+            "/home/user/project/AGENTS.md",
+            "/home/user/.agents/skills/browser-control/SKILL.md",
+            "/home/user/project/skills/custom/instructions.md",
+        ] {
+            let mut ignored = event();
+            ignored.attributed_path = Some(path.to_owned());
+            assert!(sanitizer.sanitize(ignored).is_none(), "{path}");
+        }
     }
 
     fn event() -> NormalizedEvent {
