@@ -1,21 +1,54 @@
 # Menvane
 
-## Your Agents Remember The Work
+**Durable memory for coding agents, with your data kept local.**
 
-Menvane is a local, persistent memory layer for coding agents. It captures the important parts of a task, turns proven discoveries into reusable knowledge, and brings the right context back when the work resumes.
+[Portuguese (Brazil)](README.pt-BR.md)
 
-No more re-explaining the architecture. No more losing the reason behind a decision. No more asking an agent to rediscover the same fix in every session.
+Menvane gives coding agents continuity across sessions and projects. It captures task progress, preserves operational handoffs, consolidates reusable knowledge from evidence, and recalls relevant context when work resumes.
 
-Menvane runs on your machine. Durable knowledge is human-readable Markdown, while SQLite provides a fast, rebuildable search index.
+Menvane is local-first: durable knowledge is human-readable Markdown, while SQLite provides a fast, rebuildable search index.
 
-## Why Menvane
+## Table Of Contents
 
-- **Continuity across sessions:** Resume unfinished work with goals, blockers, decisions, validation, changed files, and next actions.
-- **Memory that earns trust:** Facts, decisions, procedures, and gotchas are consolidated from captured evidence, not copied from raw transcripts.
-- **Relevant context, not prompt bloat:** Automatic recall combines the current prompt with the active task goal, corrections, constraints, and conversation goal.
-- **Project-aware knowledge:** Project memory stays isolated, while applicable global knowledge can be reused safely across repositories.
-- **Local-first control:** Markdown is the source of truth. Search indexes are derived and can be rebuilt.
-- **Works with your agent:** Claude Code, Codex, and OpenCode use the same capture, recall, sanitization, and trust boundary.
+- [About](#about)
+- [Key Capabilities](#key-capabilities)
+- [How It Works](#how-it-works)
+- [Quickstart](#quickstart)
+- [Integrations](#integrations)
+- [Search And Memory](#search-and-memory)
+- [Privacy And Trust](#privacy-and-trust)
+- [Recovery](#recovery)
+- [Build](#build)
+- [Contributing](#contributing)
+
+## About
+
+Menvane is designed for teams and developers who want agents to remember the work without handing their project context to a hosted memory service.
+
+- **Resume work faster:** handoffs preserve goals, blockers, decisions, validation, changed files, and next actions.
+- **Reuse proven knowledge:** facts, decisions, procedures, and gotchas are consolidated from captured evidence.
+- **Recall the right context:** automatic retrieval considers the current prompt, active task goal, corrections, constraints, and conversation goal.
+- **Keep projects isolated:** project memory is separated from unrelated repositories, with applicable global knowledge available when appropriate.
+- **Inspect and own the data:** Markdown is the durable source of truth and remains readable without Menvane.
+- **Avoid instruction pollution:** `AGENTS.md`, `SKILL.md`, and files under `skills` directories are not processed as memory or handoff file evidence.
+
+## Key Capabilities
+
+### Cross-session continuity
+
+Menvane groups activity into task episodes and creates one current handoff per episode. A later session can receive bounded, repository-aware context instead of reconstructing the task from a transcript.
+
+### Evidence-based memory
+
+Captured sessions are finalized into bounded episodic records. A structured compiler can consolidate reusable facts, decisions, procedures, and gotchas while retaining source-event provenance and respecting contradictions, scope, confidence, and forgotten-memory rules.
+
+### Local and rebuildable storage
+
+Markdown stores durable knowledge. `index.sqlite` contains derived search data and can be rebuilt with `menvane reindex`; operational session and handoff state is kept separately.
+
+### Agent-native integrations
+
+Claude Code, Codex, and OpenCode use the same capture, sanitization, recall, and trust boundary. Integrations preserve unrelated client configuration and install only Menvane-owned entries.
 
 ## How It Works
 
@@ -23,45 +56,37 @@ Menvane runs on your machine. Durable knowledge is human-readable Markdown, whil
 Agent session
      |
      v
-Capture -> sanitize -> task episodes -> handoff
+Capture -> sanitize -> task episode -> handoff
                                       |
                                       v
                               evidence-based memory
                                       |
                                       v
-Prompt recall <- project and global knowledge
+Prompt recall <- project and applicable global knowledge
 ```
 
-Menvane records bounded, normalized session events and groups them into task episodes. At lifecycle boundaries it creates a concise session record and an operational handoff. A memory compiler can then consolidate reusable knowledge while preserving provenance back to the source events.
+Menvane captures bounded normalized events, removes sensitive data and ignored paths, identifies task intent, and links meaningful progress to an episode. Lifecycle events produce a session record and queue durable compilation work without blocking the agent.
 
-Agent instructions are not treated as knowledge: `AGENTS.md`, `SKILL.md`, and files under `skills` directories are excluded from memory and handoff file processing.
+## Quickstart
 
-## Quick Start
-
-### Build
+### Install And Connect
 
 ```bash
 cargo build --release --locked
 install -m 755 target/release/menvane ~/.local/bin/menvane
-```
 
-Rust's supported toolchain installs Menvane on Linux, macOS, and WSL. Native Windows is not currently a release target.
-
-### Connect An Agent
-
-```bash
 menvane doctor
 menvane daemon start
 menvane connect claude
 ```
 
-Use `menvane connect codex` or `menvane connect opencode` for the other supported integrations. Menvane preserves unrelated client configuration and installs only its owned integration entries.
+Use `menvane connect codex` or `menvane connect opencode` for the other supported clients. Capture and recall happen automatically; no Skill, repository instruction file, or explicit memory prompt is required.
 
-Capture and recall then happen automatically. No Skill, repository instruction file, or explicit memory prompt is required.
+Menvane supports Linux, macOS, and WSL. Native Windows is not currently a release target.
 
 ### Enable Memory Compilation
 
-Menvane can capture, search, and provide handoffs without a language-model provider. To enable evidence-based consolidation with OpenAI:
+Capture, search, handoffs, and manual memory operations work without a language-model provider. To enable evidence-based consolidation with OpenAI:
 
 ```bash
 menvane provider configure openai --model gpt-5.6-luna --reasoning-effort medium
@@ -70,11 +95,19 @@ menvane daemon restart
 menvane provider status
 ```
 
-Authorization opens OpenAI in the system browser. Menvane stores its own refreshable credentials under `~/.menvane/oauth/` and never reads credentials from OpenCode or Codex. Run `menvane provider logout openai` to remove them.
+Authorization opens OpenAI in the system browser. Menvane stores its own refreshable credentials under `~/.menvane/oauth/` and never reads credentials from OpenCode or Codex.
 
-## Explore Your Memory
+## Integrations
+
+| Client | Connect command | Captured lifecycle |
+| --- | --- | --- |
+| Claude Code | `menvane connect claude` | Session, prompts, tools, compaction, stop, end |
+| Codex | `menvane connect codex` | Session, prompts, tools, compaction, stop, end |
+| OpenCode | `menvane connect opencode` | Session, messages, tools, compaction |
 
 The local dashboard is available at <http://127.0.0.1:47831/>.
+
+## Search And Memory
 
 ```bash
 menvane search "database migration"
@@ -83,24 +116,30 @@ menvane write --type gotcha --title "Migration rule" --content "..."
 menvane forget <memory-id>
 ```
 
-The search path combines SQLite FTS5 with ranked retrieval, project scope, global applicability, memory lifecycle, confidence, freshness, and technology context. Full Markdown remains available when you need the complete provenance.
+Automatic prompt recall combines independently ranked searches for the sanitized current prompt, active episode goal, corrections, constraints, and conversation root goal. It applies project scope, global applicability, memory lifecycle, type, confidence, freshness, and technology context.
 
-## Trust And Recovery
+Explicit search uses the query provided by the caller. Full Markdown and bounded provenance remain available through `menvane read` and the local UI.
 
-- Capture removes authentication headers, likely secrets, and configured ignored paths before persistence.
-- Prompts and tool inputs and outputs are bounded.
+## Privacy And Trust
+
+- Capture removes authentication headers and likely API keys, tokens, and passwords.
+- Prompts and tool inputs and outputs are bounded before persistence.
+- Configured ignored paths are dropped when reliably attributed.
+- `AGENTS.md`, `SKILL.md`, and files under `skills` directories are excluded from memory and handoff file processing.
 - Private model reasoning is never captured.
-- Injected memories are marked as historical context; current user instructions and repository state remain authoritative.
-- Session memories, handoffs, and durable knowledge remain local and inspectable.
+- Injected memories are historical context; current user instructions and repository state remain authoritative.
+- Menvane never reads or modifies OpenCode or Codex credentials.
 
-Markdown is the durable source of truth. Rebuild the derived index at any time:
+## Recovery
+
+Rebuild the derived index without deleting durable knowledge:
 
 ```bash
 rm ~/.menvane/index.sqlite
 menvane reindex
 ```
 
-Backup and validated restore:
+Create and restore a validated backup:
 
 ```bash
 menvane backup ~/menvane-backup
@@ -110,6 +149,14 @@ menvane restore ~/menvane-backup --confirm
 
 Set `MENVANE_HOME` to isolate or relocate all Menvane state.
 
-## License
+## Build
 
-Menvane is under active development. See the repository for the current license and contribution details.
+```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo build --release --locked
+```
+
+## Contributing
+
+Issues, documentation improvements, tests, and implementation contributions are welcome. Please keep changes focused, preserve the documented product behavior in [`product.md`](product.md), and run the relevant test suite before submitting a change.
