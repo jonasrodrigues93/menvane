@@ -274,32 +274,28 @@ impl EvidenceBuilder {
             let event = &episode_event.event;
             (event.is_user_prompt() && event.is_allowed_evidence()).then_some(event)
         }) {
-            if event
+            if let Some(input) = event
                 .bounded_input
                 .as_deref()
-                .is_some_and(is_decision_prompt)
-                && let Some(input) = event.bounded_input.as_deref()
+                .filter(|value| is_decision_prompt(value))
+                && let Some(input) = sanitizer.filter_content(input)
             {
-                if let Some(input) = sanitizer.filter_content(input) {
-                    candidates
-                        .decisions
-                        .push(item(event, EvidenceKind::Decision, &input, 0.65));
-                }
+                candidates
+                    .decisions
+                    .push(item(event, EvidenceKind::Decision, &input, 0.65));
             }
-            if event
+            if let Some(input) = event
                 .bounded_input
                 .as_deref()
-                .is_some_and(is_unresolved_question)
-                && let Some(input) = event.bounded_input.as_deref()
+                .filter(|value| is_unresolved_question(value))
+                && let Some(input) = sanitizer.filter_content(input)
             {
-                if let Some(input) = sanitizer.filter_content(input) {
-                    candidates.unresolved_questions.push(item(
-                        event,
-                        EvidenceKind::UnresolvedQuestion,
-                        &input,
-                        0.75,
-                    ));
-                }
+                candidates.unresolved_questions.push(item(
+                    event,
+                    EvidenceKind::UnresolvedQuestion,
+                    &input,
+                    0.75,
+                ));
             }
         }
 

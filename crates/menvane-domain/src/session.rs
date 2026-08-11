@@ -15,9 +15,10 @@ pub enum NormalizedEventKind {
     SessionEnded,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NormalizedEventOrigin {
+    #[default]
     User,
     System,
     Agent,
@@ -26,15 +27,10 @@ pub enum NormalizedEventOrigin {
     Importer,
 }
 
-impl Default for NormalizedEventOrigin {
-    fn default() -> Self {
-        Self::User
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NormalizedEventRole {
+    #[default]
     UserPrompt,
     SystemPrompt,
     AgentInstruction,
@@ -42,12 +38,6 @@ pub enum NormalizedEventRole {
     ToolMetadata,
     ToolActivity,
     Lifecycle,
-}
-
-impl Default for NormalizedEventRole {
-    fn default() -> Self {
-        Self::UserPrompt
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

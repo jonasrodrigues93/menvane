@@ -25,9 +25,9 @@ Menvane is local-first: durable knowledge is human-readable Markdown, while SQLi
 
 Menvane is designed for teams and developers who want agents to remember the work without handing their project context to a hosted memory service.
 
-- **Resume work faster:** handoffs preserve goals, blockers, decisions, validation, changed files, and next actions.
+- **Resume work faster:** one short, replaceable project handoff summarizes recent facts and pending work.
 - **Reuse proven knowledge:** facts, decisions, procedures, and gotchas are consolidated from captured evidence.
-- **Recall the right context:** automatic retrieval considers the current prompt, active task goal, corrections, constraints, and conversation goal.
+- **Recall the right context:** automatic retrieval considers the current prompt and the project's consolidated goals.
 - **Keep projects isolated:** project memory is separated from unrelated repositories, with applicable global knowledge available when appropriate.
 - **Inspect and own the data:** Markdown is the durable source of truth and remains readable without Menvane.
 - **Avoid instruction pollution:** `AGENTS.md`, `SKILL.md`, and files under `skills` directories are not processed as memory or handoff file evidence.
@@ -36,11 +36,11 @@ Menvane is designed for teams and developers who want agents to remember the wor
 
 ### Cross-session continuity
 
-Menvane groups activity into task episodes and maintains one current, versioned handoff per project. A later session can receive bounded, repository-aware context instead of reconstructing the task from a transcript.
+Each durable session is a chronological, sanitized capture of the observed events. A single short, replaceable handoff per project carries only recent relevant facts and pending decisions or work, so later sessions resume without reconstructing the task.
 
 ### Evidence-based memory
 
-Captured sessions are finalized into bounded episodic records. A structured compiler can consolidate reusable facts, decisions, procedures, and gotchas while retaining source-event provenance and respecting contradictions, scope, confidence, and forgotten-memory rules.
+One language-model consolidation per finalized session interprets the chronological capture and can identify goals and produce durable facts, decisions, procedures, and gotchas while retaining source-event provenance and respecting contradictions, scope, confidence, and forgotten-memory rules.
 
 ### Local and rebuildable storage
 
@@ -56,7 +56,7 @@ Claude Code, Codex, and OpenCode use the same capture, sanitization, recall, and
 Agent session
      |
      v
-Capture -> sanitize -> task episode -> LLM consolidation -> project handoff
+Capture -> sanitize -> chronological session -> LLM consolidation -> goals, memory, handoff
                                       |
                                       v
                               evidence-based memory
@@ -65,7 +65,7 @@ Capture -> sanitize -> task episode -> LLM consolidation -> project handoff
 Prompt recall <- project and applicable global knowledge
 ```
 
-Menvane captures bounded normalized events, removes sensitive data and ignored paths, identifies task intent, and links meaningful progress to an episode. Lifecycle events produce a session record and queue durable compilation work without blocking the agent.
+Menvane captures bounded normalized events, removes sensitive data and ignored paths, and keeps real user prompts, tool activity, and lifecycle events distinct without guessing intent. Lifecycle events produce a deterministic session record and queue one consolidation job without blocking the agent.
 
 ## Quickstart
 
@@ -116,7 +116,7 @@ menvane write --type gotcha --title "Migration rule" --content "..."
 menvane forget <memory-id>
 ```
 
-Automatic prompt recall combines independently ranked searches for the sanitized current prompt, active episode goal, corrections, constraints, and conversation root goal. It applies project scope, global applicability, memory lifecycle, type, confidence, freshness, and technology context.
+Automatic prompt recall combines independently ranked searches for the sanitized current prompt and the project's consolidated goals. It applies project scope, global applicability, memory lifecycle, type, confidence, freshness, and technology context, and never calls a language-model provider on the hot path.
 
 Explicit search uses the query provided by the caller. Full Markdown and bounded provenance remain available through `menvane read` and the local UI.
 

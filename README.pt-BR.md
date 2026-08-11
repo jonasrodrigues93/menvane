@@ -25,9 +25,9 @@ O Menvane é local-first: o conhecimento durável fica em Markdown legível por 
 
 O Menvane foi criado para equipes e desenvolvedores que querem que os agentes se lembrem do trabalho sem enviar o contexto dos projetos para um serviço de memória hospedado.
 
-- **Retome o trabalho mais rápido:** handoffs preservam objetivos, bloqueios, decisões, validações, arquivos alterados e próximas ações.
+- **Retome o trabalho mais rápido:** um handoff curto e substituível por projeto resume os fatos recentes e o trabalho pendente.
 - **Reutilize conhecimento comprovado:** fatos, decisões, procedimentos e gotchas são consolidados a partir de evidências capturadas.
-- **Recupere o contexto certo:** a recuperação automática considera o prompt atual, o objetivo da tarefa, correções, restrições e o objetivo da conversa.
+- **Recupere o contexto certo:** a recuperação automática considera o prompt atual e os objetivos consolidados do projeto.
 - **Mantenha projetos isolados:** a memória de cada projeto é separada de repositórios não relacionados, com conhecimento global aplicável disponível quando apropriado.
 - **Inspecione e controle os dados:** Markdown é a fonte durável da verdade e continua legível sem o Menvane.
 - **Evite poluir a memória com instruções:** `AGENTS.md`, `SKILL.md` e arquivos dentro de diretórios `skills` não são processados como memória ou evidência de handoff.
@@ -36,11 +36,11 @@ O Menvane foi criado para equipes e desenvolvedores que querem que os agentes se
 
 ### Continuidade entre sessões
 
-O Menvane agrupa a atividade em episódios de tarefa e mantém um handoff atual e versionado por projeto. Uma sessão posterior recebe contexto limitado e validado pelo repositório, em vez de reconstruir a tarefa a partir de uma transcrição.
+Cada sessão durável é uma captura cronológica e sanitizada dos eventos observados. Um único handoff curto e substituível por projeto carrega apenas fatos recentes relevantes e decisões ou trabalho pendentes, para que sessões posteriores retomem sem reconstruir a tarefa.
 
 ### Memória baseada em evidências
 
-As sessões capturadas são finalizadas em registros episódicos limitados. Um compilador estruturado pode consolidar fatos, decisões, procedimentos e gotchas reutilizáveis, preservando a origem nos eventos e respeitando contradições, escopo, confiança e regras de esquecimento.
+Uma consolidação por modelo de linguagem por sessão finalizada interpreta a captura cronológica e pode identificar objetivos e produzir fatos, decisões, procedimentos e gotchas duráveis, preservando a origem nos eventos e respeitando contradições, escopo, confiança e regras de esquecimento.
 
 ### Armazenamento local e reconstruível
 
@@ -56,7 +56,7 @@ Claude Code, Codex e OpenCode usam o mesmo limite de captura, sanitização, rec
 Sessão do agente
        |
        v
-Captura -> sanitização -> episódio de tarefa -> consolidação LLM -> handoff do projeto
+Captura -> sanitização -> sessão cronológica -> consolidação LLM -> objetivos, memória e handoff
                                              |
                                              v
                                      memória baseada em evidências
@@ -65,7 +65,7 @@ Captura -> sanitização -> episódio de tarefa -> consolidação LLM -> handoff
 Recuperação do prompt <- conhecimento do projeto e global aplicável
 ```
 
-O Menvane captura eventos normalizados e limitados, remove dados sensíveis e caminhos ignorados, identifica a intenção da tarefa e associa o progresso relevante a um episódio. Eventos de ciclo de vida produzem um registro de sessão e enfileiram a compilação durável sem bloquear o agente.
+O Menvane captura eventos normalizados e limitados, remove dados sensíveis e caminhos ignorados e mantém promps reais, atividade de ferramenta e eventos de ciclo de vida distintos, sem adivinhar a intenção. Eventos de ciclo de vida produzem um registro de sessão determinístico e enfileiram uma consolidação sem bloquear o agente.
 
 ## Início rápido
 
@@ -116,7 +116,7 @@ menvane write --type gotcha --title "Regra de migração" --content "..."
 menvane forget <memory-id>
 ```
 
-A recuperação automática combina buscas ranqueadas de forma independente pelo prompt atual sanitizado, objetivo do episódio ativo, correções, restrições e objetivo raiz da conversa. Ela aplica escopo do projeto, aplicabilidade global, ciclo de vida, tipo, confiança, frescor e contexto tecnológico.
+A recuperação automática combina buscas ranqueadas de forma independente pelo prompt atual sanitizado e pelos objetivos consolidados do projeto. Ela aplica escopo do projeto, aplicabilidade global, ciclo de vida, tipo, confiança, frescor e contexto tecnológico, sem chamar um provedor no caminho crítico.
 
 A busca explícita usa somente a consulta fornecida pelo chamador. O Markdown completo e a proveniência limitada continuam disponíveis por `menvane read` e pela interface local.
 
