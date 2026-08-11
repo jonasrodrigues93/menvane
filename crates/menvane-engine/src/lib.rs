@@ -10,6 +10,7 @@ mod project_resolver;
 mod providers;
 mod retriever;
 mod sanitizer;
+mod session_consolidator;
 mod session_engine;
 mod technology_detector;
 
@@ -24,8 +25,8 @@ use chrono::Utc;
 use fs2::FileExt;
 use menvane_domain::{
     Applicability, HandoffStatus, JsonSchema, LlmProvider, LlmRequest, Memory, MemoryMetadata,
-    MemoryType, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, PromptIntent,
-    ProviderHealth, ReinforcementSignal, Scope, TaskEpisode, TaskHandoff,
+    MemoryType, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProjectHandoff,
+    PromptIntent, ProviderHealth, ReinforcementSignal, Scope, TaskEpisode, TaskHandoff,
 };
 pub use menvane_store::mark_forgotten;
 pub use menvane_store::{
@@ -68,6 +69,9 @@ pub use retriever::{RetrievalMode, RetrievalScope, Retriever};
 pub use sanitizer::{
     CaptureSanitizer, CaptureSanitizerConfig, MAX_RECALL_CWD_BYTES, MAX_RECALL_IDENTIFIER_BYTES,
     MAX_RECALL_PROMPT_BYTES,
+};
+pub use session_consolidator::{
+    ConsolidationOutcome, ConsolidationPacket, MAX_HANDOFF_SUMMARY_BYTES, SessionConsolidator,
 };
 pub use session_engine::{CaptureOutcome, SessionEngine, is_session_worth_compiling};
 pub use technology_detector::TechnologyDetector;
@@ -1532,6 +1536,10 @@ impl Menvane {
                 SessionEngine::new(self).finalize_job(&job)?;
                 return Ok(None);
             }
+            if job.job_type == "consolidate_session" {
+                let provider = self.process_consolidate_job(&job).await?;
+                return Ok(Some(provider));
+            }
             if job.job_type != "compile_session" {
                 bail!("unsupported job type: {}", job.job_type);
             }
@@ -1619,6 +1627,100 @@ impl Menvane {
         Ok(true)
     }
 
+    async fn process_consolidate_job(&self, job: &JobRecord) -> Result<String> {
+        let session_id = job.dedupe_key.parse()?;
+        let session = self.sessions.session(session_id)?;
+        let sanitizer = CaptureSanitizer::new(self.config.capture.clone())?;
+        let durable = self
+            .sessions
+            .events(session_id)?
+            .into_iter()
+            .filter_map(|event| sanitizer.filter_durable_event(event))
+            .collect::<Vec<_>>();
+        let (cwd, technology_profile) = if let Some(project_id) = session.project_id.as_deref() {
+            let project = self
+                .all_projects()?
+                .into_iter()
+                .find(|project| project.id == project_id)
+                .context("session project is missing")?;
+            let cwd = project
+                .known_paths
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.exists())
+                .context("session project has no available checkout")?;
+            (cwd, serde_json::to_value(project.technologies)?)
+        } else {
+            let cwd = durable
+                .iter()
+                .map(|event| PathBuf::from(&event.cwd))
+                .find(|path| path.exists())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("global session has no available working directory")
+                })?;
+            (cwd, serde_json::json!({}))
+        };
+        let goals = self.sessions.active_goals(session.project_id.as_deref())?;
+        let related = self.related_memories_from_events(
+            &durable,
+            &technology_profile,
+            session.project_id.as_deref(),
+        )?;
+        let current_handoff = self
+            .sessions
+            .current_project_handoff(session.project_id.as_deref())?;
+        let created_at = current_handoff.as_ref().map(|handoff| handoff.created_at);
+        let fingerprint = current_handoff
+            .as_ref()
+            .and_then(|handoff| handoff.fingerprint.clone());
+        let packet = ConsolidationPacket {
+            session_id,
+            events: durable,
+            goals,
+            related_memories: related,
+            technology_profile: technology_profile.clone(),
+            current_handoff,
+        };
+        let outcome = SessionConsolidator::new(self.configured_provider()?)
+            .consolidate(&packet)
+            .await
+            .map_err(anyhow::Error::new)?;
+        self.sessions.apply_goal_operations(
+            session_id,
+            session.project_id.as_deref(),
+            &session.conversation_key,
+            &outcome.response.goals,
+        )?;
+        for (index, memory) in outcome.response.memories.iter().enumerate() {
+            let memory_key = format!("mem:{session_id}:{index}");
+            if self
+                .sessions
+                .compilation_operation_result(&memory_key)?
+                .is_some()
+            {
+                continue;
+            }
+            let compiled = compiled_operation(memory);
+            let applied =
+                self.apply_compilation_operation(&cwd, compiled, Some(session_id), None, index)?;
+            let ids = applied.iter().copied().collect::<Vec<_>>();
+            self.sessions
+                .record_compilation_operation(&memory_key, &ids)?;
+        }
+        if let Some(replacement) = outcome.response.handoff {
+            let handoff = ProjectHandoff {
+                project_id: session.project_id.clone(),
+                summary: replacement.summary,
+                source_session_ids: replacement.source_session_ids,
+                fingerprint,
+                created_at: created_at.unwrap_or_else(Utc::now),
+                updated_at: Utc::now(),
+            };
+            self.sessions.replace_project_handoff(&handoff)?;
+        }
+        Ok(outcome.provider)
+    }
+
     async fn process_checkpoint_job(&self, job: &JobRecord) -> Result<String> {
         let episode_id = Uuid::parse_str(&job.dedupe_key)?;
         let state = self.sessions.checkpoint_state(episode_id)?;
@@ -1675,7 +1777,7 @@ impl Menvane {
 
     pub fn related_memories(
         &self,
-        cwd: &Path,
+        _cwd: &Path,
         evidence: &menvane_domain::EpisodeEvidencePacket,
         technology_profile: &serde_json::Value,
         project_id: Option<&str>,
@@ -1688,8 +1790,39 @@ impl Menvane {
         query.extend(evidence.errors.iter().map(|item| item.content.clone()));
         query.extend(evidence.validations.iter().map(|item| item.content.clone()));
         query.extend(evidence.files.iter().cloned());
+        self.related_from_values(query, technology_profile, project_id)
+    }
+
+    pub fn related_memories_from_events(
+        &self,
+        events: &[NormalizedEvent],
+        technology_profile: &serde_json::Value,
+        project_id: Option<&str>,
+    ) -> Result<Vec<RelatedMemory>> {
+        let mut query = Vec::new();
+        for event in events {
+            if let Some(input) = event.bounded_input.as_deref() {
+                query.push(input.to_owned());
+            }
+            if let Some(output) = event.bounded_output.as_deref() {
+                query.push(output.to_owned());
+            }
+            if let Some(path) = event.attributed_path.as_deref() {
+                query.push(path.to_owned());
+            }
+        }
+        self.related_from_values(query, technology_profile, project_id)
+    }
+
+    fn related_from_values(
+        &self,
+        query: Vec<String>,
+        technology_profile: &serde_json::Value,
+        project_id: Option<&str>,
+    ) -> Result<Vec<RelatedMemory>> {
         let mut technology_values = Vec::new();
         collect_strings(technology_profile, &mut technology_values);
+        let mut query = query;
         query.extend(technology_values.iter().cloned());
         let query_tokens = query
             .iter()
@@ -1758,7 +1891,6 @@ impl Menvane {
             bytes += item_bytes;
             related.push(related_memory);
         }
-        let _ = cwd;
         Ok(related)
     }
 
@@ -2551,6 +2683,22 @@ fn compilation_memory_id(operation_key: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+fn compiled_operation(memory: &menvane_domain::MemoryOperation) -> CompiledOperation {
+    CompiledOperation {
+        operation: memory.operation.clone(),
+        target_memory_ids: memory.target_memory_ids.clone(),
+        memory_type: memory.memory_type,
+        title: memory.title.clone(),
+        scope: memory.scope,
+        scope_confidence: memory.scope_confidence,
+        scope_reason: memory.scope_reason.clone(),
+        confidence_signal: memory.confidence_signal,
+        applies_to: memory.applies_to.clone(),
+        content: memory.content.clone(),
+        evidence_event_ids: memory.evidence_event_ids.clone(),
+        contradicting_event_ids: memory.contradicting_event_ids.clone(),
+    }
+}
 fn add_source_session(memory: &mut Memory, source_session: Option<Uuid>) {
     if let Some(source_session) = source_session
         && !memory.metadata.source_sessions.contains(&source_session)

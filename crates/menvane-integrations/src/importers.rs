@@ -150,7 +150,7 @@ impl JsonlImporter {
                     attributed_path: None,
                     success,
                     model: find_string(&record, &["model"]).map(str::to_owned),
-        harness_injected: false,
+                    harness_injected: false,
                 });
             }
         }
@@ -281,7 +281,7 @@ impl OpenCodeImporter {
                         attributed_path: None,
                         success,
                         model: None,
-        harness_injected: false,
+                        harness_injected: false,
                     });
                 }
             }
@@ -647,7 +647,7 @@ mod tests {
             attributed_path: None,
             success: None,
             model: None,
-        harness_injected: false,
+            harness_injected: false,
         };
         let mut scan = SessionScan {
             sessions: vec![

@@ -2,8 +2,8 @@ use std::path::Path;
 
 use chrono::{Duration, TimeZone, Utc};
 use menvane_domain::{
-    EpisodeState, IntentClassificationSource, NormalizedEvent, NormalizedEventKind, PromptIntent,
-    PromptIntentKind,
+    EpisodeState, Goal, GoalOperation, GoalOperationKind, IntentClassificationSource,
+    NormalizedEvent, NormalizedEventKind, PromptIntent, PromptIntentKind,
 };
 use menvane_store::{SessionRepository, conversation_key};
 use rusqlite::Connection;
@@ -327,7 +327,12 @@ fn migration_twelve_converts_compile_jobs_and_disables_episodic_checkpoints() {
     repository.initialize().unwrap();
     let session = repository
         .ingest(
-            &event("m12-start", "external", NormalizedEventKind::SessionStarted, 0),
+            &event(
+                "m12-start",
+                "external",
+                NormalizedEventKind::SessionStarted,
+                0,
+            ),
             Some("project-a"),
         )
         .unwrap()
@@ -343,10 +348,7 @@ fn migration_twelve_converts_compile_jobs_and_disables_episodic_checkpoints() {
         .unwrap();
     let connection = Connection::open(&path).unwrap();
     connection
-        .execute(
-            "DELETE FROM schema_migrations WHERE version=12",
-            [],
-        )
+        .execute("DELETE FROM schema_migrations WHERE version=12", [])
         .unwrap();
     connection
         .execute("DROP TABLE project_handoffs", [])
@@ -354,9 +356,7 @@ fn migration_twelve_converts_compile_jobs_and_disables_episodic_checkpoints() {
     connection
         .execute("DROP TABLE goal_event_links", [])
         .unwrap();
-    connection
-        .execute("DROP TABLE goals", [])
-        .unwrap();
+    connection.execute("DROP TABLE goals", []).unwrap();
     let now = "2026-01-01T00:00:00Z";
     for (id, session_part, episode_part) in [
         ("job-a", "first-session", "episode-1"),
@@ -434,13 +434,65 @@ fn migration_twelve_converts_compile_jobs_and_disables_episodic_checkpoints() {
         )
         .unwrap();
     assert_eq!(dirty, 0);
-    assert!(connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_handoffs'",
-            [],
-            |_| Ok(()),
+    assert!(
+        connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_handoffs'",
+                [],
+                |_| Ok(()),
+            )
+            .is_ok()
+    );
+}
+
+#[test]
+fn goal_operations_are_applied_idempotently() {
+    let temporary = TempDir::new().unwrap();
+    let repository = SessionRepository::new(temporary.path().join("state.sqlite"));
+    repository.initialize().unwrap();
+    let session = repository
+        .ingest(
+            &event("start", "external", NormalizedEventKind::SessionStarted, 0),
+            Some("project-a"),
         )
-        .is_ok());
+        .unwrap()
+        .session;
+    repository
+        .ingest(
+            &event("prompt", "external", NormalizedEventKind::UserPrompt, 1),
+            Some("project-a"),
+        )
+        .unwrap();
+    let operation = GoalOperation {
+        kind: GoalOperationKind::Create,
+        goal_id: None,
+        summary: Some("Implement the export".to_owned()),
+        event_ids: vec!["prompt".to_owned()],
+    };
+    let first = repository
+        .apply_goal_operations(
+            session.id,
+            Some("project-a"),
+            &session.conversation_key,
+            &[operation.clone()],
+        )
+        .unwrap();
+    let second = repository
+        .apply_goal_operations(
+            session.id,
+            Some("project-a"),
+            &session.conversation_key,
+            &[operation.clone()],
+        )
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(second.is_empty());
+    let active = repository.active_goals(Some("project-a")).unwrap();
+    assert_eq!(active.len(), 1);
+    let goal: Goal = active.into_iter().next().unwrap();
+    assert_eq!(goal.id, first[0]);
+    assert_eq!(goal.summary, "Implement the export");
+    assert_eq!(goal.state, menvane_domain::GoalState::Active);
 }
 
 fn prompt_intent(

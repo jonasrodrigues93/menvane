@@ -251,7 +251,11 @@ fn linked_session_events_render_a_chronological_timeline() {
     assert!(session.body.contains("[event:edit-a]"));
     assert!(session.body.contains("[event:check-b]"));
     assert!(session.body.contains("Implement export parsing"));
-    assert!(session.body.contains("Now document the dashboard navigation"));
+    assert!(
+        session
+            .body
+            .contains("Now document the dashboard navigation")
+    );
     assert!(session.body.contains("cargo check"));
     let goal_a = session.body.find("[event:goal-a]").unwrap();
     let check_b = session.body.find("[event:check-b]").unwrap();
@@ -270,11 +274,13 @@ fn linked_session_events_render_a_chronological_timeline() {
         .filter(|job| job.job_type == "consolidate_session")
         .collect::<Vec<_>>();
     assert_eq!(consolidation_jobs.len(), 1);
-    assert!(menvane
-        .jobs()
-        .unwrap()
-        .into_iter()
-        .all(|job| job.job_type != "compile_session"));
+    assert!(
+        menvane
+            .jobs()
+            .unwrap()
+            .into_iter()
+            .all(|job| job.job_type != "compile_session")
+    );
     let (_, indexed_memories) = menvane.reindex().unwrap();
     assert!(indexed_memories >= 1);
 }
@@ -346,7 +352,7 @@ fn episode_event(
             attributed_path: None,
             success: None,
             model: None,
-        harness_injected: false,
+            harness_injected: false,
         },
         session_id: Uuid::from_u128(9),
         generation: 1,

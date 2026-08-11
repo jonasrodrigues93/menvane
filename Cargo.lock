@@ -1023,6 +1023,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
  "menvane-domain",
  "rusqlite",
  "serde",

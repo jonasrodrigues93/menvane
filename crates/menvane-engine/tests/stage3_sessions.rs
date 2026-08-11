@@ -27,8 +27,7 @@ fn injected_context_is_stripped_from_composed_user_prompts() {
         menvane.ingest_event(prompt.clone()).unwrap(),
         CaptureOutcome::Stored
     );
-    let connection =
-        Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
+    let connection = Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
     let payload: String = connection
         .query_row(
             "SELECT payload_json FROM session_events WHERE event_id='composed'",

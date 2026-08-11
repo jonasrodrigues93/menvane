@@ -5,8 +5,9 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use menvane_domain::{
-    EpisodeState, HandoffStatus, IntentClassificationSource, NormalizedEvent, NormalizedEventKind,
-    PromptIntent, PromptIntentKind, ReinforcementSignal, SessionState, TaskEpisode, TaskHandoff,
+    EpisodeState, Goal, GoalOperation, GoalOperationKind, GoalState, HandoffStatus,
+    IntentClassificationSource, NormalizedEvent, NormalizedEventKind, ProjectHandoff, PromptIntent,
+    PromptIntentKind, ReinforcementSignal, SessionState, TaskEpisode, TaskHandoff,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
@@ -2111,6 +2112,77 @@ impl SessionRepository {
         Ok(())
     }
 
+    pub fn active_goals(&self, project_id: Option<&str>) -> Result<Vec<Goal>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, conversation_key, summary, state, created_at, updated_at FROM goals WHERE project_id IS ?1 AND state='active' ORDER BY updated_at DESC, id",
+        )?;
+        let rows = statement.query_map(params![project_id], goal_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn apply_goal_operations(
+        &self,
+        session_id: Uuid,
+        project_id: Option<&str>,
+        conversation_key: &str,
+        goal_ops: &[GoalOperation],
+    ) -> Result<Vec<Uuid>> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut applied = Vec::new();
+        for (index, op) in goal_ops.iter().enumerate() {
+            let key = goal_operation_key(session_id, index);
+            let goal_id =
+                apply_goal_operation(&transaction, &key, op, project_id, conversation_key)?;
+            if let Some(goal_id) = goal_id {
+                record_consolidation_operation(&transaction, &key, &[goal_id.to_string()])?;
+                applied.push(goal_id);
+            }
+        }
+        transaction.commit()?;
+        Ok(applied)
+    }
+
+    pub fn current_project_handoff(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Option<ProjectHandoff>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT project_id, summary, source_session_ids_json, fingerprint, created_at, updated_at FROM project_handoffs WHERE project_id IS ?1",
+                [project_id],
+                project_handoff_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn replace_project_handoff(&self, handoff: &ProjectHandoff) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "INSERT INTO project_handoffs(project_id, summary, source_session_ids_json, fingerprint, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(project_id) DO UPDATE SET summary=excluded.summary, source_session_ids_json=excluded.source_session_ids_json, fingerprint=excluded.fingerprint, updated_at=excluded.updated_at",
+            params![
+                handoff.project_id,
+                handoff.summary,
+                serde_json::to_string(
+                    &handoff
+                        .source_session_ids
+                        .iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>()
+                )?,
+                handoff.fingerprint,
+                handoff.created_at.to_rfc3339(),
+                handoff.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn open(&self) -> Result<Connection> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -2121,7 +2193,6 @@ impl SessionRepository {
         Ok(connection)
     }
 }
-
 const CURRENT_HANDOFF_BY_EPISODE_SELECT: &str = "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE episode_id=?1 AND status IN ('active', 'ready', 'consumed')";
 const CURRENT_HANDOFF_BY_PROJECT_SELECT: &str = "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE COALESCE(project_id, ?1)=COALESCE(?2, ?1) AND status IN ('active', 'ready', 'consumed')";
 const CLEAN_HANDOFF_SQL: &str = "lower(goal) NOT LIKE '%agents.md%' AND lower(goal) NOT LIKE '%skill.md%' AND lower(goal) NOT LIKE '%<available-skills>%' AND lower(goal) NOT LIKE '%<recommended_plugins>%' AND lower(current_state) NOT LIKE '%agents.md%' AND lower(current_state) NOT LIKE '%skill.md%' AND lower(current_state) NOT LIKE '%<available-skills>%' AND lower(current_state) NOT LIKE '%<recommended_plugins>%' AND lower(completed_work_json) NOT LIKE '%agents.md%' AND lower(completed_work_json) NOT LIKE '%skill.md%' AND lower(pending_work_json) NOT LIKE '%agents.md%' AND lower(pending_work_json) NOT LIKE '%skill.md%' AND lower(blockers_json) NOT LIKE '%agents.md%' AND lower(blockers_json) NOT LIKE '%skill.md%' AND lower(changed_files_json) NOT LIKE '%agents.md%' AND lower(changed_files_json) NOT LIKE '%skill.md%' AND lower(decisions_json) NOT LIKE '%agents.md%' AND lower(decisions_json) NOT LIKE '%skill.md%' AND lower(validation_json) NOT LIKE '%agents.md%' AND lower(validation_json) NOT LIKE '%skill.md%'";
@@ -3387,10 +3458,7 @@ fn migrate_to_version_12(connection: &Connection) -> Result<()> {
         )?;
     }
     if table_exists(connection, "checkpoint_state") {
-        connection.execute(
-            "UPDATE checkpoint_state SET dirty=0, updated_at=?1",
-            [&now],
-        )?;
+        connection.execute("UPDATE checkpoint_state SET dirty=0, updated_at=?1", [&now])?;
     }
     Ok(())
 }
@@ -3505,6 +3573,194 @@ fn episode_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEpisode> {
         created_at: parse_timestamp(&created_at).map_err(sql_conversion_error)?,
         updated_at: parse_timestamp(&updated_at).map_err(sql_conversion_error)?,
     })
+}
+
+fn goal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Goal> {
+    let id: String = row.get(0)?;
+    let state: String = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    let updated_at: String = row.get(6)?;
+    Ok(Goal {
+        id: Uuid::parse_str(&id).map_err(sql_conversion_error)?,
+        project_id: row.get(1)?,
+        conversation_key: row.get(2)?,
+        summary: row.get(3)?,
+        state: parse_goal_state(&state).map_err(sql_conversion_error)?,
+        created_at: parse_timestamp(&created_at).map_err(sql_conversion_error)?,
+        updated_at: parse_timestamp(&updated_at).map_err(sql_conversion_error)?,
+    })
+}
+
+fn project_handoff_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectHandoff> {
+    let project_id: Option<String> = row.get(0)?;
+    let source_session_ids: String = row.get(2)?;
+    let created_at: String = row.get(4)?;
+    let updated_at: String = row.get(5)?;
+    let parsed: Vec<String> = serde_json::from_str(&source_session_ids).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let source_session_ids = parsed
+        .into_iter()
+        .map(|value| Uuid::parse_str(&value).map_err(sql_conversion_error))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ProjectHandoff {
+        project_id,
+        summary: row.get(1)?,
+        source_session_ids,
+        fingerprint: row.get(3)?,
+        created_at: parse_timestamp(&created_at).map_err(sql_conversion_error)?,
+        updated_at: parse_timestamp(&updated_at).map_err(sql_conversion_error)?,
+    })
+}
+
+fn apply_goal_operation(
+    transaction: &Transaction<'_>,
+    key: &str,
+    op: &GoalOperation,
+    project_id: Option<&str>,
+    conversation_key: &str,
+) -> Result<Option<Uuid>> {
+    let now = Utc::now();
+    let now_text = now.to_rfc3339();
+    if consolidation_operation_applied(transaction, key)? {
+        return Ok(None);
+    }
+    match op.kind {
+        GoalOperationKind::Create => {
+            let summary = op
+                .summary
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("goal create requires a summary"))?
+                .trim();
+            if summary.is_empty() {
+                bail!("goal summary cannot be empty");
+            }
+            let goal_id = deterministic_goal_id(key);
+            transaction.execute(
+                "INSERT OR IGNORE INTO goals(id, project_id, conversation_key, summary, state, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)",
+                params![
+                    goal_id.to_string(),
+                    project_id,
+                    conversation_key,
+                    summary,
+                    now_text
+                ],
+            )?;
+            link_goal_events(transaction, goal_id, &op.event_ids)?;
+            Ok(Some(goal_id))
+        }
+        GoalOperationKind::Continue => {
+            let goal_id = require_goal_id(op)?;
+            let updated = transaction.execute(
+                "UPDATE goals SET summary=COALESCE(NULLIF(?1, ''), summary), updated_at=?2 WHERE id=?3 AND state='active'",
+                params![
+                    op.summary.as_deref().unwrap_or("").trim(),
+                    now_text,
+                    goal_id.to_string()
+                ],
+            )?;
+            if updated == 0 {
+                bail!("goal continue targets a missing or inactive goal: {goal_id}");
+            }
+            link_goal_events(transaction, goal_id, &op.event_ids)?;
+            Ok(Some(goal_id))
+        }
+        GoalOperationKind::Complete | GoalOperationKind::Abandon => {
+            let goal_id = require_goal_id(op)?;
+            let state = if op.kind == GoalOperationKind::Complete {
+                GoalState::Completed
+            } else {
+                GoalState::Abandoned
+            };
+            let updated = transaction.execute(
+                "UPDATE goals SET state=?1, updated_at=?2 WHERE id=?3",
+                params![
+                    match state {
+                        GoalState::Completed => "completed",
+                        GoalState::Abandoned => "abandoned",
+                        GoalState::Active => "active",
+                    },
+                    now_text,
+                    goal_id.to_string()
+                ],
+            )?;
+            if updated == 0 {
+                bail!("goal does not exist: {goal_id}");
+            }
+            link_goal_events(transaction, goal_id, &op.event_ids)?;
+            Ok(Some(goal_id))
+        }
+    }
+}
+
+fn require_goal_id(op: &GoalOperation) -> Result<Uuid> {
+    op.goal_id
+        .ok_or_else(|| anyhow::anyhow!("goal operation requires a goal id"))
+}
+
+fn link_goal_events(
+    transaction: &Transaction<'_>,
+    goal_id: Uuid,
+    event_ids: &[String],
+) -> Result<()> {
+    for event_id in event_ids {
+        transaction.execute(
+            "INSERT OR IGNORE INTO goal_event_links(event_id, goal_id, linked_at) VALUES (?1, ?2, ?3)",
+            params![event_id, goal_id.to_string(), Utc::now().to_rfc3339()],
+        )?;
+    }
+    Ok(())
+}
+
+fn goal_operation_key(session_id: Uuid, index: usize) -> String {
+    hex::encode(Sha256::digest(
+        format!("goal:{session_id}:{index}").as_bytes(),
+    ))
+}
+
+fn consolidation_operation_applied(transaction: &Transaction<'_>, key: &str) -> Result<bool> {
+    Ok(transaction
+        .query_row(
+            "SELECT 1 FROM compilation_operations WHERE operation_key=?1",
+            [key],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn deterministic_goal_id(key: &str) -> Uuid {
+    let digest = Sha256::digest(key.as_bytes());
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn record_consolidation_operation(
+    transaction: &Transaction<'_>,
+    key: &str,
+    ids: &[String],
+) -> Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO compilation_operations(operation_key, memory_ids_json, applied_at) VALUES (?1, ?2, ?3)",
+        params![key, serde_json::to_string(ids)?, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn parse_goal_state(value: &str) -> std::io::Result<GoalState> {
+    match value {
+        "active" => Ok(GoalState::Active),
+        "completed" => Ok(GoalState::Completed),
+        "abandoned" => Ok(GoalState::Abandoned),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid goal state: {value}"),
+        )),
+    }
 }
 
 fn prompt_intent_by_event(connection: &Connection, event_id: &str) -> Result<PromptIntent> {

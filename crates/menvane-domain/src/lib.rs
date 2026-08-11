@@ -11,8 +11,8 @@ pub use retrieval::{
 };
 pub use session::ReinforcementSignal;
 pub use session::{
-    ConsolidationResponse, EpisodeEvidencePacket, EpisodeState, EvidenceItem, EvidenceKind,
-    Goal, GoalOperation, GoalOperationKind, GoalState, HandoffReplacement, HandoffStatus,
+    ConsolidationResponse, EpisodeEvidencePacket, EpisodeState, EvidenceItem, EvidenceKind, Goal,
+    GoalOperation, GoalOperationKind, GoalState, HandoffReplacement, HandoffStatus,
     HandoffValidation, IntentClassificationSource, MemoryOperation, NormalizedEvent,
     NormalizedEventKind, NormalizedEventOrigin, NormalizedEventRole, NormalizedSession,
     ProjectHandoff, PromptIntent, PromptIntentKind, SessionImporter, SessionState, TaskEpisode,

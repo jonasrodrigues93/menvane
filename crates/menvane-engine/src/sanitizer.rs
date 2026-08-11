@@ -207,10 +207,7 @@ impl CaptureSanitizer {
                 }
                 continue;
             }
-            if FILTERED_LINES
-                .iter()
-                .any(|marker| trimmed.contains(marker))
-            {
+            if FILTERED_LINES.iter().any(|marker| trimmed.contains(marker)) {
                 continue;
             }
             filtered.push(line);
