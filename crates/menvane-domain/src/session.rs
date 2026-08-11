@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::memory::{Applicability, MemoryType, Scope};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NormalizedEventKind {
@@ -240,28 +242,57 @@ pub struct NormalizedEvent {
     pub success: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub harness_injected: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl NormalizedEvent {
     pub fn is_user_prompt(&self) -> bool {
-        self.kind == NormalizedEventKind::UserPrompt
+        !self.harness_injected
+            && self.kind == NormalizedEventKind::UserPrompt
             && self.origin == NormalizedEventOrigin::User
             && self.role == NormalizedEventRole::UserPrompt
     }
 
+    pub fn is_injected_content(&self) -> bool {
+        self.harness_injected
+            || matches!(
+                self.origin,
+                NormalizedEventOrigin::System
+                    | NormalizedEventOrigin::Agent
+                    | NormalizedEventOrigin::Compaction
+            )
+            || matches!(
+                self.role,
+                NormalizedEventRole::SystemPrompt
+                    | NormalizedEventRole::AgentInstruction
+                    | NormalizedEventRole::CompactionSummary
+                    | NormalizedEventRole::ToolMetadata
+            )
+    }
+
+    pub fn is_operational(&self) -> bool {
+        self.is_injected_content() || matches!(self.role, NormalizedEventRole::Lifecycle)
+    }
+
+    pub fn is_durable(&self) -> bool {
+        !self.is_injected_content()
+    }
+
+    pub fn is_consolidation_eligible(&self) -> bool {
+        self.is_durable()
+            && matches!(
+                self.kind,
+                NormalizedEventKind::UserPrompt | NormalizedEventKind::ToolCompleted
+            )
+    }
+
     pub fn is_allowed_evidence(&self) -> bool {
-        if matches!(
-            self.origin,
-            NormalizedEventOrigin::System
-                | NormalizedEventOrigin::Agent
-                | NormalizedEventOrigin::Compaction
-        ) {
-            return false;
-        }
-        !matches!(
-            self.role,
-            NormalizedEventRole::ToolMetadata | NormalizedEventRole::CompactionSummary
-        )
+        self.is_consolidation_eligible()
     }
 }
 
@@ -276,6 +307,88 @@ pub struct NormalizedSession {
 
 pub trait SessionImporter {
     fn discover(&self) -> Result<Vec<NormalizedSession>, String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GoalState {
+    Active,
+    Completed,
+    Abandoned,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Goal {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub conversation_key: String,
+    pub summary: String,
+    pub state: GoalState,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GoalOperationKind {
+    Create,
+    Continue,
+    Complete,
+    Abandon,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoalOperation {
+    pub kind: GoalOperationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryOperation {
+    pub operation: String,
+    pub target_memory_ids: Vec<Uuid>,
+    #[serde(rename = "type")]
+    pub memory_type: MemoryType,
+    pub title: String,
+    pub scope: Scope,
+    pub scope_confidence: f64,
+    pub scope_reason: String,
+    pub confidence_signal: f64,
+    pub applies_to: Applicability,
+    pub content: serde_json::Value,
+    pub evidence_event_ids: Vec<String>,
+    pub contradicting_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandoffReplacement {
+    pub summary: String,
+    pub source_session_ids: Vec<Uuid>,
+    pub evidence_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsolidationResponse {
+    pub goals: Vec<GoalOperation>,
+    pub memories: Vec<MemoryOperation>,
+    #[serde(default)]
+    pub handoff: Option<HandoffReplacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectHandoff {
+    pub project_id: Option<String>,
+    pub summary: String,
+    pub source_session_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -316,5 +429,57 @@ mod tests {
         assert!(event.is_user_prompt());
         assert_eq!(event.origin, NormalizedEventOrigin::User);
         assert_eq!(event.role, NormalizedEventRole::UserPrompt);
+        assert!(!event.harness_injected);
+        assert!(event.is_consolidation_eligible());
+        assert!(event.is_durable());
+        assert!(!event.is_operational());
+    }
+
+    #[test]
+    fn harness_injected_and_lifecycle_events_are_never_durable() {
+        let base = NormalizedEvent {
+            event_id: "id".to_owned(),
+            kind: NormalizedEventKind::UserPrompt,
+            origin: NormalizedEventOrigin::User,
+            role: NormalizedEventRole::UserPrompt,
+            client: "client".to_owned(),
+            external_session_id: "session".to_owned(),
+            timestamp: Utc::now(),
+            cwd: "/tmp".to_owned(),
+            project_id: None,
+            tool_family: None,
+            bounded_input: Some("content".to_owned()),
+            bounded_output: None,
+            attributed_path: None,
+            success: None,
+            model: None,
+            harness_injected: false,
+        };
+        assert!(base.is_durable());
+        assert!(base.is_consolidation_eligible());
+        assert!(!base.is_operational());
+
+        let mut injected = base.clone();
+        injected.harness_injected = true;
+        assert!(injected.is_injected_content());
+        assert!(!injected.is_user_prompt());
+        assert!(injected.is_operational());
+        assert!(!injected.is_durable());
+        assert!(!injected.is_consolidation_eligible());
+
+        let mut system = base.clone();
+        system.origin = NormalizedEventOrigin::System;
+        system.role = NormalizedEventRole::SystemPrompt;
+        assert!(system.is_injected_content());
+        assert!(system.is_operational());
+        assert!(!system.is_durable());
+
+        let mut lifecycle = base.clone();
+        lifecycle.kind = NormalizedEventKind::SessionEnded;
+        lifecycle.origin = NormalizedEventOrigin::System;
+        lifecycle.role = NormalizedEventRole::Lifecycle;
+        assert!(lifecycle.is_operational());
+        assert!(!lifecycle.is_durable());
+        assert!(!lifecycle.is_consolidation_eligible());
     }
 }

@@ -11,10 +11,12 @@ pub use retrieval::{
 };
 pub use session::ReinforcementSignal;
 pub use session::{
-    EpisodeEvidencePacket, EpisodeState, EvidenceItem, EvidenceKind, HandoffStatus,
-    HandoffValidation, IntentClassificationSource, NormalizedEvent, NormalizedEventKind,
-    NormalizedEventOrigin, NormalizedEventRole, NormalizedSession, PromptIntent, PromptIntentKind,
-    SessionImporter, SessionState, TaskEpisode, TaskHandoff,
+    ConsolidationResponse, EpisodeEvidencePacket, EpisodeState, EvidenceItem, EvidenceKind,
+    Goal, GoalOperation, GoalOperationKind, GoalState, HandoffReplacement, HandoffStatus,
+    HandoffValidation, IntentClassificationSource, MemoryOperation, NormalizedEvent,
+    NormalizedEventKind, NormalizedEventOrigin, NormalizedEventRole, NormalizedSession,
+    ProjectHandoff, PromptIntent, PromptIntentKind, SessionImporter, SessionState, TaskEpisode,
+    TaskHandoff,
 };
 
 pub type EventOrigin = NormalizedEventOrigin;
