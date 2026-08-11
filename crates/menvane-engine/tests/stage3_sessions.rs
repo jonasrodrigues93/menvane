@@ -2,12 +2,76 @@ use std::fs;
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use menvane_domain::{NormalizedEvent, NormalizedEventKind};
+use menvane_domain::{
+    NormalizedEvent, NormalizedEventKind, NormalizedEventOrigin, NormalizedEventRole,
+};
 use menvane_engine::{CaptureOutcome, Menvane, ScopeSelection};
 use rusqlite::Connection;
 use tempfile::TempDir;
 
 mod common;
+
+#[test]
+fn injected_context_is_stripped_from_composed_user_prompts() {
+    let temporary = TempDir::new().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
+    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+    let mut prompt = event(&project, "composed", NormalizedEventKind::UserPrompt);
+    prompt.bounded_input = Some(
+        "Implement the export\nMENVANE MEMORY CONTEXT\nHistorical context only.\n[REQUIRED CONTEXT]\nTitle: x\nEND MENVANE MEMORY CONTEXT\n<available-skills>\n- browser-control\n</available-skills>\nContinue the export"
+            .to_owned(),
+    );
+    assert_eq!(
+        menvane.ingest_event(prompt.clone()).unwrap(),
+        CaptureOutcome::Stored
+    );
+    let connection =
+        Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
+    let payload: String = connection
+        .query_row(
+            "SELECT payload_json FROM session_events WHERE event_id='composed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: NormalizedEvent = serde_json::from_str(&payload).unwrap();
+    assert!(stored.is_user_prompt());
+    assert!(stored.is_consolidation_eligible());
+    assert_eq!(
+        stored.bounded_input.as_deref(),
+        Some("Implement the export\nContinue the export")
+    );
+}
+
+#[test]
+fn injected_and_system_events_are_operational_evidence_only() {
+    let temporary = TempDir::new().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
+    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+    let system = NormalizedEvent {
+        harness_injected: true,
+        ..event(&project, "system-prompt", NormalizedEventKind::UserPrompt)
+    };
+    assert!(!system.is_user_prompt());
+    assert!(system.is_operational());
+    assert!(!system.is_durable());
+    assert!(!system.is_consolidation_eligible());
+    assert_eq!(
+        menvane.ingest_event(system).unwrap(),
+        CaptureOutcome::Stored
+    );
+
+    let mut skill = event(&project, "skill", NormalizedEventKind::ToolCompleted);
+    skill.role = NormalizedEventRole::SystemPrompt;
+    skill.origin = NormalizedEventOrigin::System;
+    assert!(!skill.is_durable());
+    assert!(!skill.is_consolidation_eligible());
+    assert!(skill.is_operational());
+}
 
 #[test]
 fn capture_is_bounded_idempotent_and_reopens_finalized_sessions() {
@@ -314,6 +378,7 @@ fn event(project: &std::path::Path, id: &str, kind: NormalizedEventKind) -> Norm
         attributed_path: None,
         success: None,
         model: Some("test-model".to_owned()),
+        harness_injected: false,
     }
 }
 
