@@ -218,10 +218,7 @@ CREATE TABLE IF NOT EXISTS handoffs (
     FOREIGN KEY(episode_id) REFERENCES task_episodes(id),
     FOREIGN KEY(source_session_id) REFERENCES sessions(id)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS handoffs_current_episode
-    ON handoffs(episode_id)
-    WHERE status IN ('active', 'ready', 'consumed');
-CREATE INDEX IF NOT EXISTS handoffs_project_status ON handoffs(project_id, status, updated_at DESC);
+ CREATE INDEX IF NOT EXISTS handoffs_project_status ON handoffs(project_id, status, updated_at DESC);
 CREATE TABLE IF NOT EXISTS handoff_versions (
     handoff_id TEXT NOT NULL,
     revision INTEGER NOT NULL,
@@ -273,6 +270,7 @@ pub const MAX_HANDOFF_CHANGED_FILES: usize = 128;
 pub const MAX_HANDOFF_TOTAL_BYTES: usize = 32_768;
 pub const MAX_HANDOFF_VERSIONS: usize = 100;
 pub const MAX_CHECKPOINT_DEBOUNCE_SECONDS: i64 = 86_400;
+pub const GLOBAL_HANDOFF_KEY: &str = "__global__";
 
 const OPERATIONAL_TABLES: &[(&str, &str)] = &[
     (
@@ -494,6 +492,10 @@ impl SessionRepository {
         connection.execute_batch("PRAGMA journal_mode=WAL;")?;
         connection.execute_batch(SESSION_SCHEMA)?;
         apply_migrations(&connection)?;
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS handoffs_current_project ON handoffs(COALESCE(project_id, '__global__')) WHERE status IN ('active', 'ready', 'consumed')",
+            [],
+        )?;
         if let Some(legacy_index) = legacy_index
             && legacy_index != self.path.as_path()
             && legacy_index.exists()
@@ -1060,50 +1062,44 @@ impl SessionRepository {
         let handoff = validate_handoff(&transaction, handoff)?;
         let current_id: Option<String> = transaction
             .query_row(
-                "SELECT id FROM handoffs WHERE episode_id=?1 AND status IN ('active', 'ready', 'consumed')",
-                [handoff.episode_id.to_string()],
+                "SELECT id FROM handoffs WHERE COALESCE(project_id, ?1)=COALESCE(?2, ?1) AND status IN ('active', 'ready', 'consumed') ORDER BY updated_at DESC, id DESC LIMIT 1",
+                params![GLOBAL_HANDOFF_KEY, handoff.project_id],
                 |row| row.get(0),
             )
             .optional()?;
+        let mut current_id = current_id;
+        if let Some(current_id_value) = current_id.clone() {
+            let current = handoff_by_id(&transaction, Uuid::parse_str(&current_id_value)?)?;
+            if handoff_is_contaminated(&current) {
+                store_handoff_revision(&transaction, &current)?;
+                update_handoff_status(
+                    &transaction,
+                    current.id,
+                    HandoffStatus::Superseded,
+                    current_revision(&transaction, current.id)? + 1,
+                )?;
+                current_id = None;
+            }
+        }
         let existing = handoff_by_id_optional(&transaction, handoff.id)?;
         if let Some(current_id) = current_id {
             let current = handoff_by_id(&transaction, Uuid::parse_str(&current_id)?)?;
-            if current.id == handoff.id {
-                let mut next = handoff.clone();
-                next.created_at = current.created_at;
-                if current.status == HandoffStatus::Consumed
-                    && same_handoff_content(&current, &next)
-                {
-                    transaction.commit()?;
-                    return Ok(current);
-                }
-                if current == next {
-                    transaction.commit()?;
-                    return Ok(current);
-                }
-                if !is_current_handoff_status(current.status) {
-                    bail!("terminal handoff cannot be updated");
-                }
-                store_handoff_revision(&transaction, &current)?;
-                update_handoff(
-                    &transaction,
-                    &next,
-                    current_revision(&transaction, current.id)? + 1,
-                )?;
-                replace_handoff_evidence(&transaction, &next)?;
+            let mut next = handoff.clone();
+            next.id = current.id;
+            next.created_at = current.created_at;
+            if current == next {
                 transaction.commit()?;
-                return Ok(next);
-            }
-            if existing.is_some() {
-                bail!("handoff id is already used by another snapshot");
+                return Ok(current);
             }
             store_handoff_revision(&transaction, &current)?;
-            update_handoff_status(
+            update_handoff(
                 &transaction,
-                current.id,
-                HandoffStatus::Superseded,
+                &next,
                 current_revision(&transaction, current.id)? + 1,
             )?;
+            replace_handoff_evidence(&transaction, &next)?;
+            transaction.commit()?;
+            return Ok(next);
         } else if let Some(existing) = existing {
             if existing == handoff {
                 transaction.commit()?;
@@ -1150,8 +1146,20 @@ impl SessionRepository {
         let connection = self.open()?;
         connection
             .query_row(
-                CURRENT_HANDOFF_BY_EPISODE_SELECT,
+                &format!("{CURRENT_HANDOFF_BY_EPISODE_SELECT} AND {CLEAN_HANDOFF_SQL}"),
                 [episode_id.to_string()],
+                handoff_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn current_handoff(&self, project_id: Option<&str>) -> Result<Option<TaskHandoff>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                &format!("{CURRENT_HANDOFF_BY_PROJECT_SELECT} AND {CLEAN_HANDOFF_SQL}"),
+                params![GLOBAL_HANDOFF_KEY, project_id],
                 handoff_from_row,
             )
             .optional()
@@ -2095,6 +2103,8 @@ impl SessionRepository {
 }
 
 const CURRENT_HANDOFF_BY_EPISODE_SELECT: &str = "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE episode_id=?1 AND status IN ('active', 'ready', 'consumed')";
+const CURRENT_HANDOFF_BY_PROJECT_SELECT: &str = "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE COALESCE(project_id, ?1)=COALESCE(?2, ?1) AND status IN ('active', 'ready', 'consumed')";
+const CLEAN_HANDOFF_SQL: &str = "lower(goal) NOT LIKE '%agents.md%' AND lower(goal) NOT LIKE '%skill.md%' AND lower(goal) NOT LIKE '%<available-skills>%' AND lower(goal) NOT LIKE '%<recommended_plugins>%' AND lower(current_state) NOT LIKE '%agents.md%' AND lower(current_state) NOT LIKE '%skill.md%' AND lower(current_state) NOT LIKE '%<available-skills>%' AND lower(current_state) NOT LIKE '%<recommended_plugins>%' AND lower(completed_work_json) NOT LIKE '%agents.md%' AND lower(completed_work_json) NOT LIKE '%skill.md%' AND lower(pending_work_json) NOT LIKE '%agents.md%' AND lower(pending_work_json) NOT LIKE '%skill.md%' AND lower(blockers_json) NOT LIKE '%agents.md%' AND lower(blockers_json) NOT LIKE '%skill.md%' AND lower(changed_files_json) NOT LIKE '%agents.md%' AND lower(changed_files_json) NOT LIKE '%skill.md%' AND lower(decisions_json) NOT LIKE '%agents.md%' AND lower(decisions_json) NOT LIKE '%skill.md%' AND lower(validation_json) NOT LIKE '%agents.md%' AND lower(validation_json) NOT LIKE '%skill.md%'";
 
 fn list_handoffs_for_candidates(
     connection: &Connection,
@@ -2106,11 +2116,11 @@ fn list_handoffs_for_candidates(
     let limit = i64::try_from(limit)?;
     let mut statement = if conversation_key.is_some() {
         connection.prepare(
-            "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE project_id IS ?1 AND conversation_key=?2 AND status IN ('active', 'ready', 'consumed') ORDER BY updated_at DESC, id DESC LIMIT ?3",
+            &format!("SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE project_id IS ?1 AND conversation_key=?2 AND status IN ('active', 'ready', 'consumed') AND {CLEAN_HANDOFF_SQL} ORDER BY updated_at DESC, id DESC LIMIT ?3"),
         )?
     } else {
         connection.prepare(
-            "SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE project_id IS ?1 AND status IN ('active', 'ready', 'consumed') ORDER BY updated_at DESC, id DESC LIMIT ?2",
+            &format!("SELECT id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, created_at, updated_at FROM handoffs WHERE project_id IS ?1 AND status IN ('active', 'ready', 'consumed') AND {CLEAN_HANDOFF_SQL} ORDER BY updated_at DESC, id DESC LIMIT ?2"),
         )?
     };
     let rows = if let Some(conversation_key) = conversation_key {
@@ -2201,6 +2211,9 @@ fn validate_handoff(transaction: &Transaction<'_>, input: &TaskHandoff) -> Resul
         bail!("handoff creation and update require active or ready status");
     }
     let mut handoff = input.clone();
+    if handoff_is_contaminated(&handoff) {
+        bail!("handoff contains agent instructions");
+    }
     handoff.project_id = handoff
         .project_id
         .map(|value| bounded_identifier(&value, "project id", MAX_HANDOFF_ITEM_BYTES))
@@ -2290,6 +2303,42 @@ fn validate_handoff(transaction: &Transaction<'_>, input: &TaskHandoff) -> Resul
     }
     validate_handoff_relationships(transaction, &handoff)?;
     Ok(handoff)
+}
+
+fn handoff_is_contaminated(handoff: &TaskHandoff) -> bool {
+    handoff_texts(handoff).iter().any(|value| {
+        let value = value.to_ascii_lowercase();
+        [
+            "agents.md",
+            "skill.md",
+            "<available-skills>",
+            "<recommended_plugins>",
+            "system prompt",
+            "agent instruction",
+        ]
+        .iter()
+        .any(|marker| value.contains(marker))
+    })
+}
+
+fn handoff_texts(handoff: &TaskHandoff) -> Vec<&str> {
+    handoff
+        .completed_work
+        .iter()
+        .chain(handoff.pending_work.iter())
+        .chain(handoff.blockers.iter())
+        .chain(handoff.changed_files.iter())
+        .chain(handoff.decisions.iter())
+        .chain(std::iter::once(&handoff.goal))
+        .chain(std::iter::once(&handoff.current_state))
+        .chain(handoff.next_action.iter())
+        .chain(handoff.validation.iter().flat_map(|value| {
+            std::iter::once(&value.event_id)
+                .chain(value.command.iter())
+                .chain(std::iter::once(&value.summary))
+        }))
+        .map(String::as_str)
+        .collect()
 }
 
 fn bounded_list(values: Vec<String>, name: &str) -> Result<Vec<String>> {
@@ -2392,16 +2441,13 @@ fn validate_handoff_relationships(
     if episode.0 != handoff.project_id || episode.1 != handoff.conversation_key {
         bail!("handoff episode project or conversation does not match");
     }
-    let source: (String, Option<String>, String) = transaction.query_row(
-        "SELECT client, project_id, conversation_key FROM sessions WHERE id=?1",
+    let source: (String, Option<String>) = transaction.query_row(
+        "SELECT client, project_id FROM sessions WHERE id=?1",
         [handoff.source_session_id.to_string()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if source.0 != handoff.source_client
-        || source.1 != handoff.project_id
-        || source.2 != handoff.conversation_key
-    {
-        bail!("handoff source session does not match its episode");
+    if source.0 != handoff.source_client || source.1 != handoff.project_id {
+        bail!("handoff source session does not match its project");
     }
     for event_id in &handoff.source_event_ids {
         validate_handoff_event(transaction, handoff, event_id)?;
@@ -2417,35 +2463,14 @@ fn validate_handoff_event(
     handoff: &TaskHandoff,
     event_id: &str,
 ) -> Result<String> {
-    let (source_session_id, project_id, conversation_key): (String, Option<String>, String) =
+    let (source_session_id, project_id): (String, Option<String>) =
         transaction.query_row(
-            "SELECT e.session_id, s.project_id, s.conversation_key FROM session_events e JOIN sessions s ON s.id=e.session_id WHERE e.event_id=?1",
+            "SELECT e.session_id, s.project_id FROM session_events e JOIN sessions s ON s.id=e.session_id WHERE e.event_id=?1",
             [event_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-    if project_id != handoff.project_id || conversation_key != handoff.conversation_key {
-        bail!("handoff evidence event does not match its conversation or project");
-    }
-    let assigned_episode: Option<String> = transaction
-        .query_row(
-            "SELECT episode_id FROM event_episode_links WHERE event_id=?1",
-            [event_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .or(transaction
-            .query_row(
-                "SELECT episode_id FROM prompt_intents WHERE event_id=?1",
-                [event_id],
-                |row| row.get(0),
-            )
-            .optional()?);
-    let episode_id = handoff.episode_id.to_string();
-    if assigned_episode
-        .as_deref()
-        .is_some_and(|assigned| assigned != episode_id.as_str())
-    {
-        bail!("handoff evidence prompt belongs to another episode");
+    if project_id != handoff.project_id {
+        bail!("handoff evidence event does not match its project");
     }
     Ok(source_session_id)
 }
@@ -2639,16 +2664,6 @@ fn is_current_handoff_status(status: HandoffStatus) -> bool {
         status,
         HandoffStatus::Active | HandoffStatus::Ready | HandoffStatus::Consumed
     )
-}
-
-fn same_handoff_content(left: &TaskHandoff, right: &TaskHandoff) -> bool {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    left.status = HandoffStatus::Active;
-    right.status = HandoffStatus::Active;
-    left.created_at = right.created_at;
-    left.updated_at = right.updated_at;
-    left == right
 }
 
 fn handoff_status(status: HandoffStatus) -> &'static str {
@@ -2955,6 +2970,10 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
     if current < 10 {
         migrate_to_version_10(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (10)", [])?;
+    }
+    if current < 11 {
+        migrate_to_version_11(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (11)", [])?;
     }
     Ok(())
 }
@@ -3264,6 +3283,34 @@ fn migrate_to_version_10(connection: &Connection) -> Result<()> {
              PRIMARY KEY(client, conversation_key, generation, handoff_id, delivery_kind),
              FOREIGN KEY(handoff_id) REFERENCES handoffs(id)
          );",
+    )?;
+    Ok(())
+}
+
+fn migrate_to_version_11(connection: &Connection) -> Result<()> {
+    connection.execute("DROP INDEX IF EXISTS handoffs_current_episode", [])?;
+    connection.execute(
+        &format!(
+            "UPDATE handoffs SET status='superseded' WHERE status IN ('active', 'ready', 'consumed') AND NOT ({CLEAN_HANDOFF_SQL})"
+        ),
+        [],
+    )?;
+    connection.execute(
+        "UPDATE handoffs SET status='superseded' WHERE id IN (
+             SELECT id FROM (
+                 SELECT id, ROW_NUMBER() OVER (
+                     PARTITION BY COALESCE(project_id, '__global__')
+                     ORDER BY updated_at DESC, id DESC
+                 ) AS rank
+                 FROM handoffs
+                 WHERE status IN ('active', 'ready', 'consumed')
+             ) WHERE rank > 1
+         )",
+        [],
+    )?;
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS handoffs_current_project ON handoffs(COALESCE(project_id, '__global__')) WHERE status IN ('active', 'ready', 'consumed')",
+        [],
     )?;
     Ok(())
 }

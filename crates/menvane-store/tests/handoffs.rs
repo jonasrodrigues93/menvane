@@ -83,18 +83,18 @@ fn handoff_lifecycle_is_idempotent_and_preserves_versions() {
         "active",
         "newer replacement",
     );
-    repository.create_or_update_handoff(&newer).unwrap();
+    let newer = repository.create_or_update_handoff(&newer).unwrap();
     assert_eq!(
         repository
             .handoff_for_episode(episode.id)
             .unwrap()
             .unwrap()
             .id,
-        newer.id
+        replacement.id
     );
     assert_eq!(
         repository.handoff(replacement.id).unwrap().status,
-        HandoffStatus::Superseded
+        HandoffStatus::Active
     );
     assert_eq!(
         repository
@@ -383,11 +383,9 @@ fn evidence_relationships_and_bounds_are_checked_before_persistence() {
     let mut conflicting_prompt =
         handoff(&session, &episode, "conflicting-prompt", "active", "state");
     conflicting_prompt.source_event_ids = vec!["prompt-other".to_owned()];
-    assert!(
-        repository
-            .create_or_update_handoff(&conflicting_prompt)
-            .is_err()
-    );
+    repository
+        .create_or_update_handoff(&conflicting_prompt)
+        .unwrap();
 
     let mut oversized = handoff(&session, &episode, "oversized", "active", "state");
     oversized.goal = "x".repeat(2_049);
@@ -485,6 +483,163 @@ fn state_reopen_preserves_handoffs_versions_and_evidence() {
     assert!(reopened.checkpoint_state(episode.id).unwrap().dirty);
 }
 
+#[test]
+fn current_handoff_identity_is_project_scoped_and_global_is_explicitly_unique() {
+    let (_temporary, repository, session, episode) = setup();
+    let first = handoff(&session, &episode, "project-first", "ready", "first");
+    repository.create_or_update_handoff(&first).unwrap();
+    repository
+        .ingest(
+            &event(
+                "project-prompt-2",
+                "external",
+                NormalizedEventKind::UserPrompt,
+                2,
+            ),
+            Some("project-a"),
+        )
+        .unwrap();
+    let second_episode = repository
+        .create_episode(session.id, "project-prompt-2", "second episode")
+        .unwrap();
+    let second = handoff(
+        &session,
+        &second_episode,
+        "project-second",
+        "ready",
+        "second",
+    );
+    let stored = repository.create_or_update_handoff(&second).unwrap();
+    assert_eq!(stored.id, first.id);
+    assert_eq!(
+        repository
+            .project_handoffs("project-a", None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let global_session = repository
+        .ingest(
+            &event(
+                "global-start",
+                "global-external",
+                NormalizedEventKind::SessionStarted,
+                3,
+            ),
+            None,
+        )
+        .unwrap()
+        .session;
+    repository
+        .ingest(
+            &event(
+                "global-prompt",
+                "global-external",
+                NormalizedEventKind::UserPrompt,
+                4,
+            ),
+            None,
+        )
+        .unwrap();
+    let global_episode = repository
+        .create_episode(global_session.id, "global-prompt", "global episode")
+        .unwrap();
+    let mut global = handoff(
+        &global_session,
+        &global_episode,
+        "global",
+        "ready",
+        "global",
+    );
+    global.source_event_ids = vec!["global-prompt".to_owned()];
+    repository.create_or_update_handoff(&global).unwrap();
+    let mut global_update = global.clone();
+    global_update.id = Uuid::now_v7();
+    global_update.current_state = "global update".to_owned();
+    assert_eq!(
+        repository
+            .create_or_update_handoff(&global_update)
+            .unwrap()
+            .id,
+        global.id
+    );
+    assert_eq!(
+        repository.current_handoff(None).unwrap().unwrap().id,
+        global.id
+    );
+    assert_eq!(
+        repository
+            .current_handoff(Some("project-a"))
+            .unwrap()
+            .unwrap()
+            .id,
+        first.id
+    );
+}
+
+#[test]
+fn migration_quarantines_contaminated_and_deduplicates_episode_handoffs() {
+    let (temporary, repository, session, episode) = setup();
+    let first = handoff(&session, &episode, "legacy-first", "ready", "first");
+    repository.create_or_update_handoff(&first).unwrap();
+    repository
+        .ingest(
+            &event(
+                "legacy-prompt-2",
+                "external",
+                NormalizedEventKind::UserPrompt,
+                2,
+            ),
+            Some("project-a"),
+        )
+        .unwrap();
+    let second_episode = repository
+        .create_episode(session.id, "legacy-prompt-2", "legacy second")
+        .unwrap();
+    let connection = rusqlite::Connection::open(temporary.path().join("state.sqlite")).unwrap();
+    connection
+        .execute("DROP INDEX handoffs_current_project", [])
+        .unwrap();
+    let second_id = Uuid::now_v7();
+    connection
+        .execute(
+            "INSERT INTO handoffs(id, project_id, conversation_key, episode_id, source_session_id, source_client, status, goal, current_state, completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, revision, created_at, updated_at)
+             SELECT ?1, project_id, conversation_key, ?2, source_session_id, source_client, status, goal, 'newer state', completed_work_json, pending_work_json, next_action, blockers_json, changed_files_json, decisions_json, validation_json, relevant_memory_ids_json, source_event_ids_json, git_head, worktree_state_hash, revision, created_at, ?3 FROM handoffs WHERE id=?4",
+            rusqlite::params![
+                second_id.to_string(),
+                second_episode.id.to_string(),
+                timestamp(99).to_rfc3339(),
+                first.id.to_string()
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE handoffs SET goal='AGENTS.md contaminated' WHERE id=?1",
+            [first.id.to_string()],
+        )
+        .unwrap();
+    connection
+        .execute("DELETE FROM schema_migrations WHERE version=11", [])
+        .unwrap();
+    drop(connection);
+    let reopened = SessionRepository::new(temporary.path().join("state.sqlite"));
+    reopened.initialize().unwrap();
+    assert_eq!(
+        reopened
+            .current_handoff(Some("project-a"))
+            .unwrap()
+            .unwrap()
+            .id,
+        second_id
+    );
+    assert_eq!(
+        reopened.handoff(first.id).unwrap().status,
+        HandoffStatus::Superseded
+    );
+}
+
 fn setup() -> (
     TempDir,
     SessionRepository,
@@ -559,6 +714,8 @@ fn event(
     NormalizedEvent {
         event_id: id.to_owned(),
         kind,
+        origin: Default::default(),
+        role: Default::default(),
         client: "client".to_owned(),
         external_session_id: external_session_id.to_owned(),
         timestamp: timestamp(seconds),

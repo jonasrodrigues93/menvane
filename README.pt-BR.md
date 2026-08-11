@@ -36,7 +36,7 @@ O Menvane foi criado para equipes e desenvolvedores que querem que os agentes se
 
 ### Continuidade entre sessões
 
-O Menvane agrupa a atividade em episódios de tarefa e cria um handoff atual por episódio. Uma sessão posterior recebe contexto limitado e validado pelo repositório, em vez de reconstruir a tarefa a partir de uma transcrição.
+O Menvane agrupa a atividade em episódios de tarefa e mantém um handoff atual e versionado por projeto. Uma sessão posterior recebe contexto limitado e validado pelo repositório, em vez de reconstruir a tarefa a partir de uma transcrição.
 
 ### Memória baseada em evidências
 
@@ -56,7 +56,7 @@ Claude Code, Codex e OpenCode usam o mesmo limite de captura, sanitização, rec
 Sessão do agente
        |
        v
-Captura -> sanitização -> episódio de tarefa -> handoff
+Captura -> sanitização -> episódio de tarefa -> consolidação LLM -> handoff do projeto
                                              |
                                              v
                                      memória baseada em evidências
@@ -86,7 +86,7 @@ O Menvane suporta Linux, macOS e WSL. Windows nativo ainda não é um alvo de re
 
 ### Ative a compilação de memória
 
-Captura, busca, handoffs e operações manuais de memória funcionam sem um provedor de modelo de linguagem. Para ativar a consolidação baseada em evidências com OpenAI:
+Captura, busca e operações manuais de memória funcionam sem um provedor de modelo de linguagem. A consolidação de handoff e memória baseada em evidências exige um provider configurado. Para ativar a consolidação com OpenAI:
 
 ```bash
 menvane provider configure openai --model gpt-5.6-luna --reasoning-effort medium

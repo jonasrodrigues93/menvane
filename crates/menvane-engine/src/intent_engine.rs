@@ -1,7 +1,7 @@
 use anyhow::Result;
 use menvane_domain::{
-    EpisodeState, IntentClassificationSource, NormalizedEvent, NormalizedEventKind, PromptIntent,
-    PromptIntentKind, TaskEpisode,
+    EpisodeState, IntentClassificationSource, NormalizedEvent, PromptIntent, PromptIntentKind,
+    TaskEpisode,
 };
 use menvane_store::{SessionRecord, SessionRepository};
 use serde::Serialize;
@@ -73,7 +73,7 @@ impl<'a> IntentEngine<'a> {
         event: &NormalizedEvent,
         session: &SessionRecord,
     ) -> Result<Option<PromptIntent>> {
-        if event.kind != NormalizedEventKind::UserPrompt {
+        if !event.is_user_prompt() {
             return Ok(None);
         }
         if let Ok(intent) = self.repository.prompt_intent(&event.event_id) {

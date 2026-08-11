@@ -55,7 +55,7 @@ fn migration_backfills_the_deterministic_conversation_identity() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        10
+        11
     );
 }
 
@@ -346,6 +346,8 @@ fn event(
     NormalizedEvent {
         event_id: event_id.to_owned(),
         kind,
+        origin: Default::default(),
+        role: Default::default(),
         client: "client".to_owned(),
         external_session_id: external_session_id.to_owned(),
         timestamp: timestamp(seconds),

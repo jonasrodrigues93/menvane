@@ -147,7 +147,7 @@ pub fn compilation_input(fixture: &Fixture) -> CompilationInput {
     let events = &fixture.session.events;
     let goal_event = events
         .iter()
-        .find(|event| event.kind == NormalizedEventKind::UserPrompt)
+        .find(|event| event.is_user_prompt())
         .or_else(|| events.first())
         .unwrap();
     let goal = EvidenceItem {
@@ -164,7 +164,7 @@ pub fn compilation_input(fixture: &Fixture) -> CompilationInput {
         .session
         .events
         .iter()
-        .filter(|event| event.kind == NormalizedEventKind::UserPrompt)
+        .filter(|event| event.is_user_prompt())
         .map(|event| EvidenceItem {
             event_id: event.event_id.clone(),
             kind: EvidenceKind::Prompt,

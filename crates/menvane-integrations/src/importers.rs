@@ -3,7 +3,10 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use menvane_domain::{NormalizedEvent, NormalizedEventKind, NormalizedSession, SessionImporter};
+use menvane_domain::{
+    NormalizedEvent, NormalizedEventKind, NormalizedEventOrigin, NormalizedEventRole,
+    NormalizedSession, SessionImporter,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -117,7 +120,9 @@ impl JsonlImporter {
                 find_string(&record, &["session_id", "sessionId", "id"]).map(str::to_owned)
             });
             cwd = cwd.or_else(|| find_string(&record, &["cwd"]).map(str::to_owned));
-            if let Some((kind, input, output, tool, success)) = normalize_record(&record) {
+            if let Some((kind, input, output, tool, success, origin, role)) =
+                normalize_record(&record)
+            {
                 let timestamp = find_string(&record, &["timestamp", "created_at"])
                     .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                     .map(|value| value.with_timezone(&Utc))
@@ -132,6 +137,8 @@ impl JsonlImporter {
                         .as_bytes(),
                     )),
                     kind,
+                    origin,
+                    role,
                     client: self.client.clone(),
                     external_session_id: String::new(),
                     timestamp,
@@ -211,6 +218,8 @@ type ImportedEvent = (
     Option<String>,
     Option<String>,
     Option<bool>,
+    NormalizedEventOrigin,
+    NormalizedEventRole,
 );
 
 impl OpenCodeImporter {
@@ -250,12 +259,16 @@ impl OpenCodeImporter {
             let cwd = find_string(&summary, &["directory", "cwd"]).map(str::to_owned);
             let session_timestamp = find_timestamp(&summary).unwrap_or_else(Utc::now);
             for (index, message) in messages.into_iter().enumerate() {
-                if let Some((kind, input, output, tool, success)) = normalize_record(&message) {
+                if let Some((kind, input, output, tool, success, origin, role)) =
+                    normalize_record(&message)
+                {
                     events.push(NormalizedEvent {
                         event_id: hex::encode(Sha256::digest(
                             format!("opencode:{id}:{index}").as_bytes(),
                         )),
                         kind,
+                        origin,
+                        role,
                         client: "opencode".to_owned(),
                         external_session_id: id.to_owned(),
                         timestamp: find_timestamp(&message).unwrap_or(session_timestamp),
@@ -329,6 +342,8 @@ fn normalize_record(record: &Value) -> Option<ImportedEvent> {
             block.get("content").and_then(content_text),
             Some("tool".to_owned()),
             Some(block.get("is_error").and_then(Value::as_bool) != Some(true)),
+            NormalizedEventOrigin::Tool,
+            NormalizedEventRole::ToolActivity,
         ))
     } else if blocks.is_some_and(|blocks| {
         blocks
@@ -344,9 +359,39 @@ fn normalize_record(record: &Value) -> Option<ImportedEvent> {
             None,
             find_string(block, &["name"]).map(str::to_owned),
             None,
+            NormalizedEventOrigin::Tool,
+            NormalizedEventRole::ToolActivity,
         ))
     } else if role.contains("user") {
-        Some((NormalizedEventKind::UserPrompt, content, None, None, None))
+        Some((
+            NormalizedEventKind::UserPrompt,
+            content,
+            None,
+            None,
+            None,
+            NormalizedEventOrigin::User,
+            NormalizedEventRole::UserPrompt,
+        ))
+    } else if role.contains("system") {
+        Some((
+            NormalizedEventKind::UserPrompt,
+            content,
+            None,
+            None,
+            None,
+            NormalizedEventOrigin::System,
+            NormalizedEventRole::SystemPrompt,
+        ))
+    } else if role.contains("assistant") {
+        Some((
+            NormalizedEventKind::UserPrompt,
+            content,
+            None,
+            None,
+            None,
+            NormalizedEventOrigin::Agent,
+            NormalizedEventRole::AgentInstruction,
+        ))
     } else if role.contains("tool") || record.get("tool_name").is_some() {
         Some((
             NormalizedEventKind::ToolCompleted,
@@ -357,6 +402,8 @@ fn normalize_record(record: &Value) -> Option<ImportedEvent> {
                 .map(Value::to_string),
             find_string(record, &["tool_name", "name"]).map(str::to_owned),
             record.get("success").and_then(Value::as_bool),
+            NormalizedEventOrigin::Tool,
+            NormalizedEventRole::ToolActivity,
         ))
     } else {
         None
@@ -422,6 +469,8 @@ fn boundary_event(
             format!("{client}:{session}:{suffix}").as_bytes(),
         )),
         kind,
+        origin: NormalizedEventOrigin::Importer,
+        role: NormalizedEventRole::Lifecycle,
         client: client.to_owned(),
         external_session_id: session.to_owned(),
         timestamp,
@@ -551,6 +600,28 @@ mod tests {
         assert_eq!(result.0, NormalizedEventKind::ToolCompleted);
         assert_eq!(result.3.as_deref(), Some("Bash"));
         assert_eq!(result.1.as_deref(), Some("{\"command\":\"cargo test\"}"));
+        assert_eq!(result.5, NormalizedEventOrigin::Tool);
+        assert_eq!(result.6, NormalizedEventRole::ToolActivity);
+    }
+
+    #[test]
+    fn imported_system_and_assistant_messages_are_not_user_prompts() {
+        let system = normalize_record(&serde_json::json!({
+            "role": "system",
+            "content": "<recommended_plugins>plugin metadata</recommended_plugins>"
+        }))
+        .unwrap();
+        assert_eq!(system.5, NormalizedEventOrigin::System);
+        assert_eq!(system.6, NormalizedEventRole::SystemPrompt);
+        assert_ne!(system.0, NormalizedEventKind::ToolCompleted);
+
+        let assistant = normalize_record(&serde_json::json!({
+            "role": "assistant",
+            "content": "agent instructions"
+        }))
+        .unwrap();
+        assert_eq!(assistant.5, NormalizedEventOrigin::Agent);
+        assert_eq!(assistant.6, NormalizedEventRole::AgentInstruction);
     }
 
     #[test]
@@ -560,6 +631,8 @@ mod tests {
         let event = |timestamp: DateTime<Utc>| NormalizedEvent {
             event_id: timestamp.to_rfc3339(),
             kind: NormalizedEventKind::UserPrompt,
+            origin: Default::default(),
+            role: Default::default(),
             client: "claude-code".to_owned(),
             external_session_id: timestamp.to_rfc3339(),
             timestamp,

@@ -541,11 +541,15 @@ pub fn home_from_environment() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use chrono::Utc;
     use menvane_domain::NormalizedEventKind;
-    use menvane_domain::{Applicability, MemoryType, Scope};
+    use menvane_domain::{
+        Applicability, JsonSchema, LlmError, LlmProvider, LlmRequest, MemoryType,
+        ProviderCapabilities, ProviderHealth, Scope, StructuredResponse,
+    };
     use menvane_engine::WriteMemory;
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -568,6 +572,8 @@ mod tests {
         let event = NormalizedEvent {
             event_id: "stable-event-id".to_owned(),
             kind: NormalizedEventKind::SessionStarted,
+            origin: Default::default(),
+            role: Default::default(),
             client: "test-client".to_owned(),
             external_session_id: "external-session".to_owned(),
             timestamp: Utc::now(),
@@ -633,6 +639,8 @@ mod tests {
         let event = NormalizedEvent {
             event_id: "server-session-start".to_owned(),
             kind: NormalizedEventKind::SessionStarted,
+            origin: Default::default(),
+            role: Default::default(),
             client: "claude-code".to_owned(),
             external_session_id: "shared-session".to_owned(),
             timestamp: Utc::now(),
@@ -814,7 +822,13 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let menvane = Arc::new(Menvane::new(temporary.path().join("home")).unwrap());
+        let menvane = Arc::new(
+            Menvane::new_with_provider(
+                temporary.path().join("home"),
+                Arc::new(ServerHandoffProvider),
+            )
+            .unwrap(),
+        );
         post_event(
             app(Arc::clone(&menvane)),
             &test_event(
@@ -986,6 +1000,65 @@ mod tests {
         assert_eq!(project_id, handoff.project_id.unwrap());
     }
 
+    struct ServerHandoffProvider;
+
+    #[async_trait]
+    impl LlmProvider for ServerHandoffProvider {
+        async fn generate_structured(
+            &self,
+            request: LlmRequest,
+            _schema: JsonSchema,
+        ) -> Result<StructuredResponse, LlmError> {
+            let input: Value = serde_json::from_str(&request.prompt).unwrap();
+            let evidence = &input["episode_evidence"];
+            let mut source_event_ids =
+                vec![evidence["goal"]["event_id"].as_str().unwrap().to_owned()];
+            for item in evidence["actions"].as_array().into_iter().flatten() {
+                source_event_ids.push(item["event_id"].as_str().unwrap().to_owned());
+            }
+            Ok(StructuredResponse {
+                value: json!({
+                    "operation": "create",
+                    "source_event_ids": source_event_ids,
+                    "fields": {
+                        "goal": evidence["goal"]["content"],
+                        "current_state": "server test state",
+                        "completed_work": [],
+                        "pending_work": ["continue the task"],
+                        "next_action": "continue the task",
+                        "blockers": [],
+                        "changed_files": [],
+                        "decisions": [],
+                        "validation": [],
+                        "relevant_memory_ids": []
+                    }
+                }),
+                provider: "server-test".to_owned(),
+                model: "test".to_owned(),
+            })
+        }
+
+        async fn health(&self) -> ProviderHealth {
+            ProviderHealth::Ready
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                structured_output: true,
+                json_schema: true,
+                embeddings: false,
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "server-test"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+    }
+
     fn test_event(
         project: &std::path::Path,
         event_id: &str,
@@ -995,6 +1068,8 @@ mod tests {
         NormalizedEvent {
             event_id: event_id.to_owned(),
             kind,
+            origin: Default::default(),
+            role: Default::default(),
             client: "server-test".to_owned(),
             external_session_id: "server-session".to_owned(),
             timestamp: Utc::now(),

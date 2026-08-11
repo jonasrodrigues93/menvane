@@ -8,6 +8,8 @@ use menvane_domain::{
 use menvane_store::EpisodeEvent;
 use uuid::Uuid;
 
+use crate::CaptureSanitizer;
+
 pub const DEFAULT_EVIDENCE_BUDGET_BYTES: usize = 32_768;
 pub const MAX_SESSION_MARKDOWN_BYTES: usize = 32_768;
 
@@ -29,6 +31,7 @@ impl EvidenceBuilder {
         if events.is_empty() {
             bail!("episode has no linked evidence");
         }
+        let sanitizer = CaptureSanitizer::new(Default::default())?;
         let event_by_id = events
             .iter()
             .map(|episode_event| (episode_event.event.event_id.as_str(), episode_event))
@@ -36,26 +39,28 @@ impl EvidenceBuilder {
         let root = event_by_id
             .get(episode.root_event_id.as_str())
             .copied()
-            .contextualize("episode root event is not linked")?;
+            .filter(|episode_event| episode_event.event.is_user_prompt())
+            .contextualize("episode root event is not an allowed user prompt")?;
         let intent_by_event = intents
             .iter()
             .map(|intent| (intent.event_id.as_str(), intent.kind))
             .collect::<HashMap<_, _>>();
         let mut candidates = CandidateSet::new(self.budget_bytes, episode.id);
 
-        candidates.required.push(item(
-            &root.event,
-            EvidenceKind::Goal,
-            root.event
-                .bounded_input
-                .as_deref()
-                .unwrap_or(episode.goal.as_str()),
-            1.0,
-        ));
+        let goal = root
+            .event
+            .bounded_input
+            .as_deref()
+            .and_then(|value| sanitizer.filter_content(value))
+            .or_else(|| sanitizer.filter_content(&episode.goal))
+            .contextualize("episode goal has no allowed content")?;
+        candidates
+            .required
+            .push(item(&root.event, EvidenceKind::Goal, &goal, 1.0));
 
         let mut prompts = Vec::new();
         for episode_event in events.iter().filter(|episode_event| {
-            episode_event.event.kind == NormalizedEventKind::UserPrompt
+            episode_event.event.is_user_prompt()
                 && episode_event.event.event_id != episode.root_event_id
         }) {
             let kind = intent_by_event
@@ -71,11 +76,16 @@ impl EvidenceBuilder {
                 PromptIntentKind::Operational => 0.20,
                 PromptIntentKind::RootGoal => 0.90,
             };
-            if let Some(input) = episode_event.event.bounded_input.as_deref() {
+            if let Some(input) = episode_event
+                .event
+                .bounded_input
+                .as_deref()
+                .and_then(|value| sanitizer.filter_content(value))
+            {
                 prompts.push((
                     priority,
                     episode_event.event.timestamp,
-                    item(&episode_event.event, EvidenceKind::Prompt, input, priority),
+                    item(&episode_event.event, EvidenceKind::Prompt, &input, priority),
                 ));
             }
         }
@@ -96,10 +106,15 @@ impl EvidenceBuilder {
         }
 
         let mut actions = BTreeMap::<String, Vec<&EpisodeEvent>>::new();
-        for episode_event in events
-            .iter()
-            .filter(|episode_event| episode_event.event.kind == NormalizedEventKind::ToolCompleted)
-        {
+        for episode_event in events.iter().filter(|episode_event| {
+            episode_event.event.kind == NormalizedEventKind::ToolCompleted
+                && episode_event.event.is_allowed_evidence()
+                && episode_event
+                    .event
+                    .attributed_path
+                    .as_deref()
+                    .is_none_or(|path| !sanitizer.path_is_ignored(path))
+        }) {
             let event = &episode_event.event;
             let key = format!(
                 "{}\0{}\0{}",
@@ -151,14 +166,20 @@ impl EvidenceBuilder {
                 && event
                     .bounded_output
                     .as_deref()
-                    .is_some_and(is_outcome_output)
+                    .and_then(|value| sanitizer.filter_content(value))
+                    .is_some_and(|value| is_outcome_output(&value))
             {
                 candidates.discoveries.push(item(
                     event,
                     EvidenceKind::Discovery,
                     &format!(
                         "{family} outcome: {}",
-                        excerpt(event.bounded_output.as_deref().unwrap_or_default(), 768)
+                        excerpt(
+                            &sanitizer
+                                .filter_content(event.bounded_output.as_deref().unwrap_or_default())
+                                .unwrap_or_default(),
+                            768,
+                        )
                     ),
                     0.68,
                 ));
@@ -174,7 +195,15 @@ impl EvidenceBuilder {
 
         let tool_events = events
             .iter()
-            .filter(|episode_event| episode_event.event.kind == NormalizedEventKind::ToolCompleted)
+            .filter(|episode_event| {
+                episode_event.event.kind == NormalizedEventKind::ToolCompleted
+                    && episode_event.event.is_allowed_evidence()
+                    && episode_event
+                        .event
+                        .attributed_path
+                        .as_deref()
+                        .is_none_or(|path| !sanitizer.path_is_ignored(path))
+            })
             .collect::<Vec<_>>();
         for episode_event in &tool_events {
             let event = &episode_event.event;
@@ -185,12 +214,14 @@ impl EvidenceBuilder {
             let attempted = event
                 .bounded_input
                 .as_deref()
+                .and_then(|value| sanitizer.filter_content(value))
                 .map(|value| format!(" attempted {value}"))
                 .unwrap_or_default();
             let output = event
                 .bounded_output
                 .as_deref()
-                .map(|value| format!(": {}", excerpt(value, 1_024)))
+                .and_then(|value| sanitizer.filter_content(value))
+                .map(|value| format!(": {}", excerpt(&value, 1_024)))
                 .unwrap_or_default();
             let resolution = tool_events
                 .iter()
@@ -220,13 +251,15 @@ impl EvidenceBuilder {
                 let input = event
                     .bounded_input
                     .as_deref()
+                    .and_then(|value| sanitizer.filter_content(value))
                     .map(|value| format!(" command: {value}"))
                     .unwrap_or_default();
                 let output = event
                     .bounded_output
                     .as_deref()
+                    .and_then(|value| sanitizer.filter_content(value))
                     .filter(|value| is_outcome_output(value))
-                    .map(|value| format!(": {}", excerpt(value, 768)))
+                    .map(|value| format!(": {}", excerpt(&value, 768)))
                     .unwrap_or_default();
                 candidates.validations.push(item(
                     event,
@@ -239,7 +272,7 @@ impl EvidenceBuilder {
 
         for event in events.iter().filter_map(|episode_event| {
             let event = &episode_event.event;
-            (event.kind == NormalizedEventKind::UserPrompt).then_some(event)
+            (event.is_user_prompt() && event.is_allowed_evidence()).then_some(event)
         }) {
             if event
                 .bounded_input
@@ -247,9 +280,11 @@ impl EvidenceBuilder {
                 .is_some_and(is_decision_prompt)
                 && let Some(input) = event.bounded_input.as_deref()
             {
-                candidates
-                    .decisions
-                    .push(item(event, EvidenceKind::Decision, input, 0.65));
+                if let Some(input) = sanitizer.filter_content(input) {
+                    candidates
+                        .decisions
+                        .push(item(event, EvidenceKind::Decision, &input, 0.65));
+                }
             }
             if event
                 .bounded_input
@@ -257,37 +292,23 @@ impl EvidenceBuilder {
                 .is_some_and(is_unresolved_question)
                 && let Some(input) = event.bounded_input.as_deref()
             {
-                candidates.unresolved_questions.push(item(
-                    event,
-                    EvidenceKind::UnresolvedQuestion,
-                    input,
-                    0.75,
-                ));
-            }
-        }
-
-        for episode_event in events.iter().filter(|episode_event| {
-            episode_event.event.kind == NormalizedEventKind::ContextCompacted
-        }) {
-            let event = &episode_event.event;
-            if let Some(context) = event
-                .bounded_input
-                .as_deref()
-                .or(event.bounded_output.as_deref())
-            {
-                candidates.compaction_context.push(item(
-                    event,
-                    EvidenceKind::CompactionContext,
-                    context,
-                    0.25,
-                ));
+                if let Some(input) = sanitizer.filter_content(input) {
+                    candidates.unresolved_questions.push(item(
+                        event,
+                        EvidenceKind::UnresolvedQuestion,
+                        &input,
+                        0.75,
+                    ));
+                }
             }
         }
 
         let mut files = events
             .iter()
+            .filter(|episode_event| episode_event.event.is_allowed_evidence())
             .filter_map(|episode_event| episode_event.event.attributed_path.as_deref())
             .filter(|path| !path.trim().is_empty())
+            .filter(|path| !sanitizer.path_is_ignored(path))
             .map(str::to_owned)
             .collect::<Vec<_>>();
         files.sort();

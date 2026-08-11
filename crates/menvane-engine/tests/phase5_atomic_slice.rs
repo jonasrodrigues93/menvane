@@ -2,8 +2,8 @@ use std::fs;
 
 use chrono::{Duration, TimeZone, Utc};
 use menvane_domain::{
-    EpisodeState, IntentClassificationSource, NormalizedEvent, NormalizedEventKind, PromptIntent,
-    PromptIntentKind, TaskEpisode,
+    EpisodeState, IntentClassificationSource, NormalizedEvent, NormalizedEventKind,
+    NormalizedEventOrigin, NormalizedEventRole, PromptIntent, PromptIntentKind, TaskEpisode,
 };
 use menvane_engine::{CaptureOutcome, EvidenceBuilder, Menvane};
 use menvane_store::EpisodeEvent;
@@ -100,12 +100,7 @@ fn packet_budget_priority_and_event_references_are_bounded() {
             .iter()
             .all(|item| item.event_id != "compact")
     );
-    assert!(
-        packet
-            .compaction_context
-            .iter()
-            .any(|item| item.event_id == "compact")
-    );
+    assert!(packet.compaction_context.is_empty());
     assert!(
         packet
             .unresolved_questions
@@ -127,6 +122,55 @@ fn packet_budget_priority_and_event_references_are_bounded() {
                 .any(|event| event.event.event_id == item.event_id)
         );
     }
+}
+
+#[test]
+fn instruction_and_metadata_events_are_excluded_from_evidence() {
+    let episode = episode();
+    let mut system = episode_event(
+        "system",
+        NormalizedEventKind::UserPrompt,
+        Some("<available-skills>agent instructions</available-skills>"),
+        None,
+    );
+    system.event.origin = NormalizedEventOrigin::System;
+    system.event.role = NormalizedEventRole::SystemPrompt;
+    let mut metadata = tool("metadata", "tool metadata", true, Some("AGENTS.md"), None);
+    metadata.event.origin = NormalizedEventOrigin::Tool;
+    metadata.event.role = NormalizedEventRole::ToolMetadata;
+    let mut compacted = episode_event(
+        "compacted",
+        NormalizedEventKind::ContextCompacted,
+        Some("<recommended_plugins>plugin metadata</recommended_plugins>"),
+        None,
+    );
+    compacted.event.origin = NormalizedEventOrigin::Compaction;
+    compacted.event.role = NormalizedEventRole::CompactionSummary;
+
+    let packet = EvidenceBuilder::new(4_096)
+        .build(
+            &episode,
+            &[
+                episode_event(
+                    "goal",
+                    NormalizedEventKind::UserPrompt,
+                    Some("Implement the export"),
+                    None,
+                ),
+                system,
+                metadata,
+                compacted,
+            ],
+            &[],
+        )
+        .unwrap();
+    let serialized = serde_json::to_string(&packet).unwrap();
+    assert!(!serialized.contains("available-skills"));
+    assert!(!serialized.contains("recommended_plugins"));
+    assert!(!serialized.contains("AGENTS.md"));
+    assert!(packet.goal.content.contains("Implement the export"));
+    assert!(packet.actions.is_empty());
+    assert!(packet.compaction_context.is_empty());
 }
 
 #[test]
@@ -293,6 +337,8 @@ fn episode_event(
         event: NormalizedEvent {
             event_id: id.to_owned(),
             kind,
+            origin: Default::default(),
+            role: Default::default(),
             client: "client".to_owned(),
             external_session_id: "session".to_owned(),
             timestamp: timestamp(id.len() as i64),
@@ -337,6 +383,8 @@ fn ingest(
     let event = NormalizedEvent {
         event_id: id.to_owned(),
         kind,
+        origin: Default::default(),
+        role: Default::default(),
         client: "client".to_owned(),
         external_session_id: "session".to_owned(),
         timestamp: Utc::now() + Duration::milliseconds(id.len() as i64),
@@ -363,6 +411,8 @@ fn ingest_tool(
     let mut event = NormalizedEvent {
         event_id: id.to_owned(),
         kind: NormalizedEventKind::ToolCompleted,
+        origin: Default::default(),
+        role: Default::default(),
         client: "client".to_owned(),
         external_session_id: "session".to_owned(),
         timestamp: Utc::now() + Duration::milliseconds(id.len() as i64),

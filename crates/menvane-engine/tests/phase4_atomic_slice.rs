@@ -1,8 +1,13 @@
 use std::fs;
 use std::process::Command;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use menvane_domain::{NormalizedEvent, NormalizedEventKind};
+use menvane_domain::{
+    JsonSchema, LlmError, LlmProvider, LlmRequest, NormalizedEvent, NormalizedEventKind,
+    ProviderCapabilities, ProviderHealth, StructuredResponse,
+};
 use menvane_engine::{CaptureOutcome, Menvane};
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -117,7 +122,7 @@ fn event_links_are_idempotent_cross_generation_and_isolated() {
     assert!(!topic_change_context.contains("[TASK HANDOFF]"));
     assert!(menvane.process_next_checkpoint_job_blocking());
     let handoffs = menvane.handoffs(&project).unwrap();
-    assert_eq!(handoffs.len(), 2);
+    assert_eq!(handoffs.len(), 1);
     assert!(
         handoffs
             .iter()
@@ -134,7 +139,7 @@ fn event_links_are_idempotent_cross_generation_and_isolated() {
 }
 
 #[test]
-fn checkpoint_generation_is_provider_free_and_flushes_debounced_work() {
+fn checkpoint_generation_uses_provider_and_flushes_debounced_work() {
     let (temporary, project, menvane) = setup();
     fs::create_dir_all(project.join("src")).unwrap();
     fs::write(project.join("src/lib.rs"), "pub fn edit() {}\n").unwrap();
@@ -163,6 +168,38 @@ fn checkpoint_generation_is_provider_free_and_flushes_debounced_work() {
 }
 
 #[test]
+fn provider_failure_keeps_checkpoint_evidence_retryable_without_a_handoff() {
+    let temporary = TempDir::new().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    common::init_git(&project);
+    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+    ingest(
+        &menvane,
+        &project,
+        "failure-start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest(
+        &menvane,
+        &project,
+        "failure-prompt",
+        NormalizedEventKind::UserPrompt,
+        Some("Provider failure must not create a handoff."),
+    );
+    assert!(menvane.process_next_checkpoint_job_blocking());
+    assert!(menvane.handoffs(&project).unwrap().is_empty());
+    assert!(
+        menvane
+            .jobs()
+            .unwrap()
+            .iter()
+            .any(|job| { job.job_type == "checkpoint_handoff" && job.status != "completed" })
+    );
+}
+
+#[test]
 fn repository_facts_replace_prior_handoff_text_and_validation_is_deterministic() {
     let (_temporary, project, menvane) = setup();
     fs::write(project.join("src.rs"), "fn main() {}\n").unwrap();
@@ -184,20 +221,21 @@ fn repository_facts_replace_prior_handoff_text_and_validation_is_deterministic()
     assert!(menvane.process_next_checkpoint_job_blocking());
     let first = menvane.handoffs(&project).unwrap().remove(0);
     assert_eq!(first.changed_files, vec!["src.rs"]);
-    assert_eq!(first.validation[0].summary, "cargo check failed");
-    assert_eq!(first.validation[0].command.as_deref(), Some("cargo check"));
-    assert!(
-        first
-            .current_state
-            .contains("repository changed files: present")
-    );
+    assert!(first.validation[0].summary.contains("cargo check failed"));
+    assert_eq!(first.validation[0].command, None);
+    assert_eq!(first.current_state, "provider consolidated state");
     ingest_tool(&menvane, &project, "cargo check", true, "cargo check");
     assert!(menvane.process_next_checkpoint_job_blocking());
     let second = menvane.handoffs(&project).unwrap().remove(0);
     assert_eq!(first.id, second.id);
     assert_eq!(second.changed_files, first.changed_files);
     assert_eq!(second.worktree_state_hash, first.worktree_state_hash);
-    assert_eq!(second.validation[0].summary, first.validation[0].summary);
+    assert!(
+        second
+            .validation
+            .iter()
+            .any(|value| value.summary.contains("cargo check"))
+    );
 }
 
 #[test]
@@ -497,24 +535,20 @@ fn ambiguous_session_start_returns_cards_without_guessing_current_state() {
     let context = menvane
         .session_briefing_for_client(&project, "resume-client", "resume-session")
         .unwrap();
-    assert!(!context.contains("[TASK HANDOFF]"));
-    assert!(context.contains("[HISTORICAL HANDOFF CARD]"));
-    assert_eq!(context.matches("[HISTORICAL HANDOFF CARD]").count(), 2);
+    assert!(context.contains("[TASK HANDOFF]"));
+    assert!(!context.contains("[HISTORICAL HANDOFF CARD]"));
     let connection = Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
-    let card_deliveries: u64 = connection
+    let full_deliveries: u64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM handoff_deliveries WHERE delivery_kind='card'",
+            "SELECT COUNT(*) FROM handoff_deliveries WHERE delivery_kind='full'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(card_deliveries, 2);
-    assert!(
-        menvane
-            .handoffs(&project)
-            .unwrap()
-            .iter()
-            .all(|handoff| handoff.status == menvane_domain::HandoffStatus::Ready)
+    assert_eq!(full_deliveries, 1);
+    assert_eq!(
+        menvane.handoffs(&project).unwrap()[0].status,
+        menvane_domain::HandoffStatus::Consumed
     );
 }
 
@@ -742,8 +776,110 @@ fn setup() -> (TempDir, std::path::PathBuf, Menvane) {
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
     common::init_git(&project);
-    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+    let menvane =
+        Menvane::new_with_provider(temporary.path().join("home"), Arc::new(HandoffProvider))
+            .unwrap();
     (temporary, project, menvane)
+}
+
+struct HandoffProvider;
+
+#[async_trait]
+impl LlmProvider for HandoffProvider {
+    async fn generate_structured(
+        &self,
+        request: LlmRequest,
+        _schema: JsonSchema,
+    ) -> Result<StructuredResponse, LlmError> {
+        let input: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
+        let evidence = &input["episode_evidence"];
+        let mut ids = Vec::new();
+        for key in [
+            "goal",
+            "prompts",
+            "actions",
+            "decisions",
+            "discoveries",
+            "errors",
+            "validations",
+            "unresolved_questions",
+        ] {
+            let values: Vec<&serde_json::Value> = if key == "goal" {
+                evidence.get(key).into_iter().collect::<Vec<_>>()
+            } else {
+                evidence[key].as_array().into_iter().flatten().collect()
+            };
+            for value in values {
+                if let Some(id) = value.get("event_id").and_then(serde_json::Value::as_str) {
+                    if !ids.iter().any(|existing| existing == id) {
+                        ids.push(id.to_owned());
+                    }
+                }
+            }
+        }
+        let existing = input
+            .get("current_handoff")
+            .is_some_and(|value| !value.is_null());
+        let mut validations = Vec::new();
+        for item in evidence["validations"].as_array().into_iter().flatten() {
+            validations.push(serde_json::json!({
+                "event_id": item["event_id"],
+                "command": serde_json::Value::Null,
+                "success": true,
+                "summary": item["content"],
+                "timestamp": item["timestamp"]
+            }));
+        }
+        for item in evidence["errors"].as_array().into_iter().flatten() {
+            validations.push(serde_json::json!({
+                "event_id": item["event_id"],
+                "command": serde_json::Value::Null,
+                "success": false,
+                "summary": item["content"],
+                "timestamp": item["timestamp"]
+            }));
+        }
+        Ok(StructuredResponse {
+            value: serde_json::json!({
+                "operation": if existing { "patch" } else { "create" },
+                "source_event_ids": ids,
+                "fields": {
+                    "goal": evidence["goal"]["content"],
+                    "current_state": "provider consolidated state",
+                    "completed_work": evidence["actions"].as_array().map(|items| items.iter().map(|item| item["content"].clone()).collect::<Vec<_>>()).unwrap_or_default(),
+                    "pending_work": [],
+                    "next_action": "continue the current task",
+                    "blockers": evidence["errors"].as_array().map(|items| items.iter().map(|item| item["content"].clone()).collect::<Vec<_>>()).unwrap_or_default(),
+                    "changed_files": evidence["files"],
+                    "decisions": [],
+                    "validation": validations,
+                    "relevant_memory_ids": []
+                }
+            }),
+            provider: "test-handoff".to_owned(),
+            model: "test".to_owned(),
+        })
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        ProviderHealth::Ready
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            structured_output: true,
+            json_schema: true,
+            embeddings: false,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "test-handoff"
+    }
+
+    fn model(&self) -> &str {
+        "test"
+    }
 }
 
 fn ingest(
@@ -831,6 +967,8 @@ fn event_as(
     NormalizedEvent {
         event_id: id.to_owned(),
         kind,
+        origin: Default::default(),
+        role: Default::default(),
         client: client.to_owned(),
         external_session_id: external_session_id.to_owned(),
         timestamp: Utc::now() + Duration::milliseconds(id.len() as i64),

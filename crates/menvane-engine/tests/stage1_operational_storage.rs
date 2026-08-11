@@ -139,7 +139,7 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
     }
     assert_eq!(row_count(&state_path, "operational_migration_markers"), 21);
     assert_eq!(row_count(&state_path, "handoff_deliveries"), 1);
-    assert_eq!(max_schema_version(&state_path), 10);
+    assert_eq!(max_schema_version(&state_path), 11);
     assert!(has_table(&home.join("index.sqlite"), "sessions"));
     assert_eq!(
         SessionRepository::new(&state_path)
@@ -501,6 +501,8 @@ fn event(
     NormalizedEvent {
         event_id: id.to_owned(),
         kind,
+        origin: Default::default(),
+        role: Default::default(),
         client: "test-client".to_owned(),
         external_session_id: external_session_id.to_owned(),
         timestamp: Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),

@@ -76,6 +76,8 @@ fn event(
     NormalizedEvent {
         event_id: id.to_owned(),
         kind,
+        origin: Default::default(),
+        role: Default::default(),
         client: "decay-test".to_owned(),
         external_session_id: "old-session".to_owned(),
         timestamp,

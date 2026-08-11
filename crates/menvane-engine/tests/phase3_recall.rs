@@ -408,6 +408,8 @@ fn ingest(
         .ingest_event(NormalizedEvent {
             event_id: id.to_owned(),
             kind,
+            origin: Default::default(),
+            role: Default::default(),
             client: "test-client".to_owned(),
             external_session_id: "external-session".to_owned(),
             timestamp: Utc::now() + Duration::milliseconds(id.len() as i64),

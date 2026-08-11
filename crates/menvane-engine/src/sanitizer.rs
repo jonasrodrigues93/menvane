@@ -73,17 +73,21 @@ impl CaptureSanitizer {
         let prompt_limit = self.config.max_prompt_bytes.min(MAX_RECALL_PROMPT_BYTES);
         let input_limit = self.config.max_tool_input_bytes;
         let output_limit = self.config.max_tool_output_bytes;
-        event.bounded_input = event.bounded_input.map(|value| {
-            let limit = if event.tool_family.is_some() {
-                input_limit
-            } else {
-                prompt_limit
-            };
-            self.clean(&value, limit)
-        });
+        event.bounded_input = event
+            .bounded_input
+            .map(|value| {
+                let limit = if event.tool_family.is_some() {
+                    input_limit
+                } else {
+                    prompt_limit
+                };
+                self.clean(&value, limit)
+            })
+            .and_then(|value| self.filter_content(&value));
         event.bounded_output = event
             .bounded_output
-            .map(|value| self.clean(&value, output_limit));
+            .map(|value| self.clean(&value, output_limit))
+            .and_then(|value| self.filter_content(&value));
         Some(event)
     }
 
@@ -103,6 +107,65 @@ impl CaptureSanitizer {
             || normalized
                 .split_once('/')
                 .is_some_and(|(_, relative)| self.ignored_paths.is_match(relative))
+    }
+
+    pub fn filter_content(&self, value: &str) -> Option<String> {
+        let mut filtered = Vec::new();
+        let mut instruction_block = false;
+        for line in value.lines() {
+            let normalized = line.to_ascii_lowercase();
+            let starts_block = [
+                "<available-skills",
+                "<recommended_plugins",
+                "<recommended-plugins",
+                "<system",
+                "<system-prompt",
+                "<agent-instructions",
+            ]
+            .iter()
+            .any(|marker| normalized.contains(marker));
+            if starts_block {
+                instruction_block = ![
+                    "</available-skills>",
+                    "</recommended_plugins>",
+                    "</recommended-plugins>",
+                    "</system>",
+                    "</system-prompt>",
+                    "</agent-instructions>",
+                ]
+                .iter()
+                .any(|marker| normalized.contains(marker));
+                continue;
+            }
+            if instruction_block {
+                if [
+                    "</available-skills>",
+                    "</recommended_plugins>",
+                    "</recommended-plugins>",
+                    "</system>",
+                    "</system-prompt>",
+                    "</agent-instructions>",
+                ]
+                .iter()
+                .any(|marker| normalized.contains(marker))
+                {
+                    instruction_block = false;
+                }
+                continue;
+            }
+            if normalized.contains("agents.md")
+                || normalized.contains("skill.md")
+                || normalized.contains("<available-skills")
+                || normalized.contains("<recommended_plugins")
+                || normalized.contains("<recommended-plugins")
+                || normalized.contains("/skills/")
+            {
+                continue;
+            }
+            filtered.push(line);
+        }
+        let filtered = filtered.join("\n");
+        (!filtered.trim().is_empty()).then_some(filtered)
     }
 
     fn clean(&self, value: &str, limit: usize) -> String {
@@ -201,10 +264,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn removes_instruction_blocks_and_ignored_paths_from_content() {
+        let sanitizer = CaptureSanitizer::new(CaptureSanitizerConfig::default()).unwrap();
+        let mut captured = event();
+        captured.bounded_input = Some(
+            "Implement the export\n<available-skills>\n- browser-control\n</available-skills>\nContinue the export"
+                .to_owned(),
+        );
+        captured.bounded_output = Some("read AGENTS.md\nsafe result".to_owned());
+        let captured = sanitizer.sanitize(captured).unwrap();
+        assert_eq!(
+            captured.bounded_input.as_deref(),
+            Some("Implement the export\nContinue the export")
+        );
+        assert_eq!(captured.bounded_output.as_deref(), Some("safe result"));
+    }
+
     fn event() -> NormalizedEvent {
         NormalizedEvent {
             event_id: "event-1".to_owned(),
             kind: NormalizedEventKind::ToolCompleted,
+            origin: Default::default(),
+            role: Default::default(),
             client: "test".to_owned(),
             external_session_id: "session-1".to_owned(),
             timestamp: Utc::now(),

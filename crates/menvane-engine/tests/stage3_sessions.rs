@@ -301,6 +301,8 @@ fn event(project: &std::path::Path, id: &str, kind: NormalizedEventKind) -> Norm
     NormalizedEvent {
         event_id: id.to_owned(),
         kind,
+        origin: Default::default(),
+        role: Default::default(),
         client: "test-client".to_owned(),
         external_session_id: "external-session".to_owned(),
         timestamp: Utc::now(),

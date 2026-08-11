@@ -3,6 +3,7 @@ mod decay;
 mod evidence;
 mod global_promoter;
 mod handoff;
+mod handoff_consolidator;
 mod intent_engine;
 mod oauth_provider;
 mod project_resolver;
@@ -48,7 +49,10 @@ pub use evidence::{
     render_episode_markdown, render_session_markdown,
 };
 pub use global_promoter::GlobalPromoter;
-pub use handoff::HandoffGenerator;
+pub use handoff::{HandoffGenerator, RepositoryState};
+pub use handoff_consolidator::{
+    HandoffConsolidationResult, HandoffConsolidator, HandoffOperation, HandoffPatch, handoff_schema,
+};
 pub use intent_engine::{
     CLASSIFIER_VERSION, ClassifierDiagnostics, ClassifierWeights, IntentEngine,
 };
@@ -127,6 +131,7 @@ pub struct Menvane {
     sessions: SessionRepository,
     config: MenvaneConfig,
     worker_owner: String,
+    provider_override: Option<std::sync::Arc<dyn LlmProvider>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,7 +309,17 @@ impl Menvane {
             sessions,
             config,
             worker_owner: Uuid::now_v7().to_string(),
+            provider_override: None,
         })
+    }
+
+    pub fn new_with_provider(
+        home: impl Into<PathBuf>,
+        provider: std::sync::Arc<dyn LlmProvider>,
+    ) -> Result<Self> {
+        let mut menvane = Self::new(home)?;
+        menvane.provider_override = Some(provider);
+        Ok(menvane)
     }
 
     pub fn write(&self, cwd: &Path, request: WriteMemory) -> Result<Memory> {
@@ -1510,8 +1525,8 @@ impl Menvane {
         };
         let result = async {
             if job.job_type == "checkpoint_handoff" {
-                self.process_checkpoint_job(&job)?;
-                return Ok(None);
+                let provider = self.process_checkpoint_job(&job).await?;
+                return Ok(Some(provider));
             }
             if job.job_type == "finalize_session" {
                 SessionEngine::new(self).finalize_job(&job)?;
@@ -1604,18 +1619,19 @@ impl Menvane {
         Ok(true)
     }
 
-    fn process_checkpoint_job(&self, job: &JobRecord) -> Result<()> {
+    async fn process_checkpoint_job(&self, job: &JobRecord) -> Result<String> {
         let episode_id = Uuid::parse_str(&job.dedupe_key)?;
         let state = self.sessions.checkpoint_state(episode_id)?;
         if state.dirty {
-            HandoffGenerator::new(self).generate(episode_id)?;
+            let provider = HandoffGenerator::new(self).generate(episode_id).await?;
             self.sessions.complete_checkpoint_if_unchanged(
                 episode_id,
                 state.updated_at,
                 state.revision,
             )?;
+            return Ok(provider);
         }
-        Ok(())
+        Ok(String::new())
     }
 
     pub async fn process_next_checkpoint_job(&self) -> Result<bool> {
@@ -1627,13 +1643,13 @@ impl Menvane {
         else {
             return Ok(false);
         };
-        let result = self.process_checkpoint_job(&job);
+        let result = self.process_checkpoint_job(&job).await;
         match result {
-            Ok(()) => {
+            Ok(provider) => {
                 self.sessions.finish_job(
                     job.id,
                     job.owner.as_deref().unwrap_or_default(),
-                    None,
+                    (!provider.is_empty()).then_some(provider.as_str()),
                     None,
                 )?;
                 if self
@@ -1753,6 +1769,9 @@ impl Menvane {
     }
 
     pub fn configured_provider(&self) -> Result<std::sync::Arc<dyn LlmProvider>> {
+        if let Some(provider) = &self.provider_override {
+            return Ok(provider.clone());
+        }
         let primary = provider_from_configuration(&self.config.llm, &self.home)?;
         let fallback = self
             .config

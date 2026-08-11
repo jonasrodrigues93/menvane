@@ -14,6 +14,7 @@ use menvane_store::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::handoff_consolidator::{HandoffConsolidator, HandoffOperation, HandoffPatch};
 use crate::{CaptureSanitizer, Menvane, RetrievalMode, RetrievalScope, Retriever};
 
 pub struct HandoffGenerator<'a> {
@@ -25,7 +26,7 @@ impl<'a> HandoffGenerator<'a> {
         Self { menvane }
     }
 
-    pub fn generate(&self, episode_id: Uuid) -> Result<TaskHandoff> {
+    pub async fn generate(&self, episode_id: Uuid) -> Result<String> {
         let episode = self.menvane.sessions.episode(episode_id)?;
         let events = self.menvane.sessions.episode_events(episode_id)?;
         let sanitizer = CaptureSanitizer::new(self.menvane.config.capture.clone())?;
@@ -34,6 +35,29 @@ impl<'a> HandoffGenerator<'a> {
             .ok_or_else(|| anyhow::anyhow!("episode has no linked evidence"))?;
         let cwd = Path::new(&latest.event.cwd);
         let repository = repository_state(cwd, &events, &sanitizer);
+        let intents = self.menvane.sessions.episode_prompt_intents(episode_id)?;
+        let evidence = crate::EvidenceBuilder::new(
+            self.menvane
+                .config
+                .compilation
+                .aggregate_evidence_budget_bytes,
+        )
+        .build(&episode, &events, &intents)?;
+        let existing = self
+            .menvane
+            .sessions
+            .current_handoff(episode.project_id.as_deref())?;
+        let result = HandoffConsolidator::new(self.menvane.configured_provider()?)
+            .consolidate(&evidence, existing.as_ref(), &repository)
+            .await
+            .map_err(anyhow::Error::new)?;
+        if result.operation == HandoffOperation::NoOp {
+            return if existing.is_some() {
+                Ok(result.provider)
+            } else {
+                Err(anyhow::anyhow!("handoff no-op has no current artifact"))
+            };
+        }
         let project_name = self
             .menvane
             .all_projects()
@@ -47,66 +71,84 @@ impl<'a> HandoffGenerator<'a> {
                     .clone()
                     .unwrap_or_else(|| "global".to_owned())
             });
-        let source_event_ids = source_event_ids(&episode.root_event_id, &events);
-        let validation = validation(&events);
+        let relevant_memory_ids = self.relevant_memory_ids(cwd, &episode);
+        let mut fields = result.patch;
+        if result.operation == HandoffOperation::Replace {
+            fields.relevant_memory_ids = fields
+                .relevant_memory_ids
+                .or(Some(relevant_memory_ids.clone()));
+        }
+        let source_event_ids = merge_source_event_ids(
+            existing
+                .as_ref()
+                .map(|handoff| handoff.source_event_ids.as_slice()),
+            &result.source_event_ids,
+        );
+        let base = existing.as_ref();
+        if result.operation == HandoffOperation::Patch && base.is_none() {
+            return Err(anyhow::anyhow!("handoff patch requires a current artifact"));
+        }
         let successful_tools = unique_tool_summaries(&events, true);
         let failed_tools = unique_tool_summaries(&events, false);
-        let decisions = decisions(&self.menvane.sessions, &events);
+        let validation = validation(&events);
         let pending_work = pending_work(&successful_tools, &failed_tools, &validation);
         let blockers = failed_tools.clone();
         let current_state =
             current_state(&project_name, &episode, latest, events.len(), &repository);
-        let next_action = pending_work
-            .first()
-            .cloned()
-            .or_else(|| Some("Review the current task state.".to_owned()));
-        let relevant_memory_ids = self.relevant_memory_ids(cwd, &episode);
-        let existing = self.menvane.sessions.handoff_for_episode(episode_id)?;
         let now = Utc::now();
-        let mut handoff = TaskHandoff {
-            id: existing
-                .as_ref()
-                .map_or_else(Uuid::now_v7, |value| value.id),
-            project_id: episode.project_id.clone(),
-            conversation_key: episode.conversation_key.clone(),
-            episode_id,
-            source_session_id: latest.session_id,
-            source_client: latest.client.clone(),
-            status: if matches!(
-                latest.event.kind,
-                NormalizedEventKind::TurnStopped
-                    | NormalizedEventKind::SessionEnded
-                    | NormalizedEventKind::ContextCompacted
-            ) {
-                HandoffStatus::Ready
-            } else {
-                HandoffStatus::Active
+        let mut handoff = apply_patch(
+            (result.operation != HandoffOperation::Replace)
+                .then_some(base)
+                .flatten(),
+            fields,
+            TaskHandoff {
+                id: existing
+                    .as_ref()
+                    .map_or_else(Uuid::now_v7, |value| value.id),
+                project_id: episode.project_id.clone(),
+                conversation_key: episode.conversation_key.clone(),
+                episode_id,
+                source_session_id: latest.session_id,
+                source_client: latest.client.clone(),
+                status: if matches!(
+                    latest.event.kind,
+                    NormalizedEventKind::TurnStopped
+                        | NormalizedEventKind::SessionEnded
+                        | NormalizedEventKind::ContextCompacted
+                ) {
+                    HandoffStatus::Ready
+                } else {
+                    HandoffStatus::Active
+                },
+                goal: evidence.goal.content.clone(),
+                current_state,
+                completed_work: successful_tools,
+                pending_work,
+                next_action: Some("Review the current task state.".to_owned()),
+                blockers,
+                changed_files: repository.changed_files.clone(),
+                decisions: decisions(&self.menvane.sessions, &events),
+                validation,
+                relevant_memory_ids,
+                source_event_ids,
+                git_head: repository.git_head.clone(),
+                worktree_state_hash: repository.worktree_state_hash.clone(),
+                created_at: existing.as_ref().map_or(now, |value| value.created_at),
+                updated_at: now,
             },
-            goal: bounded(&episode.goal, 2_048),
-            current_state: bounded(&current_state, 4_096),
-            completed_work: successful_tools,
-            pending_work,
-            next_action: next_action.map(|value| bounded(&value, 4_096)),
-            blockers,
-            changed_files: repository.changed_files,
-            decisions,
-            validation,
-            relevant_memory_ids,
-            source_event_ids,
-            git_head: repository.git_head,
-            worktree_state_hash: repository.worktree_state_hash,
-            created_at: existing.as_ref().map_or(now, |value| value.created_at),
-            updated_at: existing.as_ref().map_or(now, |value| value.updated_at),
-        };
-        if let Some(existing) = &existing {
-            let mut comparable = handoff.clone();
-            comparable.created_at = existing.created_at;
-            comparable.updated_at = existing.updated_at;
-            if comparable != *existing {
-                handoff.updated_at = now;
-            }
-        }
-        self.menvane.sessions.create_or_update_handoff(&handoff)
+        );
+        handoff.changed_files = repository.changed_files;
+        handoff.git_head = repository.git_head;
+        handoff.worktree_state_hash = repository.worktree_state_hash;
+        handoff.source_event_ids = merge_source_event_ids(
+            existing
+                .as_ref()
+                .map(|value| value.source_event_ids.as_slice()),
+            &result.source_event_ids,
+        );
+        bound_handoff(&mut handoff);
+        self.menvane.sessions.create_or_update_handoff(&handoff)?;
+        Ok(result.provider)
     }
 
     fn relevant_memory_ids(&self, cwd: &Path, episode: &menvane_domain::TaskEpisode) -> Vec<Uuid> {
@@ -130,10 +172,104 @@ impl<'a> HandoffGenerator<'a> {
     }
 }
 
-pub(crate) struct RepositoryState {
-    pub(crate) changed_files: Vec<String>,
-    pub(crate) git_head: Option<String>,
-    pub(crate) worktree_state_hash: Option<String>,
+fn apply_patch(
+    existing: Option<&TaskHandoff>,
+    patch: HandoffPatch,
+    mut fallback: TaskHandoff,
+) -> TaskHandoff {
+    if let Some(existing) = existing {
+        fallback.goal = existing.goal.clone();
+        fallback.current_state = existing.current_state.clone();
+        fallback.completed_work = existing.completed_work.clone();
+        fallback.pending_work = existing.pending_work.clone();
+        fallback.next_action = existing.next_action.clone();
+        fallback.blockers = existing.blockers.clone();
+        fallback.decisions = existing.decisions.clone();
+        fallback.validation = existing.validation.clone();
+        fallback.relevant_memory_ids = existing.relevant_memory_ids.clone();
+    }
+    if let Some(value) = patch.goal {
+        fallback.goal = value;
+    }
+    if let Some(value) = patch.current_state {
+        fallback.current_state = value;
+    }
+    if let Some(value) = patch.completed_work {
+        fallback.completed_work = value;
+    }
+    if let Some(value) = patch.pending_work {
+        fallback.pending_work = value;
+    }
+    if let Some(value) = patch.next_action {
+        fallback.next_action = Some(value);
+    }
+    if let Some(value) = patch.blockers {
+        fallback.blockers = value;
+    }
+    if let Some(value) = patch.changed_files {
+        fallback.changed_files = value;
+    }
+    if let Some(value) = patch.decisions {
+        fallback.decisions = value;
+    }
+    if let Some(value) = patch.validation {
+        fallback.validation = value;
+    }
+    if let Some(value) = patch.relevant_memory_ids {
+        fallback.relevant_memory_ids = value;
+    }
+    fallback
+}
+
+fn merge_source_event_ids(existing: Option<&[String]>, incoming: &[String]) -> Vec<String> {
+    existing
+        .into_iter()
+        .flatten()
+        .chain(incoming.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(MAX_HANDOFF_SOURCE_EVENTS)
+        .collect()
+}
+
+fn bound_handoff(handoff: &mut TaskHandoff) {
+    handoff.goal = bounded(&handoff.goal, 2_048);
+    handoff.current_state = bounded(&handoff.current_state, 4_096);
+    handoff.next_action = handoff
+        .next_action
+        .as_deref()
+        .map(|value| bounded(value, 4_096));
+    for values in [
+        &mut handoff.completed_work,
+        &mut handoff.pending_work,
+        &mut handoff.blockers,
+        &mut handoff.changed_files,
+        &mut handoff.decisions,
+    ] {
+        for value in values.iter_mut() {
+            *value = bounded(value, MAX_HANDOFF_ITEM_BYTES);
+        }
+    }
+    for validation in &mut handoff.validation {
+        validation.event_id = bounded(&validation.event_id, MAX_HANDOFF_ITEM_BYTES);
+        validation.command = validation
+            .command
+            .as_deref()
+            .map(|value| bounded(value, MAX_HANDOFF_ITEM_BYTES));
+        validation.summary = bounded(&validation.summary, 4_096);
+    }
+    handoff.source_event_ids = handoff
+        .source_event_ids
+        .iter()
+        .map(|value| bounded(value, MAX_HANDOFF_ITEM_BYTES))
+        .collect();
+}
+
+pub struct RepositoryState {
+    pub changed_files: Vec<String>,
+    pub git_head: Option<String>,
+    pub worktree_state_hash: Option<String>,
 }
 
 pub(crate) fn repository_state(
@@ -229,34 +365,12 @@ fn changed_files_from_git_status(status: &[u8], sanitizer: &CaptureSanitizer) ->
         .collect()
 }
 
-fn source_event_ids(root_event_id: &str, events: &[EpisodeEvent]) -> Vec<String> {
-    if events.len() <= MAX_HANDOFF_SOURCE_EVENTS {
-        return events
-            .iter()
-            .map(|value| value.event.event_id.clone())
-            .collect();
-    }
-    let mut ids = events
-        .iter()
-        .find(|value| value.event.event_id == root_event_id)
-        .map(|value| vec![value.event.event_id.clone()])
-        .unwrap_or_default();
-    for event in events.iter().rev() {
-        if ids.len() == MAX_HANDOFF_SOURCE_EVENTS {
-            break;
-        }
-        if !ids.iter().any(|id| id == &event.event.event_id) {
-            ids.push(event.event.event_id.clone());
-        }
-    }
-    ids
-}
-
 fn unique_tool_summaries(events: &[EpisodeEvent], success: bool) -> Vec<String> {
     events
         .iter()
         .filter(|value| {
             value.event.kind == NormalizedEventKind::ToolCompleted
+                && value.event.is_allowed_evidence()
                 && value.event.success == Some(success)
         })
         .filter_map(|value| value.event.tool_family.as_deref())
@@ -292,7 +406,7 @@ fn pending_work(
 fn decisions(repository: &SessionRepository, events: &[EpisodeEvent]) -> Vec<String> {
     events
         .iter()
-        .filter(|value| value.event.kind == NormalizedEventKind::UserPrompt)
+        .filter(|value| value.event.is_user_prompt())
         .filter_map(|value| {
             repository
                 .prompt_intent(&value.event.event_id)
@@ -318,6 +432,7 @@ fn validation(events: &[EpisodeEvent]) -> Vec<HandoffValidation> {
         .iter()
         .filter(|value| {
             value.event.kind == NormalizedEventKind::ToolCompleted
+                && value.event.is_allowed_evidence()
                 && value
                     .event
                     .tool_family

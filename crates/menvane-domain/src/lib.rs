@@ -13,6 +13,9 @@ pub use session::ReinforcementSignal;
 pub use session::{
     EpisodeEvidencePacket, EpisodeState, EvidenceItem, EvidenceKind, HandoffStatus,
     HandoffValidation, IntentClassificationSource, NormalizedEvent, NormalizedEventKind,
-    NormalizedSession, PromptIntent, PromptIntentKind, SessionImporter, SessionState, TaskEpisode,
-    TaskHandoff,
+    NormalizedEventOrigin, NormalizedEventRole, NormalizedSession, PromptIntent, PromptIntentKind,
+    SessionImporter, SessionState, TaskEpisode, TaskHandoff,
 };
+
+pub type EventOrigin = NormalizedEventOrigin;
+pub type EventRole = NormalizedEventRole;

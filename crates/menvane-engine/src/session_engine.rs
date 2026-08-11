@@ -209,11 +209,12 @@ impl<'a> SessionEngine<'a> {
 
 fn checkpoint_debounce(event: &NormalizedEvent, nonvalidation_seconds: u64) -> Option<StdDuration> {
     match event.kind {
-        NormalizedEventKind::UserPrompt => event
+        NormalizedEventKind::UserPrompt if event.is_user_prompt() => event
             .bounded_input
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .map(|_| StdDuration::ZERO),
+        NormalizedEventKind::UserPrompt => None,
         NormalizedEventKind::ToolCompleted => Some(
             if event.tool_family.as_deref().is_some_and(is_validation_tool) {
                 StdDuration::ZERO
@@ -236,7 +237,7 @@ fn is_validation_tool(tool: &str) -> bool {
 fn session_title(session: &SessionRecord, events: &[NormalizedEvent]) -> String {
     events
         .iter()
-        .find(|event| event.kind == NormalizedEventKind::UserPrompt)
+        .find(|event| event.is_user_prompt())
         .and_then(|event| event.bounded_input.as_deref())
         .and_then(|prompt| prompt.lines().find(|line| !line.trim().is_empty()))
         .map(|line| line.trim().chars().take(100).collect())

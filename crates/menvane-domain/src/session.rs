@@ -15,6 +15,41 @@ pub enum NormalizedEventKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum NormalizedEventOrigin {
+    User,
+    System,
+    Agent,
+    Compaction,
+    Tool,
+    Importer,
+}
+
+impl Default for NormalizedEventOrigin {
+    fn default() -> Self {
+        Self::User
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NormalizedEventRole {
+    UserPrompt,
+    SystemPrompt,
+    AgentInstruction,
+    CompactionSummary,
+    ToolMetadata,
+    ToolActivity,
+    Lifecycle,
+}
+
+impl Default for NormalizedEventRole {
+    fn default() -> Self {
+        Self::UserPrompt
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SessionState {
     Open,
     Idle,
@@ -183,6 +218,10 @@ impl ReinforcementSignal {
 pub struct NormalizedEvent {
     pub event_id: String,
     pub kind: NormalizedEventKind,
+    #[serde(default)]
+    pub origin: NormalizedEventOrigin,
+    #[serde(default)]
+    pub role: NormalizedEventRole,
     pub client: String,
     pub external_session_id: String,
     pub timestamp: DateTime<Utc>,
@@ -201,6 +240,29 @@ pub struct NormalizedEvent {
     pub success: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+impl NormalizedEvent {
+    pub fn is_user_prompt(&self) -> bool {
+        self.kind == NormalizedEventKind::UserPrompt
+            && self.origin == NormalizedEventOrigin::User
+            && self.role == NormalizedEventRole::UserPrompt
+    }
+
+    pub fn is_allowed_evidence(&self) -> bool {
+        if matches!(
+            self.origin,
+            NormalizedEventOrigin::System
+                | NormalizedEventOrigin::Agent
+                | NormalizedEventOrigin::Compaction
+        ) {
+            return false;
+        }
+        !matches!(
+            self.role,
+            NormalizedEventRole::ToolMetadata | NormalizedEventRole::CompactionSummary
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -238,5 +300,21 @@ mod tests {
             serde_json::to_string(&EvidenceKind::CompactionContext).unwrap(),
             "\"compaction-context\""
         );
+    }
+
+    #[test]
+    fn legacy_normalized_events_use_compatible_capture_defaults() {
+        let event: NormalizedEvent = serde_json::from_value(serde_json::json!({
+            "event_id": "legacy",
+            "kind": "user-prompt",
+            "client": "claude-code",
+            "external_session_id": "session",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "cwd": "/tmp"
+        }))
+        .unwrap();
+        assert!(event.is_user_prompt());
+        assert_eq!(event.origin, NormalizedEventOrigin::User);
+        assert_eq!(event.role, NormalizedEventRole::UserPrompt);
     }
 }

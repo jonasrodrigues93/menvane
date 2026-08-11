@@ -36,7 +36,7 @@ Menvane is designed for teams and developers who want agents to remember the wor
 
 ### Cross-session continuity
 
-Menvane groups activity into task episodes and creates one current handoff per episode. A later session can receive bounded, repository-aware context instead of reconstructing the task from a transcript.
+Menvane groups activity into task episodes and maintains one current, versioned handoff per project. A later session can receive bounded, repository-aware context instead of reconstructing the task from a transcript.
 
 ### Evidence-based memory
 
@@ -56,7 +56,7 @@ Claude Code, Codex, and OpenCode use the same capture, sanitization, recall, and
 Agent session
      |
      v
-Capture -> sanitize -> task episode -> handoff
+Capture -> sanitize -> task episode -> LLM consolidation -> project handoff
                                       |
                                       v
                               evidence-based memory
@@ -86,7 +86,7 @@ Menvane supports Linux, macOS, and WSL. Native Windows is not currently a releas
 
 ### Enable Memory Compilation
 
-Capture, search, handoffs, and manual memory operations work without a language-model provider. To enable evidence-based consolidation with OpenAI:
+Capture, search, and manual memory operations work without a language-model provider. Handoff and evidence-based memory consolidation require a configured provider. To enable consolidation with OpenAI:
 
 ```bash
 menvane provider configure openai --model gpt-5.6-luna --reasoning-effort medium

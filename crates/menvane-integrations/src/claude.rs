@@ -7,7 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use menvane_domain::{NormalizedEvent, NormalizedEventKind};
+use menvane_domain::{
+    NormalizedEvent, NormalizedEventKind, NormalizedEventOrigin, NormalizedEventRole,
+};
 use menvane_engine::Menvane;
 use menvane_server::{DEFAULT_PORT, daemon_running, home_from_environment, start_daemon};
 use serde_json::{Map, Value, json};
@@ -210,6 +212,14 @@ fn normalize_event(event_name: &str, payload: &Value, client: &str) -> Result<No
             .get("prompt")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        NormalizedEventKind::ContextCompacted => [
+            "compaction_summary",
+            "compactionSummary",
+            "summary",
+            "content",
+        ]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str).map(str::to_owned)),
         NormalizedEventKind::ToolCompleted => payload.get("tool_input").map(Value::to_string),
         _ => None,
     };
@@ -235,9 +245,12 @@ fn normalize_event(event_name: &str, payload: &Value, client: &str) -> Result<No
     let event_id = hex::encode(Sha256::digest(
         [event_name.as_bytes(), canonical.as_slice()].concat(),
     ));
+    let (origin, role) = event_metadata(kind, payload);
     Ok(NormalizedEvent {
         event_id,
         kind,
+        origin,
+        role,
         client: client.to_owned(),
         external_session_id,
         timestamp: Utc::now(),
@@ -256,6 +269,63 @@ fn normalize_event(event_name: &str, payload: &Value, client: &str) -> Result<No
             .and_then(Value::as_str)
             .map(str::to_owned),
     })
+}
+
+fn event_metadata(
+    kind: NormalizedEventKind,
+    payload: &Value,
+) -> (NormalizedEventOrigin, NormalizedEventRole) {
+    if kind == NormalizedEventKind::ContextCompacted {
+        return (
+            NormalizedEventOrigin::Compaction,
+            NormalizedEventRole::CompactionSummary,
+        );
+    }
+    if kind == NormalizedEventKind::ToolCompleted {
+        return (
+            NormalizedEventOrigin::Tool,
+            NormalizedEventRole::ToolActivity,
+        );
+    }
+    if kind != NormalizedEventKind::UserPrompt {
+        return (
+            NormalizedEventOrigin::System,
+            NormalizedEventRole::Lifecycle,
+        );
+    }
+    let source = ["origin", "role", "source", "input_type"]
+        .iter()
+        .find_map(|key| payload.get(*key).and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if payload.get("is_injected").and_then(Value::as_bool) == Some(true)
+        || payload.get("injected").and_then(Value::as_bool) == Some(true)
+        || payload.get("system_prompt").is_some()
+        || payload.get("system").is_some()
+        || source.contains("system")
+    {
+        return (
+            NormalizedEventOrigin::System,
+            NormalizedEventRole::SystemPrompt,
+        );
+    }
+    if payload.get("agent_instructions").is_some()
+        || payload.get("instructions").is_some()
+        || source.contains("agent")
+        || source.contains("inject")
+    {
+        return (
+            NormalizedEventOrigin::Agent,
+            NormalizedEventRole::AgentInstruction,
+        );
+    }
+    if payload.get("tool_metadata").is_some() || source.contains("tool") {
+        return (
+            NormalizedEventOrigin::Tool,
+            NormalizedEventRole::ToolMetadata,
+        );
+    }
+    (NormalizedEventOrigin::User, NormalizedEventRole::UserPrompt)
 }
 
 fn find_attributed_path(value: &Value) -> Option<&str> {
@@ -490,5 +560,55 @@ mod tests {
         assert!(configuration["mcpServers"]["other"].is_object());
         assert!(configuration["mcpServers"].get("menvane").is_none());
         assert_eq!(configuration["projects"], json!({ "x": {} }));
+    }
+
+    #[test]
+    fn normalization_marks_injected_and_compaction_content() {
+        let system = normalize_event(
+            "UserPromptSubmit",
+            &json!({
+                "session_id": "session",
+                "cwd": "/tmp",
+                "prompt": "system instructions",
+                "role": "system"
+            }),
+            "claude-code",
+        )
+        .unwrap();
+        assert!(!system.is_user_prompt());
+        assert_eq!(system.origin, NormalizedEventOrigin::System);
+        assert_eq!(system.role, NormalizedEventRole::SystemPrompt);
+
+        let tool_metadata = normalize_event(
+            "UserPromptSubmit",
+            &json!({
+                "session_id": "session",
+                "cwd": "/tmp",
+                "prompt": "tool metadata",
+                "role": "tool"
+            }),
+            "claude-code",
+        )
+        .unwrap();
+        assert!(!tool_metadata.is_user_prompt());
+        assert_eq!(tool_metadata.origin, NormalizedEventOrigin::Tool);
+        assert_eq!(tool_metadata.role, NormalizedEventRole::ToolMetadata);
+
+        let compacted = normalize_event(
+            "PostCompact",
+            &json!({
+                "session_id": "session",
+                "cwd": "/tmp",
+                "summary": "compacted context"
+            }),
+            "claude-code",
+        )
+        .unwrap();
+        assert_eq!(compacted.origin, NormalizedEventOrigin::Compaction);
+        assert_eq!(compacted.role, NormalizedEventRole::CompactionSummary);
+        assert_eq!(
+            compacted.bounded_input.as_deref(),
+            Some("compacted context")
+        );
     }
 }
