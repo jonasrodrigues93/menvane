@@ -30,9 +30,9 @@ use menvane_domain::{
 };
 pub use menvane_store::mark_forgotten;
 pub use menvane_store::{
-    HandoffDetail, HandoffEvidence, HandoffVersion, IndexStore, InjectionIdentity,
-    IntegrationRecord, JobRecord, MAX_HANDOFF_ITEM_BYTES, MAX_HANDOFF_LIST_LIMIT, MarkdownStore,
-    OrphanRecord, SearchResult, SessionRepository,
+    GLOBAL_HANDOFF_KEY, HandoffDetail, HandoffEvidence, HandoffVersion, IndexStore,
+    InjectionIdentity, IntegrationRecord, JobRecord, MAX_HANDOFF_ITEM_BYTES,
+    MAX_HANDOFF_LIST_LIMIT, MarkdownStore, OrphanRecord, SearchResult, SessionRepository,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -94,14 +94,12 @@ pub struct PromptRecall {
 }
 
 struct HandoffSelection {
-    full: Option<TaskHandoff>,
-    cards: Vec<TaskHandoff>,
+    handoff: Option<ProjectHandoff>,
+    stale: bool,
 }
 
 struct HandoffTarget<'a> {
     cwd: &'a Path,
-    client: &'a str,
-    external_session_id: &'a str,
     project_id: Option<&'a str>,
 }
 
@@ -144,8 +142,6 @@ struct MenvaneConfig {
     capture: CaptureSanitizerConfig,
     #[serde(default)]
     sessions: SessionConfiguration,
-    #[serde(default)]
-    handoff: HandoffConfiguration,
     #[serde(default)]
     compilation: CompilationConfiguration,
     #[serde(default)]
@@ -229,24 +225,6 @@ impl Default for SessionConfiguration {
 
 fn default_idle_finalize_seconds() -> u64 {
     120
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HandoffConfiguration {
-    #[serde(default = "default_handoff_debounce_seconds")]
-    nonvalidation_tool_debounce_seconds: u64,
-}
-
-impl Default for HandoffConfiguration {
-    fn default() -> Self {
-        Self {
-            nonvalidation_tool_debounce_seconds: default_handoff_debounce_seconds(),
-        }
-    }
-}
-
-fn default_handoff_debounce_seconds() -> u64 {
-    2
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -458,17 +436,11 @@ impl Menvane {
         )?;
         let required_context = context.as_ref().map_or_else(Vec::new, |context| {
             context
-                .active_corrections
+                .goals
                 .iter()
-                .chain(context.active_constraints.iter())
-                .map(|value| value.trim().to_owned())
+                .map(|goal| goal.summary.trim().to_owned())
                 .filter(|value| !value.is_empty())
-                .fold(Vec::new(), |mut values, value| {
-                    if !values.iter().any(|existing| existing == &value) {
-                        values.push(value);
-                    }
-                    values
-                })
+                .collect()
         });
         let (results, diagnostics) = Retriever::new(&self.index).retrieve_intent(
             &prompt,
@@ -562,6 +534,21 @@ impl Menvane {
         limit: usize,
     ) -> Result<Vec<TaskHandoff>> {
         self.sessions.session_handoffs(session_id, status, limit)
+    }
+
+    pub fn current_project_handoff(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Option<ProjectHandoff>> {
+        self.sessions.current_project_handoff(project_id)
+    }
+
+    pub fn all_project_handoffs(&self) -> Result<Vec<ProjectHandoff>> {
+        self.sessions.all_project_handoffs()
+    }
+
+    pub fn session_project_handoff(&self, session_id: Uuid) -> Result<Option<ProjectHandoff>> {
+        self.sessions.session_project_handoff(session_id)
     }
 
     pub fn handoff_detail(&self, id: Uuid) -> Result<Option<HandoffDetail>> {
@@ -661,8 +648,6 @@ impl Menvane {
         let handoffs = self.select_handoffs(
             HandoffTarget {
                 cwd,
-                client,
-                external_session_id,
                 project_id: project.as_ref().map(|value| value.id.as_str()),
             },
             &identity,
@@ -705,8 +690,6 @@ impl Menvane {
         let handoffs = self.select_handoffs(
             HandoffTarget {
                 cwd,
-                client,
-                external_session_id,
                 project_id: project.as_ref().map(|value| value.id.as_str()),
             },
             &recall.identity,
@@ -727,125 +710,24 @@ impl Menvane {
     fn select_handoffs(
         &self,
         target: HandoffTarget<'_>,
-        identity: &InjectionIdentity,
-        prompt: Option<&str>,
-        session_start: bool,
+        _identity: &InjectionIdentity,
+        _prompt: Option<&str>,
+        _session_start: bool,
     ) -> Result<HandoffSelection> {
-        let context = self.sessions.recall_context(
-            target.client,
-            target.external_session_id,
-            target.project_id,
-        )?;
-        let Some(context) = context else {
+        let handoff = self.sessions.current_project_handoff(target.project_id)?;
+        let Some(handoff) = handoff else {
             return Ok(HandoffSelection {
-                full: None,
-                cards: Vec::new(),
+                handoff: None,
+                stale: false,
             });
-        };
-        let events = if let Some(episode) = &context.active_episode {
-            self.sessions.episode_events(episode.id)?
-        } else {
-            self.sessions
-                .events(context.session.id)?
-                .into_iter()
-                .map(|event| menvane_store::EpisodeEvent {
-                    event,
-                    session_id: context.session.id,
-                    generation: context.session.generation,
-                    client: context.session.client.clone(),
-                    external_session_id: context.session.external_session_id.clone(),
-                    project_id: context.session.project_id.clone(),
-                })
-                .collect()
         };
         let sanitizer = CaptureSanitizer::new(self.config.capture.clone())?;
-        let repository = handoff::repository_state(target.cwd, &events, &sanitizer);
-        let candidates = self.sessions.list_handoffs(target.project_id, None, 100)?;
-        let mut stale_cards = Vec::new();
-        let mut current_candidates = Vec::new();
-        for candidate in candidates {
-            if candidate.status == HandoffStatus::Stale {
-                if !session_start {
-                    stale_cards.push(candidate);
-                }
-                continue;
-            }
-            if !matches!(
-                candidate.status,
-                HandoffStatus::Active | HandoffStatus::Ready | HandoffStatus::Consumed
-            ) {
-                continue;
-            }
-            if fingerprint_mismatch(&candidate, &repository) {
-                stale_cards.push(self.sessions.stale_handoff(candidate.id)?);
-                continue;
-            }
-            current_candidates.push(candidate);
-        }
-        if session_start {
-            if current_candidates.len() == 1 {
-                return Ok(HandoffSelection {
-                    full: current_candidates.pop(),
-                    cards: Vec::new(),
-                });
-            }
-            return Ok(HandoffSelection {
-                full: None,
-                cards: current_candidates,
-            });
-        }
-        let query = prompt
-            .map(|value| {
-                CaptureSanitizer::new(self.config.capture.clone())
-                    .map(|sanitizer| sanitizer.sanitize_prompt(value))
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let active_goal = context
-            .active_episode
-            .as_ref()
-            .map_or("", |episode| episode.goal.as_str());
-        let query = format!("{} {}", query, active_goal,);
-        let mut ranked = current_candidates
-            .into_iter()
-            .filter(|candidate| {
-                Some(candidate.episode_id)
-                    == context.active_episode.as_ref().map(|episode| episode.id)
-                    || meaningful_handoff_intent(candidate, &query)
-            })
-            .map(|candidate| {
-                (
-                    handoff_score(
-                        &candidate,
-                        &query,
-                        &identity.conversation_key,
-                        &repository,
-                        &context.active_episode,
-                    ),
-                    candidate,
-                )
-            })
-            .filter(|(score, _)| *score >= 12)
-            .collect::<Vec<_>>();
-        ranked.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| right.1.updated_at.cmp(&left.1.updated_at))
-                .then_with(|| left.1.id.cmp(&right.1.id))
-        });
-        let full = ranked.first().map(|(_, candidate)| candidate.clone());
-        let mut cards = ranked
-            .into_iter()
-            .skip(1)
-            .map(|(_, candidate)| candidate)
-            .collect::<Vec<_>>();
-        cards.extend(
-            stale_cards
-                .into_iter()
-                .filter(|candidate| meaningful_handoff_intent(candidate, &query)),
-        );
-        Ok(HandoffSelection { full, cards })
+        let repository = handoff::repository_state(target.cwd, &[], &sanitizer);
+        let stale = fingerprint_mismatch_handoff(&handoff, &repository);
+        Ok(HandoffSelection {
+            handoff: Some(handoff),
+            stale,
+        })
     }
 
     fn render_briefing(
@@ -886,11 +768,7 @@ impl Menvane {
         handoffs: &HandoffSelection,
         max_chars: usize,
     ) -> Result<String> {
-        if required_context.is_empty()
-            && results.is_empty()
-            && handoffs.full.is_none()
-            && handoffs.cards.is_empty()
-        {
+        if required_context.is_empty() && results.is_empty() && handoffs.handoff.is_none() {
             return Ok(String::new());
         }
         let mut context = String::from(
@@ -1000,42 +878,25 @@ impl Menvane {
         identity: &InjectionIdentity,
         max_chars: usize,
     ) -> Result<bool> {
-        let mut included = false;
-        let handoff_start = context.chars().count();
-        if let Some(handoff) = &selection.full {
-            let entry = format_handoff(handoff, false);
-            if entry.chars().count() <= HANDOFF_CONTEXT_BUDGET
-                && fits_context(context, &entry, max_chars)
-            {
-                let previous_length = context.len();
-                context.push_str(&entry);
-                if self.sessions.deliver_handoff(identity, handoff.id)? {
-                    included = true;
-                } else {
-                    context.truncate(previous_length);
-                }
-            }
+        let Some(handoff) = &selection.handoff else {
+            return Ok(false);
+        };
+        let entry = format_handoff(handoff, selection.stale);
+        if entry.chars().count() > HANDOFF_CONTEXT_BUDGET
+            || !fits_context(context, &entry, max_chars)
+        {
+            return Ok(false);
         }
-        for handoff in &selection.cards {
-            let entry = format_handoff(handoff, true);
-            if context.chars().count().saturating_sub(handoff_start) + entry.chars().count()
-                > HANDOFF_CONTEXT_BUDGET
-                || !fits_context(context, &entry, max_chars)
-            {
-                break;
-            }
-            let previous_length = context.len();
-            context.push_str(&entry);
-            if !self
-                .sessions
-                .claim_handoff_delivery(identity, handoff.id, "card")?
-            {
-                context.truncate(previous_length);
-            } else {
-                included = true;
-            }
+        let content_id = content_identifier(&handoff.summary);
+        let project_key = handoff.project_id.as_deref().unwrap_or(GLOBAL_HANDOFF_KEY);
+        if !self
+            .sessions
+            .claim_project_handoff_delivery(identity, project_key, &content_id)?
+        {
+            return Ok(false);
         }
-        Ok(included)
+        context.push_str(&entry);
+        Ok(true)
     }
 
     fn append_claimed_memory(
@@ -2291,94 +2152,6 @@ const RELEVANT_CONTEXT_BUDGET: usize = 3_000;
 const RETRIEVAL_CARD_BUDGET: usize = 1_000;
 const HANDOFF_CONTEXT_BUDGET: usize = 2_000;
 
-fn fingerprint_mismatch(handoff: &TaskHandoff, current: &handoff::RepositoryState) -> bool {
-    handoff
-        .git_head
-        .as_deref()
-        .zip(current.git_head.as_deref())
-        .is_some_and(|(stored, current)| stored != current)
-        || handoff
-            .worktree_state_hash
-            .as_deref()
-            .zip(current.worktree_state_hash.as_deref())
-            .is_some_and(|(stored, current)| stored != current)
-}
-
-fn fingerprint_matches(handoff: &TaskHandoff, current: &handoff::RepositoryState) -> bool {
-    let head_matches = handoff
-        .git_head
-        .as_deref()
-        .zip(current.git_head.as_deref())
-        .map(|(stored, current)| stored == current);
-    let hash_matches = handoff
-        .worktree_state_hash
-        .as_deref()
-        .zip(current.worktree_state_hash.as_deref())
-        .map(|(stored, current)| stored == current);
-    head_matches.or(hash_matches).is_some_and(|matches| matches)
-        && head_matches.unwrap_or(true)
-        && hash_matches.unwrap_or(true)
-}
-
-fn meaningful_handoff_intent(handoff: &TaskHandoff, query: &str) -> bool {
-    let candidate_tokens = lexical_tokens(&format!(
-        "{} {}",
-        handoff.goal,
-        handoff.next_action.as_deref().unwrap_or("")
-    ));
-    candidate_tokens
-        .intersection(&lexical_tokens(query))
-        .next()
-        .is_some()
-}
-
-fn handoff_score(
-    handoff: &TaskHandoff,
-    query: &str,
-    conversation_key: &str,
-    current: &handoff::RepositoryState,
-    active_episode: &Option<TaskEpisode>,
-) -> i32 {
-    let mut score = 0;
-    if active_episode
-        .as_ref()
-        .is_some_and(|episode| episode.id == handoff.episode_id)
-    {
-        score += 150;
-    }
-    if handoff.conversation_key == conversation_key {
-        score += 100;
-    }
-    if fingerprint_matches(handoff, current) {
-        score += 45;
-    } else {
-        score += current
-            .changed_files
-            .iter()
-            .filter(|path| handoff.changed_files.contains(path))
-            .count()
-            .min(5) as i32
-            * 8;
-    }
-    let query_tokens = lexical_tokens(query);
-    let goal_tokens = lexical_tokens(&format!(
-        "{} {}",
-        handoff.goal,
-        handoff.next_action.as_deref().unwrap_or("")
-    ));
-    score += goal_tokens.intersection(&query_tokens).count().min(8) as i32 * 6;
-    if let Some(episode) = active_episode
-        && lexical_tokens(&episode.goal)
-            .intersection(&goal_tokens)
-            .next()
-            .is_some()
-    {
-        score += 12;
-    }
-    let age_days = (Utc::now() - handoff.updated_at).num_days().max(0);
-    score + (10 - age_days.min(10) as i32)
-}
-
 fn lexical_tokens(value: &str) -> std::collections::HashSet<String> {
     value
         .split(|character: char| !character.is_ascii_alphanumeric())
@@ -2414,102 +2187,33 @@ fn lexical_tokens(value: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-fn format_handoff(handoff: &TaskHandoff, card: bool) -> String {
-    let confidence = match (
-        handoff.git_head.is_some(),
-        handoff.worktree_state_hash.is_some(),
-    ) {
-        (true, true) => "high (Git HEAD and worktree hash)",
-        (false, true) => "medium (Git worktree hash; HEAD unavailable)",
-        _ => "low (Git unavailable; project/conversation/files/recency only)",
+fn format_handoff(handoff: &ProjectHandoff, stale: bool) -> String {
+    let stale_warning = if stale {
+        "\nNote: the repository fingerprint changed since this summary was generated; it may be stale. Current repository state is authoritative."
+    } else {
+        ""
     };
-    if card {
-        return bounded_delivery(
-            &format!(
-                "\n[HISTORICAL HANDOFF CARD]\nHandoff ID: {}\nStatus: {:?}\nGoal: {}\nNext: {}\nFiles: {}\nFingerprint confidence: {}\n{}\n",
-                handoff.id,
-                handoff.status,
-                bounded_delivery(&handoff.goal, 280),
-                bounded_delivery(handoff.next_action.as_deref().unwrap_or("none"), 280),
-                handoff_files(handoff),
-                confidence,
-                if handoff.status == HandoffStatus::Stale {
-                    "This is stale historical evidence; it is never current repository truth."
-                } else {
-                    "Compact historical operational evidence; current instructions and repository state win."
-                }
-            ),
-            HANDOFF_CONTEXT_BUDGET / 2,
-        );
-    }
-    bounded_delivery(
-        &format!(
-            "\n[TASK HANDOFF]\nOperational-state warning: this handoff is historical evidence, not current truth. Current user instructions and current repository state are authoritative.\nHandoff ID: {}\nGoal: {}\nState: {}\nWork completed: {}\nPending work: {}\nNext action: {}\nBlockers: {}\nFiles: {}\nDecisions: {}\nValidation: {}\nRepository fingerprint: HEAD {}; worktree {}; Fingerprint confidence: {}\nEvidence refs: {}\nEND TASK HANDOFF\n",
-            handoff.id,
-            bounded_delivery(&handoff.goal, 320),
-            bounded_delivery(&handoff.current_state, 320),
-            handoff_list(&handoff.completed_work),
-            handoff_list(&handoff.pending_work),
-            bounded_delivery(handoff.next_action.as_deref().unwrap_or("none"), 240),
-            handoff_list(&handoff.blockers),
-            handoff_files(handoff),
-            handoff_list(&handoff.decisions),
-            handoff_validation(handoff),
-            bounded_delivery(handoff.git_head.as_deref().unwrap_or("unavailable"), 96),
-            bounded_delivery(
-                handoff
-                    .worktree_state_hash
-                    .as_deref()
-                    .unwrap_or("unavailable"),
-                96,
-            ),
-            confidence,
-            handoff_list(&handoff.source_event_ids),
-        ),
-        HANDOFF_CONTEXT_BUDGET,
+    format!(
+        "\n[PROJECT HANDOFF]\nHistorical context only. Current user instructions and current repository state are authoritative.\nUpdated: {}\n{}\nEND PROJECT HANDOFF\n{}",
+        handoff.updated_at.to_rfc3339(),
+        bounded_delivery(&handoff.summary, HANDOFF_CONTEXT_BUDGET - 200),
+        stale_warning,
     )
 }
 
-fn handoff_list(values: &[String]) -> String {
-    if values.is_empty() {
-        return "none".to_owned();
-    }
-    values
-        .iter()
-        .take(4)
-        .map(|value| bounded_delivery(value, 160))
-        .collect::<Vec<_>>()
-        .join("; ")
+fn content_identifier(summary: &str) -> String {
+    hex::encode(Sha256::digest(summary.as_bytes()))
 }
 
-fn handoff_files(handoff: &TaskHandoff) -> String {
-    handoff_list(&handoff.changed_files)
-}
-
-fn handoff_validation(handoff: &TaskHandoff) -> String {
-    if handoff.validation.is_empty() {
-        return "none".to_owned();
-    }
+fn fingerprint_mismatch_handoff(
+    handoff: &ProjectHandoff,
+    current: &handoff::RepositoryState,
+) -> bool {
     handoff
-        .validation
-        .iter()
-        .take(4)
-        .map(|validation| {
-            bounded_delivery(
-                &format!(
-                    "{}: {}",
-                    validation.summary,
-                    if validation.success {
-                        "passed"
-                    } else {
-                        "failed"
-                    }
-                ),
-                180,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .fingerprint
+        .as_deref()
+        .zip(current.worktree_state_hash.as_deref())
+        .is_some_and(|(stored, current)| stored != current)
 }
 
 fn bounded_delivery(value: &str, limit: usize) -> String {

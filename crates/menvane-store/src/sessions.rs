@@ -277,6 +277,15 @@ CREATE TABLE IF NOT EXISTS project_handoffs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS project_handoff_deliveries (
+    client TEXT NOT NULL,
+    conversation_key TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    project_id TEXT NOT NULL,
+    content_id TEXT NOT NULL,
+    delivered_at TEXT NOT NULL,
+    PRIMARY KEY(client, conversation_key, generation, project_id)
+);
 CREATE TABLE IF NOT EXISTS operational_migration_markers (
     migration TEXT NOT NULL,
     table_name TEXT NOT NULL,
@@ -419,10 +428,7 @@ pub struct PromptIntentHistory {
 #[derive(Debug, Clone)]
 pub struct RecallContext {
     pub session: SessionRecord,
-    pub active_episode: Option<TaskEpisode>,
-    pub active_corrections: Vec<String>,
-    pub active_constraints: Vec<String>,
-    pub conversation_root_goal: Option<String>,
+    pub goals: Vec<Goal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,40 +865,8 @@ impl SessionRepository {
         else {
             return Ok(None);
         };
-        let active_episode =
-            active_episode_connection(&connection, &session.conversation_key, project_id)?;
-        let Some(active_episode) = active_episode else {
-            return Ok(Some(RecallContext {
-                session,
-                active_episode: None,
-                active_corrections: Vec::new(),
-                active_constraints: Vec::new(),
-                conversation_root_goal: None,
-            }));
-        };
-        let prompts = episode_prompt_texts(&connection, active_episode.id)?;
-        let root_event_id =
-            conversation_root_event_id(&connection, &session.conversation_key, project_id)?;
-        let root_goal = root_event_id
-            .as_deref()
-            .map(|event_id| event_prompt_text(&connection, event_id))
-            .transpose()?
-            .flatten();
-        Ok(Some(RecallContext {
-            session,
-            active_episode: Some(active_episode),
-            active_corrections: prompts
-                .iter()
-                .filter(|(_, kind, _)| kind == "correction")
-                .map(|(_, _, prompt)| prompt.clone())
-                .collect(),
-            active_constraints: prompts
-                .iter()
-                .filter(|(_, kind, _)| kind == "constraint")
-                .map(|(_, _, prompt)| prompt.clone())
-                .collect(),
-            conversation_root_goal: root_goal,
-        }))
+        let goals = self.active_goals(project_id)?;
+        Ok(Some(RecallContext { session, goals }))
     }
 
     pub fn injection_identity(
@@ -2159,6 +2133,27 @@ impl SessionRepository {
             .map_err(Into::into)
     }
 
+    pub fn all_project_handoffs(&self) -> Result<Vec<ProjectHandoff>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT project_id, summary, source_session_ids_json, fingerprint, created_at, updated_at FROM project_handoffs ORDER BY updated_at DESC, project_id",
+        )?;
+        let rows = statement.query_map([], project_handoff_from_row)?;
+        rows.map(|row| row.map_err(Into::into)).collect()
+    }
+
+    pub fn session_project_handoff(&self, session_id: Uuid) -> Result<Option<ProjectHandoff>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT project_id, summary, source_session_ids_json, fingerprint, created_at, updated_at FROM project_handoffs WHERE source_session_ids_json LIKE ?1",
+                [format!("%{}%", session_id)],
+                project_handoff_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn replace_project_handoff(&self, handoff: &ProjectHandoff) -> Result<()> {
         let connection = self.open()?;
         connection.execute(
@@ -2181,6 +2176,26 @@ impl SessionRepository {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn claim_project_handoff_delivery(
+        &self,
+        identity: &InjectionIdentity,
+        project_id: &str,
+        content_id: &str,
+    ) -> Result<bool> {
+        let connection = self.open()?;
+        Ok(connection.execute(
+            "INSERT OR IGNORE INTO project_handoff_deliveries(client, conversation_key, generation, project_id, content_id, delivered_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                identity.client,
+                identity.conversation_key,
+                identity.generation,
+                project_id,
+                content_id,
+                Utc::now().to_rfc3339(),
+            ],
+        )? == 1)
     }
 
     fn open(&self) -> Result<Connection> {
@@ -2874,70 +2889,6 @@ fn active_episode_connection(
         .map_err(Into::into)
 }
 
-fn conversation_root_event_id(
-    connection: &Connection,
-    conversation_key: &str,
-    project_id: Option<&str>,
-) -> Result<Option<String>> {
-    connection
-        .query_row(
-            "SELECT root_event_id FROM task_episodes WHERE conversation_key=?1 AND project_id IS ?2 ORDER BY ordinal, id LIMIT 1",
-            params![conversation_key, project_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
-}
-
-fn episode_prompt_texts(
-    connection: &Connection,
-    episode_id: Uuid,
-) -> Result<Vec<(String, String, String)>> {
-    let mut statement = connection.prepare(
-        "SELECT i.event_id, i.kind, e.payload_json FROM prompt_intents i JOIN session_events e ON e.event_id=i.event_id WHERE i.episode_id=?1 AND i.kind IN ('correction', 'constraint') ORDER BY i.classified_at, i.event_id",
-    )?;
-    let rows = statement.query_map([episode_id.to_string()], |row| {
-        let event_id: String = row.get(0)?;
-        let kind: String = row.get(1)?;
-        let payload: String = row.get(2)?;
-        Ok((event_id, kind, payload))
-    })?;
-    let prompts = rows
-        .map(|row| {
-            let (event_id, kind, payload) = row?;
-            let event: NormalizedEvent = serde_json::from_str(&payload).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            Ok::<_, rusqlite::Error>((event_id, kind, event.bounded_input.unwrap_or_default()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(prompts
-        .into_iter()
-        .filter(|(_, _, text)| !text.trim().is_empty())
-        .collect())
-}
-
-fn event_prompt_text(connection: &Connection, event_id: &str) -> Result<Option<String>> {
-    let payload: Option<String> = connection
-        .query_row(
-            "SELECT payload_json FROM session_events WHERE event_id=?1",
-            [event_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    payload
-        .map(|payload| {
-            let event: NormalizedEvent = serde_json::from_str(&payload)?;
-            Ok(event.bounded_input.filter(|text| !text.trim().is_empty()))
-        })
-        .transpose()
-        .map(|value| value.flatten())
-}
-
 fn session_by_id(connection: &Connection, id: Uuid) -> Result<SessionRecord> {
     connection
         .query_row(
@@ -3438,6 +3389,15 @@ fn migrate_to_version_12(connection: &Connection) -> Result<()> {
              fingerprint TEXT,
              created_at TEXT NOT NULL,
              updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS project_handoff_deliveries (
+             client TEXT NOT NULL,
+             conversation_key TEXT NOT NULL,
+             generation INTEGER NOT NULL,
+             project_id TEXT NOT NULL,
+             content_id TEXT NOT NULL,
+             delivered_at TEXT NOT NULL,
+             PRIMARY KEY(client, conversation_key, generation, project_id)
          );",
     )?;
     let now = Utc::now().to_rfc3339();

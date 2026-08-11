@@ -1,24 +1,22 @@
 use std::fs;
-use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use menvane_domain::{
-    JsonSchema, LlmError, LlmProvider, LlmRequest, NormalizedEvent, NormalizedEventKind,
-    ProviderCapabilities, ProviderHealth, StructuredResponse,
+    JsonSchema, LlmError, LlmErrorKind, LlmProvider, LlmRequest, NormalizedEvent,
+    NormalizedEventKind, ProviderCapabilities, ProviderHealth, StructuredResponse,
 };
-use menvane_engine::{CaptureOutcome, Menvane};
+use menvane_engine::Menvane;
+use menvane_store::SessionRepository;
 use rusqlite::Connection;
 use tempfile::TempDir;
 
 mod common;
 
 #[test]
-fn meaningful_progress_creates_and_updates_one_current_handoff() {
-    let (temporary, project, menvane) = setup();
-    fs::create_dir_all(project.join("src")).unwrap();
-    fs::write(project.join("src/lib.rs"), "pub fn export() {}\n").unwrap();
+fn consolidation_creates_and_replaces_one_handoff_per_project() {
+    let (temporary, project, menvane, _provider) = setup();
     ingest(
         &menvane,
         &project,
@@ -29,279 +27,11 @@ fn meaningful_progress_creates_and_updates_one_current_handoff() {
     ingest(
         &menvane,
         &project,
-        "prompt",
+        "prompt-a",
         NormalizedEventKind::UserPrompt,
         Some("Implement the export command."),
     );
-    ingest_tool(&menvane, &project, "test", true, "src/lib.rs");
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let first = menvane
-        .handoffs(&project)
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-
-    ingest_tool(&menvane, &project, "cargo test", true, "src/lib.rs");
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let second = menvane
-        .handoffs(&project)
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-    assert_eq!(first.id, second.id);
-    assert_eq!(first.status, menvane_domain::HandoffStatus::Active);
-    assert!(second.validation.len() >= 2);
-    assert_eq!(handoff_count(&temporary), 1);
-}
-
-#[test]
-fn event_links_are_idempotent_cross_generation_and_isolated() {
-    let (_temporary, project, menvane) = setup();
-    ingest(
-        &menvane,
-        &project,
-        "start-1",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "prompt-1",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement the export command."),
-    );
-    ingest_tool(&menvane, &project, "cargo test", true, "src/export-1.rs");
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    ingest(
-        &menvane,
-        &project,
-        "end-1",
-        NormalizedEventKind::SessionEnded,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "start-2",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "prompt-2",
-        NormalizedEventKind::UserPrompt,
-        Some("Continue the export command and add validation."),
-    );
-    ingest_tool(&menvane, &project, "cargo test", true, "src/export-2.rs");
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    assert_eq!(menvane.handoffs(&project).unwrap().len(), 1);
-    let handoff = menvane.handoffs(&project).unwrap().remove(0);
-    assert!(handoff.source_event_ids.contains(&"prompt-1".to_owned()));
-    assert!(handoff.source_event_ids.contains(&"prompt-2".to_owned()));
-
-    ingest(
-        &menvane,
-        &project,
-        "prompt-3",
-        NormalizedEventKind::UserPrompt,
-        Some("Now review the dashboard colors."),
-    );
-    let topic_change_context = menvane
-        .prompt_context_for_client(
-            &project,
-            "test-client",
-            "external-session",
-            "Now review the dashboard colors.",
-        )
-        .unwrap()
-        .0;
-    assert!(!topic_change_context.contains("[TASK HANDOFF]"));
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let handoffs = menvane.handoffs(&project).unwrap();
-    assert_eq!(handoffs.len(), 1);
-    assert!(
-        handoffs
-            .iter()
-            .any(|value| value.source_event_ids.contains(&"prompt-3".to_owned()))
-    );
-    let before = menvane.jobs().unwrap().len();
-    let _ = menvane.ingest_event(event(
-        &project,
-        "prompt-3",
-        NormalizedEventKind::UserPrompt,
-        Some("Now review the dashboard colors."),
-    ));
-    assert_eq!(menvane.jobs().unwrap().len(), before);
-}
-
-#[test]
-fn checkpoint_generation_uses_provider_and_flushes_debounced_work() {
-    let (temporary, project, menvane) = setup();
-    fs::create_dir_all(project.join("src")).unwrap();
-    fs::write(project.join("src/lib.rs"), "pub fn edit() {}\n").unwrap();
-    ingest(
-        &menvane,
-        &project,
-        "start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement a bounded handoff."),
-    );
-    ingest_tool(&menvane, &project, "edit", true, "src/lib.rs");
-    menvane.flush_dirty_checkpoints_blocking();
-    let handoff = menvane.handoffs(&project).unwrap().remove(0);
-    assert_eq!(handoff.changed_files, vec!["src/lib.rs"]);
-    assert!(handoff.worktree_state_hash.is_some());
-    assert_eq!(handoff.git_head, None);
-    assert_eq!(handoff_count(&temporary), 1);
-    assert!(!menvane.process_next_checkpoint_job_blocking());
-}
-
-#[test]
-fn provider_failure_keeps_checkpoint_evidence_retryable_without_a_handoff() {
-    let temporary = TempDir::new().unwrap();
-    let project = temporary.path().join("project");
-    fs::create_dir_all(&project).unwrap();
-    common::init_git(&project);
-    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
-    ingest(
-        &menvane,
-        &project,
-        "failure-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "failure-prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Provider failure must not create a handoff."),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    assert!(menvane.handoffs(&project).unwrap().is_empty());
-    assert!(
-        menvane
-            .jobs()
-            .unwrap()
-            .iter()
-            .any(|job| { job.job_type == "checkpoint_handoff" && job.status != "completed" })
-    );
-}
-
-#[test]
-fn repository_facts_replace_prior_handoff_text_and_validation_is_deterministic() {
-    let (_temporary, project, menvane) = setup();
-    fs::write(project.join("src.rs"), "fn main() {}\n").unwrap();
-    ingest(
-        &menvane,
-        &project,
-        "start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement deterministic validation."),
-    );
-    ingest_tool(&menvane, &project, "cargo check", false, "cargo check");
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let first = menvane.handoffs(&project).unwrap().remove(0);
-    assert_eq!(first.changed_files, vec!["src.rs"]);
-    assert!(first.validation[0].summary.contains("cargo check failed"));
-    assert_eq!(first.validation[0].command, None);
-    assert_eq!(first.current_state, "provider consolidated state");
-    ingest_tool(&menvane, &project, "cargo check", true, "cargo check");
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let second = menvane.handoffs(&project).unwrap().remove(0);
-    assert_eq!(first.id, second.id);
-    assert_eq!(second.changed_files, first.changed_files);
-    assert_eq!(second.worktree_state_hash, first.worktree_state_hash);
-    assert!(
-        second
-            .validation
-            .iter()
-            .any(|value| value.summary.contains("cargo check"))
-    );
-}
-
-#[test]
-fn lifecycle_status_is_ready_and_consumed_handoffs_reactivate_on_new_evidence() {
-    let (_temporary, project, menvane) = setup();
-    ingest(
-        &menvane,
-        &project,
-        "start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement lifecycle checkpoints."),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let active = menvane.handoffs(&project).unwrap().remove(0);
-    assert_eq!(active.status, menvane_domain::HandoffStatus::Active);
-
-    ingest(
-        &menvane,
-        &project,
-        "compact",
-        NormalizedEventKind::ContextCompacted,
-        Some("bounded context"),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let ready = menvane.handoffs(&project).unwrap().remove(0);
-    assert_eq!(ready.status, menvane_domain::HandoffStatus::Ready);
-    menvane.consume_handoff(ready.id).unwrap();
-    let before = menvane.jobs().unwrap().len();
-    assert_eq!(
-        menvane
-            .ingest_event(event(
-                &project,
-                "compact",
-                NormalizedEventKind::ContextCompacted,
-                Some("bounded context"),
-            ))
-            .unwrap(),
-        CaptureOutcome::Duplicate
-    );
-    assert_eq!(menvane.jobs().unwrap().len(), before);
-    assert_eq!(
-        menvane.handoffs(&project).unwrap()[0].status,
-        menvane_domain::HandoffStatus::Consumed
-    );
-
-    ingest(
-        &menvane,
-        &project,
-        "stop",
-        NormalizedEventKind::TurnStopped,
-        None,
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    assert_eq!(menvane.handoffs(&project).unwrap()[0].id, ready.id);
-    assert_eq!(
-        menvane.handoffs(&project).unwrap()[0].status,
-        menvane_domain::HandoffStatus::Ready
-    );
-
+    ingest_tool(&menvane, &project, "tool-a", "bash", true, "src/export.rs");
     ingest(
         &menvane,
         &project,
@@ -309,150 +39,36 @@ fn lifecycle_status_is_ready_and_consumed_handoffs_reactivate_on_new_evidence() 
         NormalizedEventKind::SessionEnded,
         None,
     );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    assert_eq!(
-        menvane.handoffs(&project).unwrap()[0].status,
-        menvane_domain::HandoffStatus::Ready
-    );
-}
+    assert!(process_one(&menvane));
+    assert!(process_one(&menvane));
 
-#[test]
-fn generated_evidence_respects_utf8_byte_bounds() {
-    let (_temporary, project, menvane) = setup();
-    ingest(
-        &menvane,
-        &project,
-        "start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    let prompt = "é".repeat(1_200);
-    ingest(
-        &menvane,
-        &project,
-        "unicode-prompt",
-        NormalizedEventKind::UserPrompt,
-        Some(&prompt),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let handoff = menvane.handoffs(&project).unwrap().remove(0);
-    assert!(handoff.goal.len() <= 2_048);
-    assert!(handoff.goal.is_char_boundary(handoff.goal.len()));
-}
+    let handoff = current_handoff(&temporary, &project, &menvane);
+    assert!(handoff.contains("consolidated summary"));
+    assert_newer_handoff_count(&temporary, 1);
 
-#[test]
-fn nonvalidation_tool_debounce_uses_handoff_configuration() {
-    let (temporary, project, menvane) = setup();
-    menvane
-        .update_configuration_text("[handoff]\nnonvalidation_tool_debounce_seconds = 0\n")
-        .unwrap();
-    drop(menvane);
-    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
     ingest(
         &menvane,
         &project,
-        "start",
-        NormalizedEventKind::SessionStarted,
-        None,
+        "prompt-b",
+        NormalizedEventKind::UserPrompt,
+        Some("Continue work."),
     );
     ingest(
         &menvane,
         &project,
-        "prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement configurable debounce."),
-    );
-    ingest_tool(&menvane, &project, "edit", true, "src/lib.rs");
-    assert!(menvane.process_next_job_blocking());
-}
-
-#[test]
-fn session_start_injects_one_unambiguous_handoff_and_first_prompt_dedupes_it() {
-    let (temporary, project, menvane) = setup();
-    ingest_as(
-        &menvane,
-        &project,
-        "source-client",
-        "source-session",
-        "source-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest_as(
-        &menvane,
-        &project,
-        "source-client",
-        "source-session",
-        "source-prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement the export parser."),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    ingest_as(
-        &menvane,
-        &project,
-        "source-client",
-        "source-session",
-        "source-end",
+        "end-b",
         NormalizedEventKind::SessionEnded,
         None,
     );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-
-    ingest_as(
-        &menvane,
-        &project,
-        "resume-client",
-        "resume-session",
-        "resume-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    let briefing = menvane
-        .session_briefing_for_client(&project, "resume-client", "resume-session")
-        .unwrap();
-    assert!(briefing.contains("[TASK HANDOFF]"));
-    assert!(briefing.contains("Implement the export parser."));
-    assert!(briefing.contains("Fingerprint confidence: medium"));
-    let handoff_id = menvane.handoffs(&project).unwrap()[0].id;
-    assert_eq!(
-        menvane.handoffs(&project).unwrap()[0].status,
-        menvane_domain::HandoffStatus::Consumed
-    );
-    let connection = Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
-    let full_deliveries: u64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM handoff_deliveries WHERE delivery_kind='full'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(full_deliveries, 1);
-
-    ingest_as(
-        &menvane,
-        &project,
-        "resume-client",
-        "resume-session",
-        "resume-prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Continue the export parser."),
-    );
-    let prompt = menvane
-        .prompt_context_for_client(
-            &project,
-            "resume-client",
-            "resume-session",
-            "Continue the export parser.",
-        )
-        .unwrap()
-        .0;
-    assert!(!prompt.contains(&handoff_id.to_string()));
+    assert!(process_one(&menvane));
+    assert!(process_one(&menvane));
+    assert_newer_handoff_count(&temporary, 1);
+    assert!(current_handoff(&temporary, &project, &menvane).contains("consolidated summary"));
 }
 
 #[test]
-fn repeated_briefing_does_not_consume_a_handoff_created_after_delivery() {
-    let (_temporary, project, menvane) = setup();
+fn provider_failure_preserves_the_last_valid_handoff() {
+    let (temporary, project, menvane, provider) = setup();
     ingest(
         &menvane,
         &project,
@@ -460,403 +76,189 @@ fn repeated_briefing_does_not_consume_a_handoff_created_after_delivery() {
         NormalizedEventKind::SessionStarted,
         None,
     );
-    let first = menvane
-        .session_briefing_for_client(&project, "test-client", "external-session")
-        .unwrap();
-    assert!(!first.is_empty());
     ingest(
         &menvane,
         &project,
-        "prompt",
+        "prompt-a",
         NormalizedEventKind::UserPrompt,
-        Some("Implement delayed handoff delivery."),
+        Some("Implement the export command."),
     );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let handoff = menvane.handoffs(&project).unwrap().remove(0);
+    ingest(
+        &menvane,
+        &project,
+        "end",
+        NormalizedEventKind::SessionEnded,
+        None,
+    );
+    assert!(process_one(&menvane));
+    assert!(process_one(&menvane));
+    let before = current_handoff(&temporary, &project, &menvane);
+    assert!(!before.is_empty());
 
+    *provider.fail.lock().unwrap() = true;
+    ingest(
+        &menvane,
+        &project,
+        "prompt-b",
+        NormalizedEventKind::UserPrompt,
+        Some("Continue work."),
+    );
+    ingest(
+        &menvane,
+        &project,
+        "end-b",
+        NormalizedEventKind::SessionEnded,
+        None,
+    );
+    assert!(process_one(&menvane));
+    assert!(process_one(&menvane));
+    assert_eq!(current_handoff(&temporary, &project, &menvane), before);
+    assert_newer_handoff_count(&temporary, 1);
+}
+
+#[test]
+fn oversized_handoff_summary_is_never_persisted() {
+    let (temporary, project, menvane, provider) = setup();
+    *provider.summary_override.lock().unwrap() = Some("x".repeat(6_000));
+    ingest(
+        &menvane,
+        &project,
+        "start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest(
+        &menvane,
+        &project,
+        "prompt-a",
+        NormalizedEventKind::UserPrompt,
+        Some("Implement the export command."),
+    );
+    ingest(
+        &menvane,
+        &project,
+        "end",
+        NormalizedEventKind::SessionEnded,
+        None,
+    );
+    assert!(process_one(&menvane));
+    assert!(process_one(&menvane));
+    assert_newer_handoff_count(&temporary, 0);
+}
+
+#[test]
+fn delivery_injects_the_single_summary_once_per_generation() {
+    let (temporary, project, menvane, _provider) = setup();
+    ingest(
+        &menvane,
+        &project,
+        "start",
+        NormalizedEventKind::SessionStarted,
+        None,
+    );
+    ingest(
+        &menvane,
+        &project,
+        "prompt-a",
+        NormalizedEventKind::UserPrompt,
+        Some("Implement the export command."),
+    );
+    ingest(
+        &menvane,
+        &project,
+        "end",
+        NormalizedEventKind::SessionEnded,
+        None,
+    );
+    assert!(process_one(&menvane));
+    assert!(process_one(&menvane));
+
+    let first = menvane
+        .session_briefing_for_client(&project, "client", "shared-session")
+        .unwrap();
+    assert!(first.contains("[PROJECT HANDOFF]"));
+    assert!(first.contains("consolidated summary"));
     let repeated = menvane
-        .session_briefing_for_client(&project, "test-client", "external-session")
+        .session_briefing_for_client(&project, "client", "shared-session")
         .unwrap();
-
     assert!(repeated.is_empty());
-    assert_eq!(
-        menvane.handoffs(&project).unwrap().remove(0).status,
-        handoff.status
-    );
-}
 
-#[test]
-fn ambiguous_session_start_returns_cards_without_guessing_current_state() {
-    let (temporary, project, menvane) = setup();
-    for (index, goal) in ["Implement export parsing.", "Implement dashboard colors."]
-        .into_iter()
-        .enumerate()
-    {
-        let session = format!("source-{index}");
-        ingest_as(
-            &menvane,
-            &project,
-            "source-client",
-            &session,
-            &format!("start-{index}"),
-            NormalizedEventKind::SessionStarted,
-            None,
-        );
-        ingest_as(
-            &menvane,
-            &project,
-            "source-client",
-            &session,
-            &format!("prompt-{index}"),
-            NormalizedEventKind::UserPrompt,
-            Some(goal),
-        );
-        assert!(menvane.process_next_checkpoint_job_blocking());
-        ingest_as(
-            &menvane,
-            &project,
-            "source-client",
-            &session,
-            &format!("end-{index}"),
-            NormalizedEventKind::SessionEnded,
-            None,
-        );
-        assert!(menvane.process_next_checkpoint_job_blocking());
-    }
-    ingest_as(
-        &menvane,
-        &project,
-        "resume-client",
-        "resume-session",
-        "resume-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    let context = menvane
-        .session_briefing_for_client(&project, "resume-client", "resume-session")
-        .unwrap();
-    assert!(context.contains("[TASK HANDOFF]"));
-    assert!(!context.contains("[HISTORICAL HANDOFF CARD]"));
-    let connection = Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
-    let full_deliveries: u64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM handoff_deliveries WHERE delivery_kind='full'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(full_deliveries, 1);
-    assert_eq!(
-        menvane.handoffs(&project).unwrap()[0].status,
-        menvane_domain::HandoffStatus::Consumed
-    );
-}
-
-#[test]
-fn first_prompt_can_resume_from_another_client_when_intent_matches() {
-    let (_temporary, project, menvane) = setup();
-    ingest_as(
-        &menvane,
-        &project,
-        "client-a",
-        "old-session",
-        "old-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest_as(
-        &menvane,
-        &project,
-        "client-a",
-        "old-session",
-        "old-prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement the export parser."),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    ingest_as(
-        &menvane,
-        &project,
-        "client-a",
-        "old-session",
-        "old-end",
-        NormalizedEventKind::SessionEnded,
-        None,
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    ingest_as(
-        &menvane,
-        &project,
-        "client-b",
-        "new-session",
-        "new-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest_as(
-        &menvane,
-        &project,
-        "client-b",
-        "new-session",
-        "new-prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Continue implementing the export parser."),
-    );
-    let context = menvane
-        .prompt_context_for_client(
-            &project,
-            "client-b",
-            "new-session",
-            "Continue implementing the export parser.",
-        )
+    let prompt = menvane
+        .prompt_context_for_client(&project, "client-2", "other-session", "continue the work")
         .unwrap()
         .0;
-    assert!(context.contains("[TASK HANDOFF]"));
-    assert!(context.contains("Implement the export parser."));
+    assert!(prompt.contains("[PROJECT HANDOFF]"));
+    drop(temporary);
 }
 
-#[test]
-fn fingerprint_mismatch_marks_stale_and_only_prompt_cards_are_historical() {
-    let (_temporary, project, menvane) = setup();
-    fs::write(project.join("tracked.rs"), "fn old() {}\n").unwrap();
-    git(&project, ["add", "."]);
-    git(&project, ["commit", "-m", "initial"]);
-    ingest(
-        &menvane,
-        &project,
-        "start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement tracked parser."),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    ingest(
-        &menvane,
-        &project,
-        "end",
-        NormalizedEventKind::SessionEnded,
-        None,
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    fs::write(project.join("tracked.rs"), "fn new() {}\n").unwrap();
-    ingest_as(
-        &menvane,
-        &project,
-        "resume-client",
-        "resume-session",
-        "resume-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    let _ = menvane
-        .session_briefing_for_client(&project, "resume-client", "resume-session")
-        .unwrap();
-    assert_eq!(
-        menvane.handoffs(&project).unwrap()[0].status,
-        menvane_domain::HandoffStatus::Stale
-    );
-    ingest_as(
-        &menvane,
-        &project,
-        "resume-client",
-        "resume-session",
-        "resume-prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Continue implementing tracked parser."),
-    );
-    let context = menvane
-        .prompt_context_for_client(
-            &project,
-            "resume-client",
-            "resume-session",
-            "Continue implementing tracked parser.",
-        )
-        .unwrap()
-        .0;
-    assert!(!context.contains("[TASK HANDOFF]"));
-    assert!(context.contains("[HISTORICAL HANDOFF CARD]"));
-    assert!(context.contains("never current repository truth"));
-}
-
-#[test]
-fn unborn_repository_hash_mismatch_marks_stale_without_a_head() {
-    let (_temporary, project, menvane) = setup();
-    fs::write(project.join("unborn.rs"), "fn old() {}\n").unwrap();
-    git(&project, ["add", "unborn.rs"]);
-    ingest(
-        &menvane,
-        &project,
-        "start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement the unborn parser."),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let generated = menvane.handoffs(&project).unwrap().remove(0);
-    assert_eq!(generated.git_head, None);
-    assert!(generated.worktree_state_hash.is_some());
-    ingest(
-        &menvane,
-        &project,
-        "end",
-        NormalizedEventKind::SessionEnded,
-        None,
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    fs::write(project.join("unborn.rs"), "fn new() {}\n").unwrap();
-    ingest_as(
-        &menvane,
-        &project,
-        "resume-client",
-        "resume-session",
-        "resume-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    let _ = menvane
-        .session_briefing_for_client(&project, "resume-client", "resume-session")
-        .unwrap();
-    assert_eq!(
-        menvane.handoffs(&project).unwrap()[0].status,
-        menvane_domain::HandoffStatus::Stale
-    );
-}
-
-#[test]
-fn completed_handoff_is_excluded_and_delivery_is_bounded_and_sanitized() {
-    let (_temporary, project, menvane) = setup();
-    ingest(
-        &menvane,
-        &project,
-        "start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    ingest(
-        &menvane,
-        &project,
-        "prompt",
-        NormalizedEventKind::UserPrompt,
-        Some("Implement bounded delivery password=do-not-leak."),
-    );
-    assert!(menvane.process_next_checkpoint_job_blocking());
-    let id = menvane.handoffs(&project).unwrap()[0].id;
-    menvane.complete_handoff(id).unwrap();
-    ingest_as(
-        &menvane,
-        &project,
-        "resume-client",
-        "resume-session",
-        "resume-start",
-        NormalizedEventKind::SessionStarted,
-        None,
-    );
-    let context = menvane
-        .session_briefing_for_client(&project, "resume-client", "resume-session")
-        .unwrap();
-    assert!(!context.contains(&id.to_string()));
-    assert!(context.chars().count() <= 2_500);
-    assert!(!context.contains("do-not-leak"));
-}
-
-fn setup() -> (TempDir, std::path::PathBuf, Menvane) {
+fn setup() -> (
+    TempDir,
+    std::path::PathBuf,
+    Menvane,
+    Arc<ConsolidationProvider>,
+) {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
     common::init_git(&project);
+    let provider = Arc::new(ConsolidationProvider::default());
     let menvane =
-        Menvane::new_with_provider(temporary.path().join("home"), Arc::new(HandoffProvider))
-            .unwrap();
-    (temporary, project, menvane)
+        Menvane::new_with_provider(temporary.path().join("home"), provider.clone()).unwrap();
+    (temporary, project, menvane, provider)
 }
 
-struct HandoffProvider;
+#[derive(Default)]
+struct ConsolidationProvider {
+    fail: Arc<Mutex<bool>>,
+    summary_override: Arc<Mutex<Option<String>>>,
+    calls: Arc<Mutex<usize>>,
+}
 
 #[async_trait]
-impl LlmProvider for HandoffProvider {
+impl LlmProvider for ConsolidationProvider {
     async fn generate_structured(
         &self,
         request: LlmRequest,
         _schema: JsonSchema,
     ) -> Result<StructuredResponse, LlmError> {
+        if *self.fail.lock().unwrap() {
+            return Err(LlmError {
+                kind: LlmErrorKind::Unavailable,
+                message: "offline".to_owned(),
+            });
+        }
+        *self.calls.lock().unwrap() += 1;
         let input: serde_json::Value = serde_json::from_str(&request.prompt).unwrap();
-        let evidence = &input["episode_evidence"];
-        let mut ids = Vec::new();
-        for key in [
-            "goal",
-            "prompts",
-            "actions",
-            "decisions",
-            "discoveries",
-            "errors",
-            "validations",
-            "unresolved_questions",
-        ] {
-            let values: Vec<&serde_json::Value> = if key == "goal" {
-                evidence.get(key).into_iter().collect::<Vec<_>>()
-            } else {
-                evidence[key].as_array().into_iter().flatten().collect()
-            };
-            for value in values {
-                if let Some(id) = value.get("event_id").and_then(serde_json::Value::as_str) {
-                    if !ids.iter().any(|existing| existing == id) {
-                        ids.push(id.to_owned());
-                    }
-                }
-            }
-        }
-        let existing = input
-            .get("current_handoff")
-            .is_some_and(|value| !value.is_null());
-        let mut validations = Vec::new();
-        for item in evidence["validations"].as_array().into_iter().flatten() {
-            validations.push(serde_json::json!({
-                "event_id": item["event_id"],
-                "command": serde_json::Value::Null,
-                "success": true,
-                "summary": item["content"],
-                "timestamp": item["timestamp"]
-            }));
-        }
-        for item in evidence["errors"].as_array().into_iter().flatten() {
-            validations.push(serde_json::json!({
-                "event_id": item["event_id"],
-                "command": serde_json::Value::Null,
-                "success": false,
-                "summary": item["content"],
-                "timestamp": item["timestamp"]
-            }));
-        }
+        let session_id = input["session"]["session_id"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_owned();
+        let events = input["session"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let ids = events
+            .iter()
+            .filter_map(|event| event["event_id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let default_summary = format!("consolidated summary for {} events", events.len());
+        let summary = self
+            .summary_override
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(default_summary);
         Ok(StructuredResponse {
             value: serde_json::json!({
-                "operation": if existing { "patch" } else { "create" },
-                "source_event_ids": ids,
-                "fields": {
-                    "goal": evidence["goal"]["content"],
-                    "current_state": "provider consolidated state",
-                    "completed_work": evidence["actions"].as_array().map(|items| items.iter().map(|item| item["content"].clone()).collect::<Vec<_>>()).unwrap_or_default(),
-                    "pending_work": [],
-                    "next_action": "continue the current task",
-                    "blockers": evidence["errors"].as_array().map(|items| items.iter().map(|item| item["content"].clone()).collect::<Vec<_>>()).unwrap_or_default(),
-                    "changed_files": evidence["files"],
-                    "decisions": [],
-                    "validation": validations,
-                    "relevant_memory_ids": []
+                "goals": [],
+                "memories": [],
+                "handoff": {
+                    "summary": summary,
+                    "source_session_ids": [session_id],
+                    "evidence_event_ids": ids
                 }
             }),
-            provider: "test-handoff".to_owned(),
+            provider: "test-consolidation".to_owned(),
             model: "test".to_owned(),
         })
     }
@@ -874,7 +276,7 @@ impl LlmProvider for HandoffProvider {
     }
 
     fn name(&self) -> &'static str {
-        "test-handoff"
+        "test-consolidation"
     }
 
     fn model(&self) -> &str {
@@ -882,154 +284,88 @@ impl LlmProvider for HandoffProvider {
     }
 }
 
+fn current_handoff(temporary: &TempDir, project: &std::path::Path, menvane: &Menvane) -> String {
+    let project_id = menvane.ensure_project(project).unwrap().unwrap().id;
+    let repository = SessionRepository::new(temporary.path().join("home/state.sqlite"));
+    repository
+        .current_project_handoff(Some(&project_id))
+        .unwrap()
+        .map(|handoff| handoff.summary)
+        .unwrap_or_default()
+}
+
+fn assert_newer_handoff_count(temporary: &TempDir, expected: u64) {
+    let connection = Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
+    let count: u64 = connection
+        .query_row("SELECT COUNT(*) FROM project_handoffs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, expected);
+}
+
+fn process_one(menvane: &Menvane) -> bool {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(menvane.process_next_job())
+        .unwrap()
+}
+
 fn ingest(
     menvane: &Menvane,
     project: &std::path::Path,
     id: &str,
     kind: NormalizedEventKind,
-    input: Option<&str>,
+    prompt: Option<&str>,
 ) {
-    ingest_as(
-        menvane,
-        project,
-        "test-client",
-        "external-session",
-        id,
-        kind,
-        input,
-    );
-}
-
-fn ingest_as(
-    menvane: &Menvane,
-    project: &std::path::Path,
-    client: &str,
-    external_session_id: &str,
-    id: &str,
-    kind: NormalizedEventKind,
-    input: Option<&str>,
-) {
-    assert_eq!(
-        menvane
-            .ingest_event(event_as(
-                project,
-                client,
-                external_session_id,
-                id,
-                kind,
-                input,
-            ))
-            .unwrap(),
-        CaptureOutcome::Stored
-    );
+    menvane
+        .ingest_event(NormalizedEvent {
+            event_id: id.to_owned(),
+            kind,
+            origin: Default::default(),
+            role: Default::default(),
+            client: "test-client".to_owned(),
+            external_session_id: "external-session".to_owned(),
+            timestamp: Utc::now() + Duration::milliseconds(id.len() as i64),
+            cwd: project.to_string_lossy().into_owned(),
+            project_id: None,
+            tool_family: None,
+            bounded_input: prompt.map(str::to_owned),
+            bounded_output: None,
+            attributed_path: None,
+            success: None,
+            model: None,
+            harness_injected: false,
+        })
+        .unwrap();
 }
 
 fn ingest_tool(
     menvane: &Menvane,
     project: &std::path::Path,
+    id: &str,
     family: &str,
     success: bool,
     path: &str,
 ) {
-    let mut event = event(
-        project,
-        &format!(
-            "tool-{}-{}-{}",
-            family.replace(' ', "-"),
-            success,
-            path.replace('/', "-")
-        ),
-        NormalizedEventKind::ToolCompleted,
-        Some(family),
-    );
-    event.success = Some(success);
-    event.attributed_path = Some(path.to_owned());
-    assert_eq!(menvane.ingest_event(event).unwrap(), CaptureOutcome::Stored);
-}
-
-fn event(
-    project: &std::path::Path,
-    id: &str,
-    kind: NormalizedEventKind,
-    input: Option<&str>,
-) -> NormalizedEvent {
-    event_as(project, "test-client", "external-session", id, kind, input)
-}
-
-fn event_as(
-    project: &std::path::Path,
-    client: &str,
-    external_session_id: &str,
-    id: &str,
-    kind: NormalizedEventKind,
-    input: Option<&str>,
-) -> NormalizedEvent {
-    NormalizedEvent {
+    let mut event = NormalizedEvent {
         event_id: id.to_owned(),
-        kind,
+        kind: NormalizedEventKind::ToolCompleted,
         origin: Default::default(),
         role: Default::default(),
-        client: client.to_owned(),
-        external_session_id: external_session_id.to_owned(),
+        client: "test-client".to_owned(),
+        external_session_id: "external-session".to_owned(),
         timestamp: Utc::now() + Duration::milliseconds(id.len() as i64),
         cwd: project.to_string_lossy().into_owned(),
         project_id: None,
-        tool_family: (kind == NormalizedEventKind::ToolCompleted)
-            .then(|| input.unwrap_or("tool").to_owned()),
-        bounded_input: input.map(str::to_owned),
-        bounded_output: None,
-        attributed_path: (kind == NormalizedEventKind::ToolCompleted)
-            .then(|| "src/lib.rs".to_owned()),
-        success: None,
+        tool_family: Some(family.to_owned()),
+        bounded_input: Some(family.to_owned()),
+        bounded_output: Some("tests passed".to_owned()),
+        attributed_path: Some(path.to_owned()),
+        success: Some(success),
         model: None,
         harness_injected: false,
-    }
-}
-
-fn git<const N: usize>(project: &std::path::Path, args: [&str; N]) {
-    assert!(
-        Command::new("git")
-            .arg("-C")
-            .arg(project)
-            .args(args)
-            .status()
-            .unwrap()
-            .success()
-    );
-}
-
-fn handoff_count(temporary: &TempDir) -> u64 {
-    Connection::open(temporary.path().join("home/state.sqlite"))
-        .unwrap()
-        .query_row("SELECT COUNT(*) FROM handoffs", [], |row| row.get(0))
-        .unwrap()
-}
-
-trait BlockingCheckpoints {
-    fn process_next_job_blocking(&self) -> bool;
-    fn process_next_checkpoint_job_blocking(&self) -> bool;
-    fn flush_dirty_checkpoints_blocking(&self);
-}
-
-impl BlockingCheckpoints for Menvane {
-    fn process_next_job_blocking(&self) -> bool {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(self.process_next_job())
-            .unwrap()
-    }
-
-    fn process_next_checkpoint_job_blocking(&self) -> bool {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(self.process_next_checkpoint_job())
-            .unwrap()
-    }
-
-    fn flush_dirty_checkpoints_blocking(&self) {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(self.flush_dirty_checkpoints())
-            .unwrap();
-    }
+    };
+    event.timestamp += Duration::milliseconds(1);
+    menvane.ingest_event(event).unwrap();
 }

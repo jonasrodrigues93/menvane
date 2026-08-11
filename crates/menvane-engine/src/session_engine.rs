@@ -1,14 +1,10 @@
 use std::path::Path;
-use std::time::Duration as StdDuration;
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use menvane_domain::{
-    Applicability, Memory, MemoryMetadata, MemoryType, NormalizedEvent, NormalizedEventKind, Scope,
-};
+use menvane_domain::{Applicability, Memory, MemoryMetadata, MemoryType, NormalizedEvent, Scope};
 use menvane_store::{JobRecord, SessionRecord};
 
-use crate::IntentEngine;
 use crate::Menvane;
 use crate::evidence::{MAX_SESSION_MARKDOWN_BYTES, render_session_markdown};
 use crate::sanitizer::CaptureSanitizer;
@@ -36,36 +32,11 @@ impl<'a> SessionEngine<'a> {
             .menvane
             .sessions
             .ingest(&event, project.as_ref().map(|project| project.id.as_str()))?;
-        IntentEngine::new(&self.menvane.sessions).classify(&event, &result.session)?;
-        let episode_id = self
-            .menvane
-            .sessions
-            .associate_event_with_active_episode(&event.event_id)?;
-        if !result.inserted {
-            return Ok(CaptureOutcome::Duplicate);
+        if result.inserted {
+            Ok(CaptureOutcome::Stored)
+        } else {
+            Ok(CaptureOutcome::Duplicate)
         }
-        if let Some(episode_id) = episode_id
-            && let Some(debounce) = checkpoint_debounce(
-                &event,
-                self.menvane
-                    .config
-                    .handoff
-                    .nonvalidation_tool_debounce_seconds,
-            )
-        {
-            if debounce.is_zero() {
-                self.menvane
-                    .sessions
-                    .mark_handoff_dirty(episode_id, debounce)?;
-            } else {
-                self.menvane.sessions.mark_handoff_dirty_at(
-                    episode_id,
-                    debounce,
-                    event.timestamp,
-                )?;
-            }
-        }
-        Ok(CaptureOutcome::Stored)
     }
 
     pub fn finalize_idle(&self, idle_seconds: u64) -> Result<usize> {
@@ -160,33 +131,6 @@ impl<'a> SessionEngine<'a> {
             .commit(&format!("feat(session): finalize {}", session.id));
         Ok(())
     }
-}
-
-fn checkpoint_debounce(event: &NormalizedEvent, nonvalidation_seconds: u64) -> Option<StdDuration> {
-    match event.kind {
-        NormalizedEventKind::UserPrompt if event.is_user_prompt() => event
-            .bounded_input
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(|_| StdDuration::ZERO),
-        NormalizedEventKind::UserPrompt => None,
-        NormalizedEventKind::ToolCompleted => Some(
-            if event.tool_family.as_deref().is_some_and(is_validation_tool) {
-                StdDuration::ZERO
-            } else {
-                StdDuration::from_secs(nonvalidation_seconds)
-            },
-        ),
-        NormalizedEventKind::ContextCompacted
-        | NormalizedEventKind::TurnStopped
-        | NormalizedEventKind::SessionEnded => Some(StdDuration::ZERO),
-        NormalizedEventKind::SessionStarted => None,
-    }
-}
-
-fn is_validation_tool(tool: &str) -> bool {
-    let tool = tool.to_ascii_lowercase();
-    tool.contains("test") || tool.contains("build") || tool.contains("check")
 }
 
 fn session_title(session: &SessionRecord, events: &[NormalizedEvent]) -> String {

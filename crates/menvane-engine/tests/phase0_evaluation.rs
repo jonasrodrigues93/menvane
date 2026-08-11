@@ -3,7 +3,6 @@ use std::fs;
 use std::sync::Arc;
 
 use menvane_engine::{MemoryCompiler, Menvane, ScopeSelection, WriteMemory};
-use menvane_store::conversation_key;
 use serde::Serialize;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -60,7 +59,6 @@ async fn phase0_corpus_compiles_replays_recall_and_matches_baseline() {
     }
 
     let replay = evaluate_recall(&corpus, &compiled);
-    let classification = evaluate_classification(&corpus);
     let calls = provider.calls();
     assert_eq!(
         calls
@@ -73,7 +71,7 @@ async fn phase0_corpus_compiles_replays_recall_and_matches_baseline() {
             .map(|fixture| fixture.id.as_str())
             .collect::<HashSet<_>>()
     );
-    let report = build_report(&corpus, &calls, &compiled, &replay, &classification);
+    let report = build_report(&corpus, &calls, &compiled, &replay);
     let expected: Value =
         serde_json::from_str(include_str!("fixtures/phase0/baseline.json")).unwrap();
     assert_eq!(serde_json::to_value(report).unwrap(), expected);
@@ -257,124 +255,6 @@ struct ReplayMetrics {
     forgotten_fixtures: usize,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct ClassificationMetrics {
-    boundary_matches: usize,
-    predicted_boundaries: usize,
-    expected_boundaries: usize,
-    intent_matches: usize,
-    expected_intents: usize,
-}
-
-#[derive(Debug, Default)]
-struct ClassificationEvaluation {
-    total: ClassificationMetrics,
-    fixtures: HashMap<String, ClassificationMetrics>,
-}
-
-fn evaluate_classification(corpus: &Corpus) -> ClassificationEvaluation {
-    let mut groups: HashMap<String, Vec<&Fixture>> = HashMap::new();
-    for fixture in &corpus.fixtures {
-        groups
-            .entry(format!(
-                "{}\0{}",
-                fixture.session.client, fixture.session.external_session_id
-            ))
-            .or_default()
-            .push(fixture);
-    }
-    let mut evaluation = ClassificationEvaluation::default();
-    for fixtures in groups.into_values() {
-        let temporary = TempDir::new().unwrap();
-        let project = temporary.path().join("project");
-        fs::create_dir_all(&project).unwrap();
-        common::init_git(&project);
-        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
-        let mut events = fixtures
-            .iter()
-            .flat_map(|fixture| fixture.session.events.iter().cloned())
-            .collect::<Vec<_>>();
-        events.sort_by_key(|event| event.timestamp);
-        for mut event in events {
-            event.cwd = project.to_string_lossy().into_owned();
-            menvane.ingest_event(event).unwrap();
-        }
-        let project_id = menvane
-            .ensure_project(&project)
-            .unwrap()
-            .map(|project| project.id);
-        let key = conversation_key(
-            &fixtures[0].session.client,
-            &fixtures[0].session.external_session_id,
-        );
-        let episodes = menvane.episodes(&key, project_id.as_deref()).unwrap();
-        let intents = menvane.prompt_intents(&key, project_id.as_deref()).unwrap();
-        for fixture in fixtures {
-            let expected_roots = fixture
-                .expected
-                .episodes
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|episode| {
-                    episode
-                        .get("event_ids")
-                        .and_then(Value::as_array)
-                        .and_then(|events| events.first())
-                        .and_then(Value::as_str)
-                })
-                .collect::<HashSet<_>>();
-            let predicted_roots = episodes
-                .iter()
-                .map(|episode| episode.root_event_id.as_str())
-                .collect::<HashSet<_>>();
-            let expected_intents = fixture.expected.intents.as_array().unwrap();
-            let actual_intents = intents
-                .iter()
-                .map(|intent| (intent.event_id.clone(), intent.kind))
-                .collect::<HashMap<_, _>>();
-            let intent_matches = expected_intents
-                .iter()
-                .filter(|expected| {
-                    let event_id = expected.get("event_id").and_then(Value::as_str);
-                    let kind = expected.get("kind").and_then(Value::as_str);
-                    event_id.zip(kind).is_some_and(|(event_id, kind)| {
-                        actual_intents
-                            .get(event_id)
-                            .is_some_and(|actual| format_intent_kind(*actual) == kind)
-                    })
-                })
-                .count();
-            let metrics = ClassificationMetrics {
-                boundary_matches: expected_roots.intersection(&predicted_roots).count(),
-                predicted_boundaries: predicted_roots.len(),
-                expected_boundaries: expected_roots.len(),
-                intent_matches,
-                expected_intents: expected_intents.len(),
-            };
-            evaluation.total.boundary_matches += metrics.boundary_matches;
-            evaluation.total.predicted_boundaries += metrics.predicted_boundaries;
-            evaluation.total.expected_boundaries += metrics.expected_boundaries;
-            evaluation.total.intent_matches += metrics.intent_matches;
-            evaluation.total.expected_intents += metrics.expected_intents;
-            evaluation.fixtures.insert(fixture.id.clone(), metrics);
-        }
-    }
-    evaluation
-}
-
-fn format_intent_kind(kind: menvane_domain::PromptIntentKind) -> &'static str {
-    match kind {
-        menvane_domain::PromptIntentKind::RootGoal => "root-goal",
-        menvane_domain::PromptIntentKind::NewGoal => "new-goal",
-        menvane_domain::PromptIntentKind::Refinement => "refinement",
-        menvane_domain::PromptIntentKind::Constraint => "constraint",
-        menvane_domain::PromptIntentKind::Correction => "correction",
-        menvane_domain::PromptIntentKind::FollowUp => "follow-up",
-        menvane_domain::PromptIntentKind::Operational => "operational",
-    }
-}
-
 fn evaluate_project_isolation() -> (usize, usize) {
     let temporary = TempDir::new().unwrap();
     let project_a = temporary.path().join("project-a");
@@ -410,7 +290,6 @@ fn build_report(
     calls: &[phase0::ProviderCall],
     compiled: &HashMap<String, Vec<menvane_engine::CompiledMemory>>,
     replay: &ReplayMetrics,
-    classification: &ClassificationEvaluation,
 ) -> Report {
     let expected_count = corpus
         .fixtures
@@ -472,27 +351,16 @@ fn build_report(
             not_meaningful("episode and handoff engines are planned for later phases"),
         );
     }
-    metrics.insert(
-        "episode_boundary_precision".to_owned(),
-        ratio(
-            classification.total.boundary_matches,
-            classification.total.predicted_boundaries,
-        ),
-    );
-    metrics.insert(
-        "episode_boundary_recall".to_owned(),
-        ratio(
-            classification.total.boundary_matches,
-            classification.total.expected_boundaries,
-        ),
-    );
-    metrics.insert(
-        "prompt_intent_classification_accuracy".to_owned(),
-        ratio(
-            classification.total.intent_matches,
-            classification.total.expected_intents,
-        ),
-    );
+    for name in [
+        "episode_boundary_precision",
+        "episode_boundary_recall",
+        "prompt_intent_classification_accuracy",
+    ] {
+        metrics.insert(
+            name.to_owned(),
+            not_meaningful("deterministic episode and intent classification is retired in 1.23"),
+        );
+    }
     metrics.insert(
         "memory_extraction_precision".to_owned(),
         ratio(matched_count, actual_count),
@@ -604,28 +472,18 @@ fn build_report(
                 "memory_extraction_precision".to_owned(),
                 ratio(expected, actual),
             );
-            let classification = classification.fixtures.get(&fixture.id).unwrap();
-            fixture_metrics.insert(
-                "episode_boundary_precision".to_owned(),
-                ratio(
-                    classification.boundary_matches,
-                    classification.predicted_boundaries,
-                ),
-            );
-            fixture_metrics.insert(
-                "episode_boundary_recall".to_owned(),
-                ratio(
-                    classification.boundary_matches,
-                    classification.expected_boundaries,
-                ),
-            );
-            fixture_metrics.insert(
-                "prompt_intent_classification_accuracy".to_owned(),
-                ratio(
-                    classification.intent_matches,
-                    classification.expected_intents,
-                ),
-            );
+            for name in [
+                "episode_boundary_precision",
+                "episode_boundary_recall",
+                "prompt_intent_classification_accuracy",
+            ] {
+                fixture_metrics.insert(
+                    name.to_owned(),
+                    not_meaningful(
+                        "deterministic episode and intent classification is retired in 1.23",
+                    ),
+                );
+            }
             fixture_metrics.insert(
                 "memory_extraction_recall".to_owned(),
                 ratio(expected, expected),

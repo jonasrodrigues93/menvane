@@ -10,10 +10,10 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use fs2::FileExt;
-use menvane_domain::{HandoffStatus, NormalizedEvent};
+use menvane_domain::{NormalizedEvent, ProjectHandoff};
 use menvane_engine::{
-    CaptureOutcome, MAX_HANDOFF_ITEM_BYTES, MAX_HANDOFF_LIST_LIMIT, MAX_RECALL_CWD_BYTES,
-    MAX_RECALL_IDENTIFIER_BYTES, Menvane,
+    CaptureOutcome, MAX_HANDOFF_ITEM_BYTES, MAX_RECALL_CWD_BYTES, MAX_RECALL_IDENTIFIER_BYTES,
+    Menvane,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -61,13 +61,7 @@ pub fn app(state: Arc<Menvane>) -> Router {
         .route("/api/v1/memories", get(api_memories))
         .route("/api/v1/sessions", get(api_sessions))
         .route("/api/v1/handoffs", get(api_handoffs))
-        .route("/api/v1/handoffs/{id}", get(api_handoff_detail))
-        .route("/api/v1/handoffs/{id}/consume", post(api_handoff_consume))
-        .route("/api/v1/handoffs/{id}/complete", post(api_handoff_complete))
-        .route(
-            "/api/v1/handoffs/{id}/supersede",
-            post(api_handoff_supersede),
-        )
+        .route("/api/v1/handoffs/{project_id}", get(api_handoff_detail))
         .route("/api/v1/imports", get(api_imports))
         .route("/api/v1/integrations", get(api_integrations))
         .route("/api/v1/settings", get(api_settings))
@@ -187,21 +181,12 @@ struct ApiHandoffsQuery {
     session_id: Option<String>,
     project: Option<String>,
     session: Option<String>,
-    status: Option<String>,
-    #[serde(default = "default_handoff_limit")]
-    limit: usize,
-}
-
-fn default_handoff_limit() -> usize {
-    25
 }
 
 async fn api_handoffs(
     State(menvane): State<Arc<Menvane>>,
     Query(query): Query<ApiHandoffsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let limit = validate_handoff_limit(query.limit)?;
-    let status = parse_handoff_status(query.status.as_deref())?;
     let project_id = query.project_id.or(query.project);
     let session_id = query.session_id.or(query.session);
     let scope = query
@@ -216,132 +201,59 @@ async fn api_handoffs(
     if let Some(project_id) = project_id.as_deref() {
         valid_handoff_selector(project_id, "project_id")?;
     }
-    let handoffs = match scope {
-        "all" if project_id.is_none() && session_id.is_none() => {
-            menvane.all_handoffs(status, limit)
-        }
-        "project" if project_id.is_some() && session_id.is_none() => {
-            menvane.project_handoffs(project_id.as_deref().unwrap(), status, limit)
-        }
-        "session" if session_id.is_some() && project_id.is_none() => {
-            let id = parse_uuid(session_id.as_deref().unwrap(), "session_id")?;
-            menvane.session_handoffs(id, status, limit)
-        }
-        _ => {
-            return Err(bad_request(
-                "handoff scope must be all, project, or session with one matching selector"
-                    .to_owned(),
-            ));
-        }
+    if !matches!(scope, "all" | "project" | "session") {
+        return Err(bad_request(
+            "handoff scope must be all, project, or session with one matching selector".to_owned(),
+        ));
     }
+    let session_uuid = match scope {
+        "session" => Some(parse_uuid(session_id.as_deref().unwrap(), "session_id")?),
+        _ => None,
+    };
+    let handoffs: Vec<ProjectHandoff> = (|| -> Result<Vec<ProjectHandoff>> {
+        match scope {
+            "all" => menvane.all_project_handoffs(),
+            "project" => {
+                let project_id = project_id.as_deref().unwrap();
+                Ok(menvane
+                    .current_project_handoff(Some(project_id))?
+                    .into_iter()
+                    .collect())
+            }
+            "session" => Ok(menvane
+                .session_project_handoff(session_uuid.unwrap())?
+                .into_iter()
+                .collect()),
+            _ => unreachable!(),
+        }
+    })()
     .map_err(internal_server_error)?;
     Ok(Json(Value::Array(
-        handoffs.into_iter().map(handoff_summary).collect(),
+        handoffs.into_iter().map(handoff_payload).collect(),
     )))
 }
 
-fn handoff_summary(handoff: menvane_domain::TaskHandoff) -> Value {
+fn handoff_payload(handoff: ProjectHandoff) -> Value {
     json!({
-        "id": handoff.id,
         "project_id": handoff.project_id,
-        "conversation_key": handoff.conversation_key,
-        "episode_id": handoff.episode_id,
-        "source_session_id": handoff.source_session_id,
-        "source_client": handoff.source_client,
-        "status": handoff.status,
-        "goal": bounded_api_text(&handoff.goal, 512),
-        "next_action": handoff.next_action.as_deref().map(|value| bounded_api_text(value, 512)),
-        "blocker_count": handoff.blockers.len(),
-        "changed_files": handoff.changed_files.into_iter().take(8).collect::<Vec<_>>(),
-        "fingerprint": {
-            "git_head": handoff.git_head,
-            "worktree_state_hash": handoff.worktree_state_hash,
-        },
+        "summary": handoff.summary,
+        "source_session_ids": handoff.source_session_ids,
+        "fingerprint": handoff.fingerprint,
+        "created_at": handoff.created_at,
         "updated_at": handoff.updated_at,
     })
 }
 
-fn bounded_api_text(value: &str, limit: usize) -> String {
-    value.chars().take(limit).collect()
-}
-
 async fn api_handoff_detail(
     State(menvane): State<Arc<Menvane>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Path(project_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let id = parse_uuid(&id, "handoff id")?;
-    let detail = menvane
-        .handoff_detail(id)
+    valid_handoff_selector(&project_id, "project_id")?;
+    let handoff = menvane
+        .current_project_handoff(Some(&project_id))
         .map_err(internal_server_error)?
-        .ok_or_else(|| not_found(format!("handoff {id} not found")))?;
-    Ok(Json(
-        serde_json::to_value(detail).map_err(|error| internal_server_error(error.into()))?,
-    ))
-}
-
-async fn api_handoff_consume(
-    State(menvane): State<Arc<Menvane>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    lifecycle_handoff(&menvane, &id, |menvane, id| menvane.consume_handoff(id)).await
-}
-
-async fn api_handoff_complete(
-    State(menvane): State<Arc<Menvane>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    lifecycle_handoff(&menvane, &id, |menvane, id| menvane.complete_handoff(id)).await
-}
-
-async fn api_handoff_supersede(
-    State(menvane): State<Arc<Menvane>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    lifecycle_handoff(&menvane, &id, |menvane, id| menvane.supersede_handoff(id)).await
-}
-
-async fn lifecycle_handoff(
-    menvane: &Menvane,
-    raw_id: &str,
-    action: impl FnOnce(&Menvane, Uuid) -> anyhow::Result<menvane_domain::TaskHandoff>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let id = parse_uuid(raw_id, "handoff id")?;
-    if menvane
-        .handoff_detail(id)
-        .map_err(internal_server_error)?
-        .is_none()
-    {
-        return Err(not_found(format!("handoff {id} not found")));
-    }
-    let handoff = action(menvane, id).map_err(internal_server_error)?;
-    Ok(Json(json!({ "handoff": handoff })))
-}
-
-fn validate_handoff_limit(limit: usize) -> Result<usize, (StatusCode, Json<Value>)> {
-    if limit == 0 || limit > MAX_HANDOFF_LIST_LIMIT {
-        return Err(bad_request(format!(
-            "handoff limit must be between 1 and {MAX_HANDOFF_LIST_LIMIT}"
-        )));
-    }
-    Ok(limit)
-}
-
-fn parse_handoff_status(
-    value: Option<&str>,
-) -> Result<Option<HandoffStatus>, (StatusCode, Json<Value>)> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let status = match value {
-        "active" => HandoffStatus::Active,
-        "ready" => HandoffStatus::Ready,
-        "consumed" => HandoffStatus::Consumed,
-        "completed" => HandoffStatus::Completed,
-        "stale" => HandoffStatus::Stale,
-        "superseded" => HandoffStatus::Superseded,
-        _ => return Err(bad_request(format!("unsupported handoff status: {value}"))),
-    };
-    Ok(Some(status))
+        .ok_or_else(|| not_found(format!("handoff for project {project_id} not found")))?;
+    Ok(Json(handoff_payload(handoff)))
 }
 
 fn parse_uuid(value: &str, name: &str) -> Result<Uuid, (StatusCode, Json<Value>)> {
@@ -813,7 +725,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handoff_rest_lists_details_validates_and_runs_lifecycle() {
+    async fn handoff_rest_returns_one_current_summary_per_project() {
         let temporary = TempDir::new().unwrap();
         let project = temporary.path().join("project");
         fs::create_dir_all(&project).unwrap();
@@ -861,73 +773,80 @@ mod tests {
         tool.attributed_path = Some("src/lib.rs".to_owned());
         tool.success = Some(true);
         post_event(app(Arc::clone(&menvane)), &tool).await;
+        post_event(
+            app(Arc::clone(&menvane)),
+            &test_event(
+                &project,
+                "handoff-end",
+                NormalizedEventKind::SessionEnded,
+                None,
+            ),
+        )
+        .await;
         assert!(menvane.process_next_job().await.unwrap());
-        let handoff = menvane.all_handoffs(None, 10).unwrap().remove(0);
-        let project_id = handoff.project_id.clone().unwrap();
-        let session_id = handoff.source_session_id;
+        assert!(menvane.process_next_job().await.unwrap());
+        let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
+        let session_id = menvane
+            .all_memories()
+            .unwrap()
+            .into_iter()
+            .find(|memory| memory.metadata.memory_type == menvane_domain::MemoryType::Session)
+            .unwrap()
+            .metadata
+            .id;
         let router = app(Arc::clone(&menvane));
+
+        for uri in [
+            "/api/v1/handoffs?scope=project&project_id=invalid-project",
+            format!("/api/v1/handoffs?scope=project&project_id={project_id}").as_str(),
+            format!("/api/v1/handoffs?scope=session&session_id={session_id}").as_str(),
+            "/api/v1/handoffs?scope=all",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
 
         let list = router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/handoffs?scope=project&project_id=invalid-project&limit=1")
+                    .uri("/api/v1/handoffs?scope=project&project_id=invalid-project")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(list.status(), StatusCode::OK);
         let bytes = to_bytes(list.into_body(), usize::MAX).await.unwrap();
         let list: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(list.as_array().unwrap().is_empty());
+
         let list = router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/handoffs?scope=all&limit=1")
+                    .uri("/api/v1/handoffs?scope=all")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(list.status(), StatusCode::OK);
         let bytes = to_bytes(list.into_body(), usize::MAX).await.unwrap();
         let list: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
-        let list = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/api/v1/handoffs?scope=session&session_id={session_id}&status=active"
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(list.status(), StatusCode::OK);
-        let bytes = to_bytes(list.into_body(), usize::MAX).await.unwrap();
-        let list: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(list.as_array().unwrap().len(), 1);
-        let invalid_status = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/handoffs?status=unknown")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(invalid_status.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            list.as_array().unwrap()[0]["summary"],
+            "server test handoff summary"
+        );
 
         let detail = router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v1/handoffs/{}", handoff.id))
+                    .uri(format!("/api/v1/handoffs/{project_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -936,37 +855,14 @@ mod tests {
         assert_eq!(detail.status(), StatusCode::OK);
         let bytes = to_bytes(detail.into_body(), usize::MAX).await.unwrap();
         let detail: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(detail["handoff"]["id"], handoff.id.to_string());
-        assert!(detail["versions"].is_array());
-        assert!(detail["evidence"].is_array());
+        assert_eq!(detail["project_id"], project_id);
+        assert_eq!(detail["summary"], "server test handoff summary");
 
-        let invalid = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/handoffs/not-a-uuid")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-        let invalid_limit = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/handoffs?limit=101")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(invalid_limit.status(), StatusCode::BAD_REQUEST);
         let missing = router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!("/api/v1/handoffs/{}", Uuid::now_v7()))
+                    .uri("/api/v1/handoffs/missing-project")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -974,32 +870,17 @@ mod tests {
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
-        for action in ["consume", "complete"] {
+        for uri in [
+            "/api/v1/handoffs?scope=all&limit=101",
+            "/api/v1/handoffs?scope=all&status=unknown",
+        ] {
             let response = router
                 .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(format!("/api/v1/handoffs/{}/{}", handoff.id, action))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{action}");
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
         }
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/api/v1/handoffs/{}/supersede", handoff.id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(project_id, handoff.project_id.unwrap());
     }
 
     struct ServerHandoffProvider;
@@ -1012,27 +893,26 @@ mod tests {
             _schema: JsonSchema,
         ) -> Result<StructuredResponse, LlmError> {
             let input: Value = serde_json::from_str(&request.prompt).unwrap();
-            let evidence = &input["episode_evidence"];
-            let mut source_event_ids =
-                vec![evidence["goal"]["event_id"].as_str().unwrap().to_owned()];
-            for item in evidence["actions"].as_array().into_iter().flatten() {
-                source_event_ids.push(item["event_id"].as_str().unwrap().to_owned());
-            }
+            let session_id = input["session"]["session_id"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_owned();
+            let events = input["session"]["events"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let ids = events
+                .iter()
+                .filter_map(|event| event["event_id"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
             Ok(StructuredResponse {
                 value: json!({
-                    "operation": "create",
-                    "source_event_ids": source_event_ids,
-                    "fields": {
-                        "goal": evidence["goal"]["content"],
-                        "current_state": "server test state",
-                        "completed_work": [],
-                        "pending_work": ["continue the task"],
-                        "next_action": "continue the task",
-                        "blockers": [],
-                        "changed_files": [],
-                        "decisions": [],
-                        "validation": [],
-                        "relevant_memory_ids": []
+                    "goals": [],
+                    "memories": [],
+                    "handoff": {
+                        "summary": "server test handoff summary",
+                        "source_session_ids": [session_id],
+                        "evidence_event_ids": ids
                     }
                 }),
                 provider: "server-test".to_owned(),

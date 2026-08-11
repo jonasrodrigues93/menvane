@@ -1,10 +1,15 @@
 use std::fs;
 
 use chrono::{Duration, Utc};
-use menvane_domain::{Applicability, MemoryType, NormalizedEvent, NormalizedEventKind, Scope};
+use menvane_domain::{
+    Applicability, GoalOperation, GoalOperationKind, MemoryType, NormalizedEvent,
+    NormalizedEventKind, Scope,
+};
 use menvane_engine::{Menvane, WriteMemory};
+use menvane_store::SessionRepository;
 use rusqlite::Connection;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 mod common;
 
@@ -101,8 +106,8 @@ fn rendered_entries_have_metadata_and_no_full_body() {
 }
 
 #[test]
-fn active_constraints_are_required_without_mcp() {
-    let (_temporary, project, menvane) = setup();
+fn consolidated_goals_are_required_context() {
+    let (temporary, project, menvane) = setup();
     ingest(
         &menvane,
         &project,
@@ -117,12 +122,12 @@ fn active_constraints_are_required_without_mcp() {
         NormalizedEventKind::UserPrompt,
         Some("Implement the storage change."),
     );
-    ingest(
+    apply_goal(
         &menvane,
+        &temporary,
         &project,
-        "constraint",
-        NormalizedEventKind::UserPrompt,
-        Some("The migration must preserve encrypted backups."),
+        "root",
+        "The migration must preserve encrypted backups.",
     );
     let context = menvane
         .prompt_context_for_client(
@@ -219,7 +224,7 @@ fn briefing_delivery_is_once_without_suppressing_prompt_recall() {
 }
 
 #[test]
-fn required_budget_overflow_keeps_gotcha_in_secondary_delivery() {
+fn budget_overflow_keeps_gotcha_in_secondary_delivery() {
     let (_temporary, project, menvane) = setup();
     ingest(
         &menvane,
@@ -236,13 +241,7 @@ fn required_budget_overflow_keeps_gotcha_in_secondary_delivery() {
         Some("Implement the fallback change."),
     );
     let constraint = format!("Constraint: {}", "preserve this rule ".repeat(95));
-    ingest(
-        &menvane,
-        &project,
-        "constraint",
-        NormalizedEventKind::UserPrompt,
-        Some(&constraint),
-    );
+    apply_goal(&menvane, &_temporary, &project, "root", &constraint);
     write(
         &menvane,
         &project,
@@ -321,5 +320,38 @@ fn ingest(
             model: None,
             harness_injected: false,
         })
+        .unwrap();
+}
+
+fn apply_goal(
+    menvane: &Menvane,
+    temporary: &TempDir,
+    project: &std::path::Path,
+    event_id: &str,
+    summary: &str,
+) {
+    let repository = SessionRepository::new(temporary.path().join("home/state.sqlite"));
+    let session_id: String = Connection::open(temporary.path().join("home/state.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT id FROM sessions ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let project_id = menvane.ensure_project(project).unwrap().unwrap().id;
+    let operation = GoalOperation {
+        kind: GoalOperationKind::Create,
+        goal_id: None,
+        summary: Some(summary.to_owned()),
+        event_ids: vec![event_id.to_owned()],
+    };
+    repository
+        .apply_goal_operations(
+            Uuid::parse_str(&session_id).unwrap(),
+            Some(&project_id),
+            &menvane_store::conversation_key("test-client", "external-session"),
+            &[operation],
+        )
         .unwrap();
 }

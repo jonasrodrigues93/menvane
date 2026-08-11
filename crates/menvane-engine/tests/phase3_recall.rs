@@ -1,9 +1,15 @@
 use std::fs;
 
 use chrono::{Duration, Utc};
-use menvane_domain::{Applicability, MemoryType, NormalizedEvent, NormalizedEventKind, Scope};
+use menvane_domain::{
+    Applicability, GoalOperation, GoalOperationKind, MemoryType, NormalizedEvent,
+    NormalizedEventKind, Scope,
+};
 use menvane_engine::{Menvane, WriteMemory};
+use menvane_store::SessionRepository;
+use rusqlite::Connection;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 mod common;
 
@@ -77,9 +83,9 @@ fn current_prompt_dominates_conflicting_root_intent() {
 }
 
 #[test]
-fn active_constraints_contribute_to_recall() {
+fn consolidated_goals_contribute_to_recall() {
     let (temporary, project, menvane) = setup();
-    let constraint_memory = write(
+    let goal_memory = write(
         &menvane,
         &project,
         "Encrypted backup constraint",
@@ -99,12 +105,12 @@ fn active_constraints_contribute_to_recall() {
         NormalizedEventKind::UserPrompt,
         Some("Implement storage migration."),
     );
-    ingest(
+    apply_goal(
         &menvane,
+        &temporary,
         &project,
-        "constraint",
-        NormalizedEventKind::UserPrompt,
-        Some("Must preserve encrypted backups."),
+        "root",
+        "Must preserve encrypted backups.",
     );
     let recall = menvane
         .prompt_recall(
@@ -119,14 +125,14 @@ fn active_constraints_contribute_to_recall() {
         recall
             .results
             .iter()
-            .any(|result| result.id == constraint_memory.metadata.id)
+            .any(|result| result.id == goal_memory.metadata.id)
     );
     assert!(
         recall
             .diagnostics
             .queries
             .iter()
-            .any(|query| query.source == "active-constraint-1")
+            .any(|query| query.source == "goal-1")
     );
     drop(temporary);
 }
@@ -423,5 +429,38 @@ fn ingest(
             model: None,
             harness_injected: false,
         })
+        .unwrap();
+}
+
+fn apply_goal(
+    menvane: &Menvane,
+    temporary: &TempDir,
+    project: &std::path::Path,
+    event_id: &str,
+    summary: &str,
+) {
+    let repository = SessionRepository::new(temporary.path().join("home/state.sqlite"));
+    let session_id: String = Connection::open(temporary.path().join("home/state.sqlite"))
+        .unwrap()
+        .query_row(
+            "SELECT id FROM sessions ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let project_id = menvane.ensure_project(project).unwrap().unwrap().id;
+    let operation = GoalOperation {
+        kind: GoalOperationKind::Create,
+        goal_id: None,
+        summary: Some(summary.to_owned()),
+        event_ids: vec![event_id.to_owned()],
+    };
+    repository
+        .apply_goal_operations(
+            Uuid::parse_str(&session_id).unwrap(),
+            Some(&project_id),
+            &menvane_store::conversation_key("test-client", "external-session"),
+            &[operation],
+        )
         .unwrap();
 }

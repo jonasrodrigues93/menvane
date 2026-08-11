@@ -321,43 +321,14 @@ fn intent_queries(current_prompt: &str, context: Option<&RecallContext>) -> Vec<
         current_prompt,
         CURRENT_PROMPT_WEIGHT,
     );
-    if let Some(context) = context
-        && let Some(episode) = &context.active_episode
-    {
-        add_query(
-            &mut queries,
-            "active-episode-goal",
-            &episode.goal,
-            ACTIVE_EPISODE_GOAL_WEIGHT,
-        );
-        for (index, correction) in context.active_corrections.iter().enumerate() {
+    if let Some(context) = context {
+        for (index, goal) in context.goals.iter().enumerate() {
             add_query(
                 &mut queries,
-                &format!("active-correction-{}", index + 1),
-                correction,
-                ACTIVE_CORRECTION_WEIGHT,
+                &format!("goal-{}", index + 1),
+                &goal.summary,
+                ACTIVE_EPISODE_GOAL_WEIGHT,
             );
-        }
-        for (index, constraint) in context.active_constraints.iter().enumerate() {
-            add_query(
-                &mut queries,
-                &format!("active-constraint-{}", index + 1),
-                constraint,
-                ACTIVE_CONSTRAINT_WEIGHT,
-            );
-        }
-        let root_goal = context
-            .conversation_root_goal
-            .as_deref()
-            .unwrap_or_default();
-        if !root_goal.trim().is_empty() {
-            let root_goal = bounded_query(root_goal);
-            queries.push(RecallQuery {
-                source: "conversation-root-goal".to_owned(),
-                query: root_goal.clone(),
-                weight: CONVERSATION_ROOT_GOAL_WEIGHT,
-                enabled: !root_goal.eq_ignore_ascii_case(&bounded_query(&episode.goal)),
-            });
         }
     }
     queries
