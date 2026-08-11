@@ -38,6 +38,61 @@ pub struct CaptureSanitizer {
     secret_assignment: Regex,
 }
 
+struct InstructionBlock {
+    open: &'static str,
+    close: &'static str,
+}
+
+const INSTRUCTION_BLOCKS: &[InstructionBlock] = &[
+    InstructionBlock {
+        open: "<available-skills",
+        close: "</available-skills>",
+    },
+    InstructionBlock {
+        open: "<recommended_plugins",
+        close: "</recommended_plugins>",
+    },
+    InstructionBlock {
+        open: "<recommended-plugins",
+        close: "</recommended-plugins>",
+    },
+    InstructionBlock {
+        open: "<system-prompt",
+        close: "</system-prompt>",
+    },
+    InstructionBlock {
+        open: "<agent-instructions",
+        close: "</agent-instructions>",
+    },
+    InstructionBlock {
+        open: "<system>",
+        close: "</system>",
+    },
+    InstructionBlock {
+        open: "[task handoff]",
+        close: "end task handoff",
+    },
+    InstructionBlock {
+        open: "menvane memory context",
+        close: "end menvane memory context",
+    },
+];
+
+const FILTERED_LINES: &[&str] = &[
+    "agents.md",
+    "skill.md",
+    "/skills/",
+    "<available-skills",
+    "<recommended_plugins",
+    "<recommended-plugins",
+    "[required active constraint or correction]",
+    "[required context]",
+    "[relevant excerpt]",
+    "[retrieval card]",
+    "[session-start memory]",
+    "[historical handoff card]",
+];
+
 impl CaptureSanitizer {
     pub fn new(config: CaptureSanitizerConfig) -> anyhow::Result<Self> {
         let mut builder = GlobSetBuilder::new();
@@ -91,6 +146,27 @@ impl CaptureSanitizer {
         Some(event)
     }
 
+    pub fn filter_durable_event(&self, event: NormalizedEvent) -> Option<NormalizedEvent> {
+        if event.is_injected_content() {
+            return None;
+        }
+        let mut event = event;
+        event.bounded_input = event
+            .bounded_input
+            .as_deref()
+            .and_then(|value| self.filter_content(value))
+            .filter(|value| !value.trim().is_empty());
+        event.bounded_output = event
+            .bounded_output
+            .as_deref()
+            .and_then(|value| self.filter_content(value))
+            .filter(|value| !value.trim().is_empty());
+        if event.is_user_prompt() && event.bounded_input.is_none() {
+            return None;
+        }
+        Some(event)
+    }
+
     pub fn sanitize_prompt(&self, value: &str) -> String {
         self.clean(
             value,
@@ -111,54 +187,29 @@ impl CaptureSanitizer {
 
     pub fn filter_content(&self, value: &str) -> Option<String> {
         let mut filtered = Vec::new();
-        let mut instruction_block = false;
+        let mut open_block: Option<&'static str> = None;
         for line in value.lines() {
-            let normalized = line.to_ascii_lowercase();
-            let starts_block = [
-                "<available-skills",
-                "<recommended_plugins",
-                "<recommended-plugins",
-                "<system",
-                "<system-prompt",
-                "<agent-instructions",
-            ]
-            .iter()
-            .any(|marker| normalized.contains(marker));
-            if starts_block {
-                instruction_block = ![
-                    "</available-skills>",
-                    "</recommended_plugins>",
-                    "</recommended-plugins>",
-                    "</system>",
-                    "</system-prompt>",
-                    "</agent-instructions>",
-                ]
+            let trimmed = line.trim_start().to_ascii_lowercase();
+            if let Some(block) = INSTRUCTION_BLOCKS
                 .iter()
-                .any(|marker| normalized.contains(marker));
+                .find(|block| trimmed.contains(block.open))
+                .map(|block| block.close)
+            {
+                if trimmed.contains(block) {
+                    continue;
+                }
+                open_block = Some(block);
                 continue;
             }
-            if instruction_block {
-                if [
-                    "</available-skills>",
-                    "</recommended_plugins>",
-                    "</recommended-plugins>",
-                    "</system>",
-                    "</system-prompt>",
-                    "</agent-instructions>",
-                ]
-                .iter()
-                .any(|marker| normalized.contains(marker))
-                {
-                    instruction_block = false;
+            if let Some(close) = open_block {
+                if trimmed.contains(close) {
+                    open_block = None;
                 }
                 continue;
             }
-            if normalized.contains("agents.md")
-                || normalized.contains("skill.md")
-                || normalized.contains("<available-skills")
-                || normalized.contains("<recommended_plugins")
-                || normalized.contains("<recommended-plugins")
-                || normalized.contains("/skills/")
+            if FILTERED_LINES
+                .iter()
+                .any(|marker| trimmed.contains(marker))
             {
                 continue;
             }
@@ -228,7 +279,7 @@ fn instruction_ignore_paths() -> [&'static str; 6] {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use menvane_domain::{NormalizedEvent, NormalizedEventKind};
+    use menvane_domain::{NormalizedEvent, NormalizedEventKind, NormalizedEventRole};
 
     use super::*;
 
@@ -281,6 +332,42 @@ mod tests {
         assert_eq!(captured.bounded_output.as_deref(), Some("safe result"));
     }
 
+    #[test]
+    fn removes_menvane_and_handoff_delimited_context_from_composed_fields() {
+        let sanitizer = CaptureSanitizer::new(CaptureSanitizerConfig::default()).unwrap();
+        let mut captured = event();
+        captured.kind = NormalizedEventKind::UserPrompt;
+        captured.role = NormalizedEventRole::UserPrompt;
+        captured.origin = Default::default();
+        captured.bounded_input = Some(
+            "Implement the export\nMENVANE MEMORY CONTEXT\nHistorical context only.\n[TASK HANDOFF]\nGoal: x\nEND TASK HANDOFF\nEND MENVANE MEMORY CONTEXT\nContinue the export"
+                .to_owned(),
+        );
+        let captured = sanitizer.filter_durable_event(captured).unwrap();
+        assert_eq!(
+            captured.bounded_input.as_deref(),
+            Some("Implement the export\nContinue the export")
+        );
+    }
+
+    #[test]
+    fn fully_injected_prompt_is_dropped_from_the_durable_session() {
+        let sanitizer = CaptureSanitizer::new(CaptureSanitizerConfig::default()).unwrap();
+        let mut captured = event();
+        captured.kind = NormalizedEventKind::UserPrompt;
+        captured.role = NormalizedEventRole::UserPrompt;
+        captured.origin = Default::default();
+        captured.bounded_input =
+            Some("MENVANE MEMORY CONTEXT\nEND MENVANE MEMORY CONTEXT".to_owned());
+        assert!(sanitizer.filter_durable_event(captured).is_none());
+
+        let mut injected = event();
+        injected.kind = NormalizedEventKind::UserPrompt;
+        injected.harness_injected = true;
+        injected.bounded_input = Some("system instructions".to_owned());
+        assert!(sanitizer.filter_durable_event(injected).is_none());
+    }
+
     fn event() -> NormalizedEvent {
         NormalizedEvent {
             event_id: "event-1".to_owned(),
@@ -298,6 +385,7 @@ mod tests {
             attributed_path: None,
             success: Some(true),
             model: None,
+            harness_injected: false,
         }
     }
 }
