@@ -57,12 +57,8 @@ struct HandoffArgs {
 
 #[derive(Subcommand)]
 enum HandoffCommand {
-    Inspect(HandoffInspectArgs),
-}
-
-#[derive(Args)]
-struct HandoffInspectArgs {
-    id: Uuid,
+    /// Inspect the single current project handoff summary and its provenance.
+    Inspect,
 }
 
 #[derive(Args)]
@@ -118,15 +114,7 @@ mod tests {
 
     #[test]
     fn parses_handoff_inspection_diagnostics() {
-        assert!(
-            Cli::try_parse_from([
-                "menvane",
-                "handoff",
-                "inspect",
-                "018f2c20-7a1e-7c3b-9f4a-1a2b3c4d5e6f"
-            ])
-            .is_ok()
-        );
+        assert!(Cli::try_parse_from(["menvane", "handoff", "inspect"]).is_ok());
     }
 }
 
@@ -667,11 +655,13 @@ async fn main() -> Result<()> {
             println!("archived {} sessions", menvane.gc()?);
         }
         Command::Handoff(arguments) => match arguments.command {
-            HandoffCommand::Inspect(arguments) => {
-                let detail = menvane
-                    .handoff_detail(arguments.id)?
-                    .ok_or_else(|| anyhow::anyhow!("handoff {} not found", arguments.id))?;
-                println!("{}", serde_json::to_string_pretty(&detail)?);
+            HandoffCommand::Inspect => {
+                let cwd = std::env::current_dir()?;
+                let project_id = menvane.ensure_project(&cwd)?.map(|project| project.id);
+                match menvane.current_project_handoff(project_id.as_deref())? {
+                    Some(handoff) => println!("{}", serde_json::to_string_pretty(&handoff)?),
+                    None => println!("no current handoff for this project"),
+                }
             }
         },
         Command::Mcp => {

@@ -644,7 +644,7 @@ mod tests {
             .await
             .unwrap();
         let project_body = String::from_utf8(project_body.to_vec()).unwrap();
-        assert!(project_body.contains("Handoffs"));
+        assert!(project_body.contains("Handoff"));
         assert!(project_body.contains("handoff-surface"));
         for path in [
             "/",

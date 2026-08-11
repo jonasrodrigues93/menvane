@@ -6,7 +6,7 @@ use axum::extract::{Form, Path, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use menvane_domain::{
-    HandoffStatus, Memory, MemoryType, NormalizedEvent, Project, ProviderHealth, TaskHandoff,
+    Memory, MemoryType, NormalizedEvent, Project, ProjectHandoff, ProviderHealth,
 };
 use menvane_engine::{Menvane, ScopeSelection};
 use serde::Deserialize;
@@ -23,10 +23,7 @@ pub fn router() -> Router<Arc<Menvane>> {
         .route("/procedures", get(procedures))
         .route("/sessions", get(sessions))
         .route("/sessions/{id}", get(session_detail))
-        .route("/handoffs/{id}", get(handoff_detail))
-        .route("/handoffs/{id}/consume", post(consume_handoff))
-        .route("/handoffs/{id}/complete", post(complete_handoff))
-        .route("/handoffs/{id}/supersede", post(supersede_handoff))
+        .route("/handoffs/{project_id}", get(handoff_detail))
         .route("/search", get(search))
         .route("/imports", get(imports))
         .route("/imports/associate", post(associate_orphan))
@@ -141,7 +138,7 @@ async fn project_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Stri
             .into_iter()
             .filter(|memory| memory.metadata.project_id.as_deref() == Some(project.id.as_str()))
             .collect::<Vec<_>>();
-        let handoffs = menvane.project_handoffs(&project.id, None, 100)?;
+        let handoff = menvane.current_project_handoff(Some(&project.id))?;
         let mut names = HashMap::new();
         names.insert(project.id.clone(), project.name.clone());
         Ok(format!(
@@ -157,7 +154,7 @@ async fn project_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Stri
             escape(&project.technologies.tools.join(", ")),
             escape(&project.technologies.databases.join(", ")),
             escape(&project.technologies.platforms.join(", ")),
-            handoff_sections(&handoffs, &project.id),
+            handoff_sections(handoff.as_ref(), &project.id),
             memories
                 .iter()
                 .map(|memory| memory_row(memory, &names))
@@ -289,7 +286,7 @@ async fn sessions(State(menvane): State<Arc<Menvane>>) -> Response {
             "{}<section class='panel'><div class='session-list'>{rows}</div></section>",
             page_head(
                 "Sessions",
-                "Live capture and imported evidence, kept episodic."
+                "Chronological, sanitized capture reconstructed from operational evidence."
             )
         ))
     });
@@ -299,12 +296,12 @@ async fn sessions(State(menvane): State<Arc<Menvane>>) -> Response {
 async fn session_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>) -> Response {
     let content = menvane.read(id).and_then(|memory| {
         let events = menvane.session_events(id)?;
-        let handoffs = menvane.session_handoffs(id, None, 100)?;
+        let handoff = menvane.session_project_handoff(id)?;
         let evidence = events.iter().map(session_evidence_row).collect::<String>();
-        let handoff_rows = handoffs
-            .iter()
-            .map(|handoff| session_handoff_row(&menvane, handoff))
-            .collect::<anyhow::Result<String>>()?;
+        let handoff_rows = handoff
+            .as_ref()
+            .map(project_handoff_row)
+            .unwrap_or_else(|| "<div class='empty-state'>No handoff covers this session.</div>".to_owned());
         Ok(format!(
             "{}<section class='session-overview panel'><div><span class='eyebrow'>Captured session</span><h2>{}</h2><p>{} · {} · generation {}</p></div><a class='panel-link' href='/memories/{}'>Open finalized record →</a></section><div class='session-detail-grid'><section class='panel'><header class='panel-head'><h2>Session evidence</h2><p>Bounded normalized events</p></header><div class='evidence-list'>{}</div></section><section class='panel'><header class='panel-head'><h2>Generated handoffs</h2><p>Artifacts and source evidence</p></header><div class='handoff-list'>{}</div></section></div>",
             page_head(&memory.title, "Operational evidence for one captured session."),
@@ -320,61 +317,30 @@ async fn session_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid
     page_result(&menvane, "sessions", "Session", content)
 }
 
-async fn handoff_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>) -> Response {
+async fn handoff_detail(
+    State(menvane): State<Arc<Menvane>>,
+    Path(project_id): Path<String>,
+) -> Response {
     let content = menvane
-        .handoff_detail(id)
-        .and_then(|detail| detail.ok_or_else(|| anyhow::anyhow!("handoff not found")))
-        .map(|detail| {
-            format!(
-                "{}<section class='panel handoff-detail'><div class='handoff-detail-head'><div><span class='eyebrow'>Handoff artifact</span><h2>{}</h2><p>{} · revision {}</p></div>{}</div><div class='handoff-detail-grid'><div>{}</div><aside><h3>Versions</h3>{}<h3>Source evidence</h3>{}</aside></div></section>",
-                page_head("Handoff detail", "Bounded artifact history and source evidence."),
-                escape(&detail.handoff.goal),
-                escape(&detail.handoff.conversation_key),
-                detail.versions.len() + 1,
-                handoff_actions(&detail.handoff, None),
-                handoff_fields(&detail.handoff),
-                detail
-                    .versions
-                    .iter()
-                    .map(|version| format!("<div class='version-row'><strong>r{}</strong><span>{}</span><time>{}</time></div>", version.revision, title_case(handoff_status(version.status)), version.created_at.format("%Y-%m-%d %H:%M")))
-                    .collect::<String>(),
-                detail
-                    .evidence
-                    .iter()
-                    .map(|evidence| format!("<div class='version-row'><strong>{}</strong><span>session {}</span></div>", escape(&evidence.event_id), evidence.source_session_id))
-                    .collect::<String>()
-            )
+        .current_project_handoff(Some(&project_id))
+        .and_then(|handoff| {
+            handoff
+                .ok_or_else(|| anyhow::anyhow!("no handoff for project {project_id}"))
+                .map(|handoff| {
+                    format!(
+                        "{}<section class='panel handoff-detail'><div class='handoff-detail-head'><div><span class='eyebrow'>Project handoff</span><h2>Current summary</h2><p>Updated {}</p></div></div><div class='handoff-detail-grid'><div><article class='rendered'><p>{}</p></article><h3>Source sessions</h3>{}</div></div></section>",
+                        page_head("Handoff", "The single current project summary."),
+                        handoff.updated_at.format("%Y-%m-%d %H:%M"),
+                        escape(&handoff.summary),
+                        handoff
+                            .source_session_ids
+                            .iter()
+                            .map(|id| format!("<div class='version-row'><strong>session</strong><span>{id}</span></div>"))
+                            .collect::<String>()
+                    )
+                })
         });
     page_result(&menvane, "projects", "Handoff", content)
-}
-
-async fn consume_handoff(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>) -> Response {
-    lifecycle_handoff(&menvane, id, |menvane, id| menvane.consume_handoff(id))
-}
-
-async fn complete_handoff(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>) -> Response {
-    lifecycle_handoff(&menvane, id, |menvane, id| menvane.complete_handoff(id))
-}
-
-async fn supersede_handoff(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>) -> Response {
-    lifecycle_handoff(&menvane, id, |menvane, id| menvane.supersede_handoff(id))
-}
-
-fn lifecycle_handoff(
-    menvane: &Menvane,
-    id: Uuid,
-    action: impl FnOnce(&Menvane, Uuid) -> anyhow::Result<TaskHandoff>,
-) -> Response {
-    match menvane.handoff_detail(id).and_then(|detail| {
-        let project_id = detail
-            .as_ref()
-            .and_then(|detail| detail.handoff.project_id.clone());
-        action(menvane, id).map(|_| project_id)
-    }) {
-        Ok(Some(project_id)) => Redirect::to(&format!("/projects/{project_id}")).into_response(),
-        Ok(None) => Redirect::to(&format!("/handoffs/{id}")).into_response(),
-        Err(error) => error_page(menvane, error),
-    }
 }
 
 #[derive(Default, Deserialize)]
@@ -693,168 +659,6 @@ fn session_row(memory: &Memory, names: &HashMap<String, String>) -> String {
     )
 }
 
-fn handoff_sections(handoffs: &[TaskHandoff], _project_id: &str) -> String {
-    let active = handoffs
-        .iter()
-        .filter(|handoff| {
-            matches!(
-                handoff.status,
-                HandoffStatus::Active | HandoffStatus::Ready | HandoffStatus::Consumed
-            ) && handoff.blockers.is_empty()
-        })
-        .collect::<Vec<_>>();
-    let blocked = handoffs
-        .iter()
-        .filter(|handoff| {
-            matches!(
-                handoff.status,
-                HandoffStatus::Stale | HandoffStatus::Superseded
-            ) || !handoff.blockers.is_empty()
-        })
-        .collect::<Vec<_>>();
-    let completed = handoffs
-        .iter()
-        .filter(|handoff| handoff.status == HandoffStatus::Completed)
-        .collect::<Vec<_>>();
-    format!(
-        "<section class='handoff-surface'><div class='section-title'><h2>Handoffs</h2><p>Operational continuation artifacts</p></div>{}{}{}{}</section>",
-        handoff_bucket("Active / ready / consumed", "current", &active),
-        handoff_bucket("Stale / blocked", "blocked", &blocked),
-        handoff_bucket("Recently completed", "completed", &completed),
-        if handoffs.is_empty() {
-            "<div class='panel empty-state'>No handoff artifacts have been generated for this project.</div>"
-        } else {
-            ""
-        }
-    )
-}
-
-fn handoff_bucket(title: &str, kind: &str, handoffs: &[&TaskHandoff]) -> String {
-    if handoffs.is_empty() {
-        return String::new();
-    }
-    format!(
-        "<section class='handoff-bucket'><header><h3>{}</h3><span>{:02}</span></header><div class='handoff-grid'>{}</div></section>",
-        escape(title),
-        handoffs.len(),
-        handoffs
-            .iter()
-            .map(|handoff| handoff_card(handoff, kind))
-            .collect::<String>()
-    )
-}
-
-fn handoff_card(handoff: &TaskHandoff, kind: &str) -> String {
-    let fingerprint = handoff_fingerprint(handoff);
-    let file = handoff
-        .changed_files
-        .first()
-        .map(String::as_str)
-        .unwrap_or("no changed file recorded");
-    format!(
-        "<article class='handoff-card' data-kind='{kind}'><div class='handoff-card-top'><span class='handoff-status {}'>{}</span><a href='/handoffs/{}' aria-label='Inspect handoff {}'>Inspect →</a></div><h3>{}</h3><dl class='handoff-facts'><dt>Fingerprint</dt><dd>{}</dd><dt>File</dt><dd>{}</dd><dt>Next action</dt><dd>{}</dd></dl>{}</article>",
-        handoff_status(handoff.status),
-        title_case(handoff_status(handoff.status)),
-        handoff.id,
-        handoff.id,
-        escape(&handoff.goal),
-        escape(&fingerprint),
-        escape(file),
-        escape(
-            handoff
-                .next_action
-                .as_deref()
-                .unwrap_or("No next action recorded")
-        ),
-        handoff_actions(handoff, handoff.project_id.as_deref())
-    )
-}
-
-fn handoff_actions(handoff: &TaskHandoff, _project_id: Option<&str>) -> String {
-    let mut actions = String::new();
-    if matches!(handoff.status, HandoffStatus::Active | HandoffStatus::Ready) {
-        actions.push_str(&format!(
-            "<form method='post' action='/handoffs/{}/consume'><button class='quiet-action' aria-label='Consume handoff {}'>Consume</button></form>",
-            handoff.id, handoff.id
-        ));
-    }
-    if handoff.status == HandoffStatus::Consumed {
-        actions.push_str(&format!(
-            "<form method='post' action='/handoffs/{}/complete'><button class='quiet-action' aria-label='Complete handoff {}'>Complete</button></form>",
-            handoff.id, handoff.id
-        ));
-    }
-    if matches!(
-        handoff.status,
-        HandoffStatus::Active | HandoffStatus::Ready | HandoffStatus::Consumed
-    ) {
-        actions.push_str(&format!(
-            "<form method='post' action='/handoffs/{}/supersede'><button class='quiet-action danger-action' aria-label='Supersede handoff {}'>Supersede</button></form>",
-            handoff.id, handoff.id
-        ));
-    }
-    if actions.is_empty() {
-        String::new()
-    } else {
-        format!("<div class='handoff-actions'>{actions}</div>")
-    }
-}
-
-fn handoff_fingerprint(handoff: &TaskHandoff) -> String {
-    match (&handoff.git_head, &handoff.worktree_state_hash) {
-        (Some(head), Some(worktree)) => {
-            format!("HEAD {} · WT {}", short_value(head), short_value(worktree))
-        }
-        (Some(head), None) => format!("HEAD {} · clean hash unavailable", short_value(head)),
-        (None, Some(worktree)) => format!("worktree {} · no HEAD", short_value(worktree)),
-        (None, None) => "unavailable · weaker confidence".to_owned(),
-    }
-}
-
-fn short_value(value: &str) -> &str {
-    value.get(..8).unwrap_or(value)
-}
-
-fn handoff_fields(handoff: &TaskHandoff) -> String {
-    format!(
-        "<div class='handoff-field-grid'><article><h3>Current state</h3><p>{}</p></article><article><h3>Completed work</h3>{}</article><article><h3>Pending work</h3>{}</article><article><h3>Blockers</h3>{}</article><article><h3>Changed files</h3>{}</article><article><h3>Decisions</h3>{}</article><article><h3>Validation</h3>{}</article></div>",
-        escape(&handoff.current_state),
-        string_list(&handoff.completed_work),
-        string_list(&handoff.pending_work),
-        string_list(&handoff.blockers),
-        string_list(&handoff.changed_files),
-        string_list(&handoff.decisions),
-        validation_list(handoff)
-    )
-}
-
-fn string_list(values: &[String]) -> String {
-    format!(
-        "<ul>{}</ul>",
-        values
-            .iter()
-            .map(|value| format!("<li>{}</li>", escape(value)))
-            .collect::<String>()
-    )
-}
-
-fn validation_list(handoff: &TaskHandoff) -> String {
-    format!(
-        "<ul>{}</ul>",
-        handoff
-            .validation
-            .iter()
-            .map(|validation| {
-                format!(
-                    "<li>{}: {}</li>",
-                    if validation.success { "pass" } else { "fail" },
-                    escape(&validation.summary)
-                )
-            })
-            .collect::<String>()
-    )
-}
-
 fn session_evidence_row(event: &NormalizedEvent) -> String {
     let detail = event
         .bounded_input
@@ -886,42 +690,30 @@ fn event_kind(event: &NormalizedEvent) -> &'static str {
     }
 }
 
-fn session_handoff_row(menvane: &Menvane, handoff: &TaskHandoff) -> anyhow::Result<String> {
-    let evidence = menvane
-        .handoff_detail(handoff.id)?
-        .map(|detail| {
-            detail
-                .evidence
-                .iter()
-                .map(|evidence| escape(&evidence.event_id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    Ok(format!(
-        "<a class='session-handoff-row' href='/handoffs/{}'><span class='handoff-status {}'>{}</span><div><strong>{}</strong><p>source evidence: {}</p></div><span class='session-state'>{}</span></a>",
-        handoff.id,
-        handoff_status(handoff.status),
-        title_case(handoff_status(handoff.status)),
-        escape(&handoff.goal),
-        if evidence.is_empty() {
-            "none".to_owned()
-        } else {
-            evidence
-        },
-        escape(&handoff_fingerprint(handoff))
-    ))
+fn project_handoff_row(handoff: &ProjectHandoff) -> String {
+    format!(
+        "<a class='session-handoff-row' href='/handoffs/{}'><div><strong>Project handoff</strong><p>{}</p></div></a>",
+        escape(handoff.project_id.as_deref().unwrap_or("global")),
+        escape(&handoff.summary)
+    )
 }
 
-fn handoff_status(status: HandoffStatus) -> &'static str {
-    match status {
-        HandoffStatus::Active => "active",
-        HandoffStatus::Ready => "ready",
-        HandoffStatus::Consumed => "consumed",
-        HandoffStatus::Completed => "completed",
-        HandoffStatus::Stale => "stale",
-        HandoffStatus::Superseded => "superseded",
-    }
+fn handoff_sections(handoff: Option<&ProjectHandoff>, _project_id: &str) -> String {
+    let Some(handoff) = handoff else {
+        return "<section class='handoff-surface'><div class='section-title'><h2>Handoff</h2><p>Continuation summary</p></div><div class='panel empty-state'>No handoff summary has been generated for this project.</div></section>".to_owned();
+    };
+    format!(
+        "<section class='handoff-surface'><div class='section-title'><h2>Handoff</h2><p>Current continuation summary</p><a href='/handoffs/{}'>Inspect →</a></div><article class='handoff-card current'><h3>Current summary</h3><p>Updated {}</p><div class='rendered'><p>{}</p></div><p class='handoff-meta'>{} source sessions; fingerprint {}</p></article></section>",
+        escape(handoff.project_id.as_deref().unwrap_or("global")),
+        handoff.updated_at.format("%Y-%m-%d %H:%M"),
+        escape(&handoff.summary),
+        handoff.source_session_ids.len(),
+        if handoff.fingerprint.is_some() {
+            "recorded"
+        } else {
+            "none"
+        }
+    )
 }
 
 fn project_row(project: &Project, memories: &[Memory]) -> String {
