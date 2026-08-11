@@ -621,7 +621,7 @@ fn migration_quarantines_contaminated_and_deduplicates_episode_handoffs() {
         )
         .unwrap();
     connection
-        .execute("DELETE FROM schema_migrations WHERE version=11", [])
+        .execute("DELETE FROM schema_migrations WHERE version IN (11, 12)", [])
         .unwrap();
     drop(connection);
     let reopened = SessionRepository::new(temporary.path().join("state.sqlite"));
@@ -727,6 +727,7 @@ fn event(
         attributed_path: None,
         success: None,
         model: None,
+        harness_injected: false,
     }
 }
 

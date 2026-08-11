@@ -319,6 +319,7 @@ fn ingest(
             attributed_path: None,
             success: None,
             model: None,
+        harness_injected: false,
         })
         .unwrap();
 }

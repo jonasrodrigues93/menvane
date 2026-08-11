@@ -982,6 +982,7 @@ fn event_as(
             .then(|| "src/lib.rs".to_owned()),
         success: None,
         model: None,
+        harness_injected: false,
     }
 }
 

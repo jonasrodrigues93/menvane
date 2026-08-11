@@ -350,6 +350,7 @@ fn episode_event(
             attributed_path: None,
             success: None,
             model: None,
+        harness_injected: false,
         },
         session_id: Uuid::from_u128(9),
         generation: 1,
@@ -396,6 +397,7 @@ fn ingest(
         attributed_path: None,
         success: None,
         model: None,
+        harness_injected: false,
     };
     assert_eq!(menvane.ingest_event(event).unwrap(), CaptureOutcome::Stored);
 }
@@ -424,6 +426,7 @@ fn ingest_tool(
         attributed_path: Some(path.to_owned()),
         success: Some(success),
         model: None,
+        harness_injected: false,
     };
     event.timestamp += Duration::milliseconds(1);
     assert_eq!(menvane.ingest_event(event).unwrap(), CaptureOutcome::Stored);

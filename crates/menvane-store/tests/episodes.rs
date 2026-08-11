@@ -55,7 +55,7 @@ fn migration_backfills_the_deterministic_conversation_identity() {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
-        11
+        12
     );
 }
 
@@ -319,6 +319,130 @@ fn project_identity_blocks_session_reuse_and_episode_continuation() {
     assert_eq!(second.generation, 2);
 }
 
+#[test]
+fn migration_twelve_converts_compile_jobs_and_disables_episodic_checkpoints() {
+    let temporary = TempDir::new().unwrap();
+    let path = temporary.path().join("state.sqlite");
+    let repository = SessionRepository::new(&path);
+    repository.initialize().unwrap();
+    let session = repository
+        .ingest(
+            &event("m12-start", "external", NormalizedEventKind::SessionStarted, 0),
+            Some("project-a"),
+        )
+        .unwrap()
+        .session;
+    repository
+        .ingest(
+            &event("m12-prompt", "external", NormalizedEventKind::UserPrompt, 1),
+            Some("project-a"),
+        )
+        .unwrap();
+    let episode = repository
+        .create_episode(session.id, "m12-prompt", "Legacy task")
+        .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "DELETE FROM schema_migrations WHERE version=12",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute("DROP TABLE project_handoffs", [])
+        .unwrap();
+    connection
+        .execute("DROP TABLE goal_event_links", [])
+        .unwrap();
+    connection
+        .execute("DROP TABLE goals", [])
+        .unwrap();
+    let now = "2026-01-01T00:00:00Z";
+    for (id, session_part, episode_part) in [
+        ("job-a", "first-session", "episode-1"),
+        ("job-b", "first-session", "episode-2"),
+        ("job-c", "second-session", "episode-3"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO jobs(id, job_type, dedupe_key, status, payload_json, next_retry_at, created_at, updated_at)
+                 VALUES (?1, 'compile_session', ?2, 'pending', '{}', ?3, ?3, ?3)",
+                rusqlite::params![
+                    format!("{id}-{episode_part}"),
+                    format!("{session_part}:{episode_part}"),
+                    now
+                ],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO jobs(id, job_type, dedupe_key, status, payload_json, next_retry_at, created_at, updated_at)
+             VALUES ('checkpoint-job', 'checkpoint_handoff', ?1, 'pending', '{}', ?2, ?2, ?2)",
+            rusqlite::params![episode.id.to_string(), now],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO checkpoint_state(episode_id, dirty, debounce_until, last_checkpoint_at, revision, updated_at)
+             VALUES (?1, 1, ?2, NULL, 1, ?3)",
+            rusqlite::params![episode.id.to_string(), now, now],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reopened = SessionRepository::new(&path);
+    reopened.initialize().unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let migration: i64 = connection
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(migration, 12);
+    let consolidate: Vec<String> = connection
+        .prepare(
+            "SELECT dedupe_key FROM jobs WHERE job_type='consolidate_session' ORDER BY dedupe_key",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(consolidate, vec!["first-session", "second-session"]);
+    let compile_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM jobs WHERE job_type='compile_session' AND status='pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(compile_count, 0);
+    let checkpoint: String = connection
+        .query_row(
+            "SELECT status FROM jobs WHERE job_type='checkpoint_handoff' AND dedupe_key=?1",
+            [episode.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(checkpoint, "completed");
+    let dirty: i64 = connection
+        .query_row(
+            "SELECT dirty FROM checkpoint_state WHERE episode_id=?1",
+            [episode.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dirty, 0);
+    assert!(connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_handoffs'",
+            [],
+            |_| Ok(()),
+        )
+        .is_ok());
+}
+
 fn prompt_intent(
     event_id: &str,
     episode_id: Uuid,
@@ -359,6 +483,7 @@ fn event(
         attributed_path: None,
         success: None,
         model: None,
+        harness_injected: false,
     }
 }
 

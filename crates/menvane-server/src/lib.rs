@@ -585,6 +585,7 @@ mod tests {
             attributed_path: None,
             success: None,
             model: None,
+        harness_injected: false,
         };
         let router = app(state);
         let first = post_event(router.clone(), &event).await;
@@ -652,6 +653,7 @@ mod tests {
             attributed_path: None,
             success: None,
             model: None,
+        harness_injected: false,
         };
         post_event(router.clone(), &event).await;
         let request = serde_json::json!({
@@ -1081,6 +1083,7 @@ mod tests {
             attributed_path: None,
             success: None,
             model: None,
+            harness_injected: false,
         }
     }
 

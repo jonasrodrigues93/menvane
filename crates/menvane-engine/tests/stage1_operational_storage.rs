@@ -139,7 +139,7 @@ fn legacy_operational_tables_migrate_idempotently_with_markers() {
     }
     assert_eq!(row_count(&state_path, "operational_migration_markers"), 21);
     assert_eq!(row_count(&state_path, "handoff_deliveries"), 1);
-    assert_eq!(max_schema_version(&state_path), 11);
+    assert_eq!(max_schema_version(&state_path), 12);
     assert!(has_table(&home.join("index.sqlite"), "sessions"));
     assert_eq!(
         SessionRepository::new(&state_path)
@@ -514,5 +514,6 @@ fn event(
         attributed_path: None,
         success: None,
         model: None,
+        harness_injected: false,
     }
 }

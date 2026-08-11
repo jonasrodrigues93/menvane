@@ -249,6 +249,33 @@ CREATE TABLE IF NOT EXISTS checkpoint_state (
     updated_at TEXT NOT NULL,
     FOREIGN KEY(episode_id) REFERENCES task_episodes(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS goals (
+    id TEXT PRIMARY KEY,
+    project_id TEXT,
+    conversation_key TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('active', 'completed', 'abandoned')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goals_project ON goals(COALESCE(project_id, '__global__'), state, updated_at DESC);
+CREATE TABLE IF NOT EXISTS goal_event_links (
+    event_id TEXT NOT NULL,
+    goal_id TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    PRIMARY KEY(event_id, goal_id),
+    FOREIGN KEY(event_id) REFERENCES session_events(event_id),
+    FOREIGN KEY(goal_id) REFERENCES goals(id)
+);
+CREATE INDEX IF NOT EXISTS goal_event_links_goal ON goal_event_links(goal_id, event_id);
+CREATE TABLE IF NOT EXISTS project_handoffs (
+    project_id TEXT PRIMARY KEY,
+    summary TEXT NOT NULL,
+    source_session_ids_json TEXT NOT NULL,
+    fingerprint TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS operational_migration_markers (
     migration TEXT NOT NULL,
     table_name TEXT NOT NULL,
@@ -2975,6 +3002,10 @@ fn apply_migrations(connection: &Connection) -> Result<()> {
         migrate_to_version_11(connection)?;
         connection.execute("INSERT INTO schema_migrations(version) VALUES (11)", [])?;
     }
+    if current < 12 {
+        migrate_to_version_12(connection)?;
+        connection.execute("INSERT INTO schema_migrations(version) VALUES (12)", [])?;
+    }
     Ok(())
 }
 
@@ -3313,6 +3344,72 @@ fn migrate_to_version_11(connection: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+fn migrate_to_version_12(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS goals (
+             id TEXT PRIMARY KEY,
+             project_id TEXT,
+             conversation_key TEXT NOT NULL,
+             summary TEXT NOT NULL,
+             state TEXT NOT NULL CHECK(state IN ('active', 'completed', 'abandoned')),
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS goals_project ON goals(COALESCE(project_id, '__global__'), state, updated_at DESC);
+         CREATE TABLE IF NOT EXISTS goal_event_links (
+             event_id TEXT NOT NULL,
+             goal_id TEXT NOT NULL,
+             linked_at TEXT NOT NULL,
+             PRIMARY KEY(event_id, goal_id),
+             FOREIGN KEY(event_id) REFERENCES session_events(event_id),
+             FOREIGN KEY(goal_id) REFERENCES goals(id)
+         );
+         CREATE INDEX IF NOT EXISTS goal_event_links_goal ON goal_event_links(goal_id, event_id);
+         CREATE TABLE IF NOT EXISTS project_handoffs (
+             project_id TEXT PRIMARY KEY,
+             summary TEXT NOT NULL,
+             source_session_ids_json TEXT NOT NULL,
+             fingerprint TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );",
+    )?;
+    let now = Utc::now().to_rfc3339();
+    if table_exists(connection, "jobs") {
+        connection.execute(
+            "INSERT OR IGNORE INTO jobs(id, job_type, dedupe_key, status, payload_json, next_retry_at, created_at, updated_at)
+             SELECT lower(hex(randomblob(16))), 'consolidate_session', substr(dedupe_key, 1, instr(dedupe_key, ':') - 1), 'pending', json_object('session_id', substr(dedupe_key, 1, instr(dedupe_key, ':') - 1)), ?1, ?1, ?1
+             FROM jobs WHERE job_type='compile_session' AND status IN ('pending', 'running') AND instr(dedupe_key, ':') > 0",
+            [&now],
+        )?;
+        connection.execute(
+            "UPDATE jobs SET status='completed', last_error='superseded by consolidate_session', updated_at=?1 WHERE job_type='compile_session' AND status IN ('pending', 'running')",
+            [&now],
+        )?;
+        connection.execute(
+            "UPDATE jobs SET status='completed', last_error='episodic checkpoint flow removed', updated_at=?1 WHERE job_type='checkpoint_handoff' AND status IN ('pending', 'running')",
+            [&now],
+        )?;
+    }
+    if table_exists(connection, "checkpoint_state") {
+        connection.execute(
+            "UPDATE checkpoint_state SET dirty=0, updated_at=?1",
+            [&now],
+        )?;
+    }
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, name: &str) -> bool {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap_or(false)
 }
 
 fn ensure_conversation_keys(connection: &Connection) -> Result<()> {

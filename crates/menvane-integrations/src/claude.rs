@@ -268,6 +268,7 @@ fn normalize_event(event_name: &str, payload: &Value, client: &str) -> Result<No
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        harness_injected: false,
     })
 }
 
