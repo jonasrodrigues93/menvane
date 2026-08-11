@@ -290,7 +290,7 @@ fn slugify(value: &str) -> String {
 }
 
 fn default_config() -> &'static str {
-    "[capture]\nmax_prompt_bytes = 16384\nmax_tool_output_bytes = 4096\nmax_tool_input_bytes = 4096\nignore_paths = [\".env\", \".env.*\", \"**/secrets/**\", \"**/.ssh/**\", \"AGENTS.md\", \"**/AGENTS.md\", \"SKILL.md\", \"**/SKILL.md\", \"skills/**\", \"**/skills/**\"]\n\n[sessions]\nidle_finalize_seconds = 120\n\n[handoff]\nnonvalidation_tool_debounce_seconds = 2\n\n[compilation]\naggregate_evidence_budget_bytes = 32768\n\n[jobs]\nlease_timeout_seconds = 300\n\n[llm]\nprovider = \"openai\"\nmodel = \"gpt-5.6-luna\"\nreasoning_effort = \"medium\"\noauth_issuer = \"https://auth.openai.com\"\noauth_endpoint = \"https://chatgpt.com/backend-api/codex/responses\"\n"
+    "[capture]\nmax_prompt_bytes = 16384\nmax_tool_output_bytes = 4096\nmax_tool_input_bytes = 4096\nignore_paths = [\".env\", \".env.*\", \"**/secrets/**\", \"**/.ssh/**\", \"AGENTS.md\", \"**/AGENTS.md\", \"SKILL.md\", \"**/SKILL.md\", \"skills/**\", \"**/skills/**\"]\n\n[sessions]\nidle_finalize_seconds = 120\n\n\n\n[jobs]\nlease_timeout_seconds = 300\n\n[llm]\nprovider = \"openai\"\nmodel = \"gpt-5.6-luna\"\nreasoning_effort = \"medium\"\noauth_issuer = \"https://auth.openai.com\"\noauth_endpoint = \"https://chatgpt.com/backend-api/codex/responses\"\n"
 }
 
 #[cfg(test)]

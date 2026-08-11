@@ -474,7 +474,7 @@ fn goal_operations_are_applied_idempotently() {
             session.id,
             Some("project-a"),
             &session.conversation_key,
-            &[operation],
+            std::slice::from_ref(&operation),
         )
         .unwrap();
     let second = repository
@@ -482,7 +482,7 @@ fn goal_operations_are_applied_idempotently() {
             session.id,
             Some("project-a"),
             &session.conversation_key,
-            &[operation],
+            std::slice::from_ref(&operation),
         )
         .unwrap();
     assert_eq!(first.len(), 1);

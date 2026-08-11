@@ -265,7 +265,7 @@ fn linked_session_events_render_a_chronological_timeline() {
         menvane
             .configuration_text()
             .unwrap()
-            .contains("aggregate_evidence_budget_bytes")
+            .contains("idle_finalize_seconds")
     );
     let consolidation_jobs = menvane
         .jobs()

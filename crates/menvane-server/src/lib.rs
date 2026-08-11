@@ -45,7 +45,6 @@ pub async fn serve(menvane: Menvane, address: &str, port: u16) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await;
     maintenance_task.abort();
-    let _ = maintenance.flush_dirty_checkpoints().await;
     let _ = fs::remove_file(home.join("daemon.pid"));
     drop(lock);
     result.map_err(Into::into)

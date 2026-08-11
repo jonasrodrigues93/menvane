@@ -3,7 +3,7 @@ use std::fs;
 use chrono::{Duration, Utc};
 use menvane_domain::{NormalizedEvent, NormalizedEventKind};
 use menvane_engine::Menvane;
-use menvane_store::conversation_key;
+use rusqlite::Connection;
 use tempfile::TempDir;
 
 mod common;
@@ -52,21 +52,22 @@ fn ingestion_never_creates_deterministic_goals_episodes_or_intents() {
         Some("Now review the dashboard colors."),
     );
 
-    let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
-    let intents = menvane
-        .prompt_intents(
-            &conversation_key("test-client", "external-session"),
-            Some(&project_id),
-        )
+    let connection = Connection::open(temporary.path().join("home/state.sqlite")).unwrap();
+    let intents: u64 = connection
+        .query_row("SELECT COUNT(*) FROM prompt_intents", [], |row| row.get(0))
         .unwrap();
-    assert!(intents.is_empty(), "intent classification is retired");
-    let episodes = menvane
-        .episodes(
-            &conversation_key("test-client", "external-session"),
-            Some(&project_id),
-        )
+    assert_eq!(intents, 0, "intent classification is retired");
+    let episodes: u64 = connection
+        .query_row("SELECT COUNT(*) FROM task_episodes", [], |row| row.get(0))
         .unwrap();
-    assert!(episodes.is_empty(), "deterministic episodes are retired");
+    assert_eq!(episodes, 0, "deterministic episodes are retired");
+    let goals: u64 = connection
+        .query_row("SELECT COUNT(*) FROM goals", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        goals, 0,
+        "no goal is created without a consolidation result"
+    );
 }
 
 #[test]

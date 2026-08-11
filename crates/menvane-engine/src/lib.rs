@@ -3,8 +3,6 @@ mod decay;
 mod evidence;
 mod global_promoter;
 mod handoff;
-mod handoff_consolidator;
-mod intent_engine;
 mod oauth_provider;
 mod project_resolver;
 mod providers;
@@ -26,7 +24,7 @@ use fs2::FileExt;
 use menvane_domain::{
     Applicability, HandoffStatus, JsonSchema, LlmProvider, LlmRequest, Memory, MemoryMetadata,
     MemoryType, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProjectHandoff,
-    PromptIntent, ProviderHealth, ReinforcementSignal, Scope, TaskEpisode, TaskHandoff,
+    ProviderHealth, ReinforcementSignal, Scope, TaskHandoff,
 };
 pub use menvane_store::mark_forgotten;
 pub use menvane_store::{
@@ -50,13 +48,7 @@ pub use evidence::{
     render_episode_markdown, render_session_markdown,
 };
 pub use global_promoter::GlobalPromoter;
-pub use handoff::{HandoffGenerator, RepositoryState};
-pub use handoff_consolidator::{
-    HandoffConsolidationResult, HandoffConsolidator, HandoffOperation, HandoffPatch, handoff_schema,
-};
-pub use intent_engine::{
-    CLASSIFIER_VERSION, ClassifierDiagnostics, ClassifierWeights, IntentEngine,
-};
+pub use handoff::RepositoryState;
 pub use oauth_provider::OpenAiOAuthProvider;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
 pub use providers::{CodexProvider, OpenAIApiProvider, OpenRouterProvider, ProviderChain};
@@ -143,8 +135,6 @@ struct MenvaneConfig {
     #[serde(default)]
     sessions: SessionConfiguration,
     #[serde(default)]
-    compilation: CompilationConfiguration,
-    #[serde(default)]
     jobs: JobConfiguration,
     #[serde(default)]
     llm: LlmConfiguration,
@@ -225,24 +215,6 @@ impl Default for SessionConfiguration {
 
 fn default_idle_finalize_seconds() -> u64 {
     120
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct CompilationConfiguration {
-    #[serde(default = "default_evidence_budget_bytes")]
-    aggregate_evidence_budget_bytes: usize,
-}
-
-impl Default for CompilationConfiguration {
-    fn default() -> Self {
-        Self {
-            aggregate_evidence_budget_bytes: default_evidence_budget_bytes(),
-        }
-    }
-}
-
-fn default_evidence_budget_bytes() -> usize {
-    evidence::DEFAULT_EVIDENCE_BUDGET_BYTES
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -488,22 +460,6 @@ impl Menvane {
         SessionEngine::new(self).ingest(event)
     }
 
-    pub fn episodes(
-        &self,
-        conversation_key: &str,
-        project_id: Option<&str>,
-    ) -> Result<Vec<TaskEpisode>> {
-        IntentEngine::new(&self.sessions).episodes(conversation_key, project_id)
-    }
-
-    pub fn prompt_intents(
-        &self,
-        conversation_key: &str,
-        project_id: Option<&str>,
-    ) -> Result<Vec<PromptIntent>> {
-        IntentEngine::new(&self.sessions).intents(conversation_key, project_id)
-    }
-
     pub fn handoffs(&self, cwd: &Path) -> Result<Vec<TaskHandoff>> {
         let project_id = self.ensure_project(cwd)?.map(|project| project.id);
         self.sessions
@@ -577,10 +533,6 @@ impl Menvane {
 
     pub fn supersede_handoff(&self, id: Uuid) -> Result<TaskHandoff> {
         self.sessions.supersede_handoff(id)
-    }
-
-    pub fn classifier_diagnostics(&self) -> ClassifierDiagnostics {
-        IntentEngine::new(&self.sessions).diagnostics()
     }
 
     pub fn sanitize_event(&self, event: NormalizedEvent) -> Result<Option<NormalizedEvent>> {
@@ -1339,48 +1291,6 @@ impl Menvane {
         Ok(response.value)
     }
 
-    pub async fn compile_and_store(
-        &self,
-        cwd: &Path,
-        input: CompilationInput,
-    ) -> Result<(Vec<Uuid>, String)> {
-        let source_session = input.source_session;
-        let source_episode = input.source_episode;
-        let result = MemoryCompiler::new(self.configured_provider()?)
-            .compile(input)
-            .await
-            .map_err(anyhow::Error::new)?;
-        let provider = result.provider.clone();
-        let ids = self.apply_compilation_result(cwd, result, source_session, source_episode)?;
-        Ok((ids, provider))
-    }
-
-    pub fn apply_compilation_result(
-        &self,
-        cwd: &Path,
-        result: CompilationResult,
-        source_session: Option<Uuid>,
-        source_episode: Option<Uuid>,
-    ) -> Result<Vec<Uuid>> {
-        let mut ids = Vec::new();
-        for (operation_index, operation) in result.operations.into_iter().enumerate() {
-            if let Some(id) = self.apply_compilation_operation(
-                cwd,
-                operation,
-                source_session,
-                source_episode,
-                operation_index,
-            )? {
-                ids.push(id);
-            }
-        }
-        Ok(ids)
-    }
-
-    pub async fn process_next_compilation(&self) -> Result<bool> {
-        self.process_next_job().await
-    }
-
     pub async fn process_next_job(&self) -> Result<bool> {
         let Some(job) = self
             .sessions
@@ -1389,10 +1299,6 @@ impl Menvane {
             return Ok(false);
         };
         let result = async {
-            if job.job_type == "checkpoint_handoff" {
-                let provider = self.process_checkpoint_job(&job).await?;
-                return Ok(Some(provider));
-            }
             if job.job_type == "finalize_session" {
                 SessionEngine::new(self).finalize_job(&job)?;
                 return Ok(None);
@@ -1401,64 +1307,10 @@ impl Menvane {
                 let provider = self.process_consolidate_job(&job).await?;
                 return Ok(Some(provider));
             }
-            if job.job_type != "compile_session" {
-                bail!("unsupported job type: {}", job.job_type);
-            }
-            let episode_id = job
-                .dedupe_key
-                .rsplit_once(':')
-                .map_or(job.dedupe_key.as_str(), |(_, episode_id)| episode_id);
-            let episode_id = Uuid::parse_str(episode_id)?;
-            let Some(episode) = self.sessions.episode_optional(episode_id)? else {
-                return Ok(Some("skipped".to_owned()));
-            };
-            let events = self.sessions.episode_events(episode_id)?;
-            let intents = self.sessions.episode_prompt_intents(episode_id)?;
-            let evidence =
-                EvidenceBuilder::new(self.config.compilation.aggregate_evidence_budget_bytes)
-                    .build(&episode, &events, &intents)?;
-            let (cwd, technology_profile) = if let Some(project_id) = episode.project_id.as_deref()
-            {
-                let project = self
-                    .all_projects()?
-                    .into_iter()
-                    .find(|project| project.id == project_id)
-                    .context("session project is missing")?;
-                let cwd = project
-                    .known_paths
-                    .iter()
-                    .map(PathBuf::from)
-                    .find(|path| path.exists())
-                    .context("session project has no available checkout")?;
-                (cwd, serde_json::to_value(project.technologies)?)
-            } else {
-                let cwd = events
-                    .iter()
-                    .map(|event| PathBuf::from(&event.event.cwd))
-                    .find(|path| path.exists())
-                    .context("global session has no available working directory")?;
-                (cwd, serde_json::json!({}))
-            };
-            let source_session = events.last().map(|event| event.session_id);
-            let existing_related_memories = self.related_memories(
-                &cwd,
-                &evidence,
-                &technology_profile,
-                episode.project_id.as_deref(),
-            )?;
-            let (_, provider) = self
-                .compile_and_store(
-                    &cwd,
-                    CompilationInput {
-                        evidence,
-                        existing_related_memories,
-                        technology_profile,
-                        source_session,
-                        source_episode: Some(episode_id),
-                    },
-                )
-                .await?;
-            Ok(Some(provider))
+            bail!(
+                "unsupported job type {}; the episodic compile and checkpoint flow is retired",
+                job.job_type
+            );
         }
         .await;
         match result {
@@ -1469,12 +1321,6 @@ impl Menvane {
                     provider.as_deref(),
                     None,
                 )?;
-                if job.job_type == "checkpoint_handoff" {
-                    let episode_id = Uuid::parse_str(&job.dedupe_key)?;
-                    if self.sessions.checkpoint_state(episode_id)?.dirty {
-                        self.sessions.requeue_checkpoint_job(episode_id)?;
-                    }
-                }
             }
             Err(error) => {
                 self.sessions.finish_job(
@@ -1580,60 +1426,6 @@ impl Menvane {
             self.sessions.replace_project_handoff(&handoff)?;
         }
         Ok(outcome.provider)
-    }
-
-    async fn process_checkpoint_job(&self, job: &JobRecord) -> Result<String> {
-        let episode_id = Uuid::parse_str(&job.dedupe_key)?;
-        let state = self.sessions.checkpoint_state(episode_id)?;
-        if state.dirty {
-            let provider = HandoffGenerator::new(self).generate(episode_id).await?;
-            self.sessions.complete_checkpoint_if_unchanged(
-                episode_id,
-                state.updated_at,
-                state.revision,
-            )?;
-            return Ok(provider);
-        }
-        Ok(String::new())
-    }
-
-    pub async fn process_next_checkpoint_job(&self) -> Result<bool> {
-        let Some(job) = self.sessions.claim_job_of_type(
-            &self.worker_owner,
-            self.config.jobs.lease_timeout_seconds,
-            "checkpoint_handoff",
-        )?
-        else {
-            return Ok(false);
-        };
-        let result = self.process_checkpoint_job(&job).await;
-        match result {
-            Ok(provider) => {
-                self.sessions.finish_job(
-                    job.id,
-                    job.owner.as_deref().unwrap_or_default(),
-                    (!provider.is_empty()).then_some(provider.as_str()),
-                    None,
-                )?;
-                if self
-                    .sessions
-                    .checkpoint_state(job.dedupe_key.parse()?)?
-                    .dirty
-                {
-                    self.sessions
-                        .requeue_checkpoint_job(job.dedupe_key.parse()?)?;
-                }
-            }
-            Err(error) => {
-                self.sessions.finish_job(
-                    job.id,
-                    job.owner.as_deref().unwrap_or_default(),
-                    None,
-                    Some(&error.to_string()),
-                )?;
-            }
-        }
-        Ok(true)
     }
 
     pub fn related_memories(
@@ -1755,12 +1547,6 @@ impl Menvane {
         Ok(related)
     }
 
-    pub async fn flush_dirty_checkpoints(&self) -> Result<()> {
-        self.sessions.prepare_checkpoint_flush()?;
-        while self.process_next_checkpoint_job().await? {}
-        Ok(())
-    }
-
     pub fn configured_provider(&self) -> Result<std::sync::Arc<dyn LlmProvider>> {
         if let Some(provider) = &self.provider_override {
             return Ok(provider.clone());
@@ -1774,6 +1560,28 @@ impl Menvane {
             .map(|configuration| provider_from_configuration(configuration, &self.home))
             .transpose()?;
         Ok(std::sync::Arc::new(ProviderChain::new(primary, fallback)))
+    }
+
+    pub fn apply_compilation_result(
+        &self,
+        cwd: &Path,
+        result: CompilationResult,
+        source_session: Option<Uuid>,
+        source_episode: Option<Uuid>,
+    ) -> Result<Vec<Uuid>> {
+        let mut ids = Vec::new();
+        for (operation_index, operation) in result.operations.into_iter().enumerate() {
+            if let Some(id) = self.apply_compilation_operation(
+                cwd,
+                operation,
+                source_session,
+                source_episode,
+                operation_index,
+            )? {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     fn apply_compilation_operation(
