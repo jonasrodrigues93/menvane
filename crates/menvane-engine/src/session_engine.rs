@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration as StdDuration;
 
@@ -11,7 +10,8 @@ use menvane_store::{JobRecord, SessionRecord};
 
 use crate::IntentEngine;
 use crate::Menvane;
-use crate::evidence::{EvidenceBuilder, MAX_SESSION_MARKDOWN_BYTES, render_session_markdown};
+use crate::evidence::{MAX_SESSION_MARKDOWN_BYTES, render_session_markdown};
+use crate::sanitizer::CaptureSanitizer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureOutcome {
@@ -74,21 +74,6 @@ impl<'a> SessionEngine<'a> {
             .menvane
             .sessions
             .finalize_idle_before(Utc::now() - Duration::seconds(seconds))?;
-        let mut episodes = BTreeSet::new();
-        for session in &sessions {
-            for event in self
-                .menvane
-                .sessions
-                .episode_events_for_session(session.id)?
-            {
-                episodes.insert(event);
-            }
-        }
-        for episode_id in episodes {
-            self.menvane
-                .sessions
-                .mark_handoff_dirty(episode_id, StdDuration::ZERO)?;
-        }
         Ok(sessions.len())
     }
 
@@ -100,39 +85,22 @@ impl<'a> SessionEngine<'a> {
 
     fn finalize_session(&self, session: &SessionRecord, job: &JobRecord) -> Result<()> {
         if let Some(path) = &session.markdown_path {
-            let episodes = self
-                .menvane
-                .sessions
-                .episode_events_for_session(session.id)?;
             self.menvane.sessions.mark_finalized(
                 session.id,
                 path,
-                &episodes,
                 job.id,
                 job.owner.as_deref().unwrap_or_default(),
             )?;
             return Ok(());
         }
-        let events = self.menvane.sessions.events(session.id)?;
-        let episode_ids = self
+        let sanitizer = CaptureSanitizer::new(self.menvane.config.capture.clone())?;
+        let durable = self
             .menvane
             .sessions
-            .episode_events_for_session(session.id)?;
-        let packets = episode_ids
-            .iter()
-            .map(|episode_id| {
-                let episode = self.menvane.sessions.episode(*episode_id)?;
-                let events = self.menvane.sessions.episode_events(*episode_id)?;
-                let intents = self.menvane.sessions.episode_prompt_intents(*episode_id)?;
-                EvidenceBuilder::new(
-                    self.menvane
-                        .config
-                        .compilation
-                        .aggregate_evidence_budget_bytes,
-                )
-                .build(&episode, &events, &intents)
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .events(session.id)?
+            .into_iter()
+            .filter_map(|event| sanitizer.filter_durable_event(event))
+            .collect::<Vec<_>>();
         let project = session
             .project_id
             .as_deref()
@@ -148,7 +116,7 @@ impl<'a> SessionEngine<'a> {
                     .ok_or_else(|| anyhow::anyhow!("session project metadata is missing"))
             })
             .transpose()?;
-        let title = session_title(session, &events);
+        let title = session_title(session, &durable);
         let mut metadata = MemoryMetadata::new(
             MemoryType::Session,
             if project.is_some() {
@@ -171,22 +139,10 @@ impl<'a> SessionEngine<'a> {
         metadata.ended_at = session.ended_at;
         metadata.imported = Some(session.imported);
         metadata.generation = Some(session.generation);
-        let body = if packets.is_empty()
-            && events
-                .iter()
-                .any(|event| event.kind == NormalizedEventKind::ToolCompleted)
-        {
-            format!(
-                "{}\n\nObserved tool activity was captured without a linked task episode and remains operational evidence.",
-                render_session_markdown(&packets, MAX_SESSION_MARKDOWN_BYTES)
-            )
-        } else {
-            render_session_markdown(&packets, MAX_SESSION_MARKDOWN_BYTES)
-        };
         let memory = Memory {
             metadata,
             title,
-            body,
+            body: render_session_markdown(&durable, MAX_SESSION_MARKDOWN_BYTES),
         };
         let path = self
             .menvane
@@ -196,7 +152,6 @@ impl<'a> SessionEngine<'a> {
         self.menvane.sessions.mark_finalized(
             session.id,
             &path,
-            &episode_ids,
             job.id,
             job.owner.as_deref().unwrap_or_default(),
         )?;
@@ -259,14 +214,5 @@ fn is_system_noise_title(title: &str) -> bool {
 }
 
 fn has_meaningful_evidence(body: &str) -> bool {
-    let body = body.trim();
-    if body.len() < 120 {
-        return false;
-    }
-    let no_goal = body.contains("## Goal\n\nNo explicit goal was captured.");
-    let no_actions = body.contains("## Important actions\n\nNone captured.");
-    let no_errors = body.contains("## Errors and discoveries\n\nNone captured.");
-    let no_validation = body.contains("## Validation\n\nNone captured.");
-    let no_files = body.contains("## Files involved\n\nNone captured.");
-    !(no_goal && no_actions && no_errors && no_validation && no_files)
+    !body.trim().is_empty()
 }

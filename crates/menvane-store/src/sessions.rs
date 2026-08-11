@@ -809,7 +809,6 @@ impl SessionRepository {
         &self,
         session_id: Uuid,
         markdown_path: &Path,
-        compile_episodes: &[Uuid],
         job_id: Uuid,
         owner: &str,
     ) -> Result<()> {
@@ -824,13 +823,7 @@ impl SessionRepository {
             "UPDATE jobs SET status='completed', owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE id=?2 AND status='running' AND owner=?3",
             params![now, job_id.to_string(), owner],
         )?;
-        for episode_id in compile_episodes {
-            enqueue_job(
-                &transaction,
-                "compile_session",
-                &format!("{session_id}:{episode_id}"),
-            )?;
-        }
+        enqueue_job(&transaction, "consolidate_session", &session_id.to_string())?;
         transaction.commit()?;
         Ok(())
     }

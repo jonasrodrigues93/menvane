@@ -588,17 +588,70 @@ pub fn render_episode_markdown(packet: &EpisodeEvidencePacket, max_bytes: usize)
     bounded_string(&body, max_bytes)
 }
 
-pub fn render_session_markdown(packets: &[EpisodeEvidencePacket], max_bytes: usize) -> String {
-    if packets.is_empty() {
-        return "## Task episodes\n\nNo task episode was linked to this session.".to_owned();
+pub fn render_session_markdown(
+    events: &[menvane_domain::NormalizedEvent],
+    max_bytes: usize,
+) -> String {
+    let mut entries = Vec::new();
+    for event in events {
+        let mut entry = format!(
+            "- `{}` [event:{}] {}",
+            event.timestamp.to_rfc3339(),
+            event.event_id,
+            event_label(event)
+        );
+        if let Some(tool) = event.tool_family.as_deref() {
+            entry.push_str(&format!(" tool `{}`", bounded_string(tool, 1_024)));
+        }
+        if let Some(success) = event.success {
+            entry.push_str(if success { " succeeded" } else { " failed" });
+        }
+        if let Some(path) = event.attributed_path.as_deref() {
+            entry.push_str(&format!(" on {}", bounded_string(path, 1_024)));
+        }
+        if let Some(input) = event
+            .bounded_input
+            .as_deref()
+            .map(|value| bounded_string(value, 2_000))
+            .filter(|value| !value.trim().is_empty())
+        {
+            entry.push_str(&format!("\n  input: {}", indented(&input)));
+        }
+        if let Some(output) = event
+            .bounded_output
+            .as_deref()
+            .map(|value| bounded_string(value, 2_000))
+            .filter(|value| !value.trim().is_empty())
+        {
+            entry.push_str(&format!("\n  output: {}", indented(&output)));
+        }
+        entries.push(entry);
     }
-    let section_budget = (max_bytes / packets.len()).max(1);
-    let body = packets
-        .iter()
-        .map(|packet| render_episode_markdown(packet, section_budget))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    bounded_string(&body, max_bytes)
+    bounded_string(&entries.join("\n"), max_bytes)
+}
+
+fn event_label(event: &menvane_domain::NormalizedEvent) -> String {
+    let kind = match event.kind {
+        NormalizedEventKind::SessionStarted => "session-started",
+        NormalizedEventKind::UserPrompt => "user-prompt",
+        NormalizedEventKind::ToolCompleted => "tool-completed",
+        NormalizedEventKind::ContextCompacted => "context-compacted",
+        NormalizedEventKind::TurnStopped => "turn-stopped",
+        NormalizedEventKind::SessionEnded => "session-ended",
+    };
+    let origin = match event.origin {
+        menvane_domain::NormalizedEventOrigin::User => "user",
+        menvane_domain::NormalizedEventOrigin::System => "system",
+        menvane_domain::NormalizedEventOrigin::Agent => "agent",
+        menvane_domain::NormalizedEventOrigin::Compaction => "compaction",
+        menvane_domain::NormalizedEventOrigin::Tool => "tool",
+        menvane_domain::NormalizedEventOrigin::Importer => "importer",
+    };
+    format!("{kind} ({origin})")
+}
+
+fn indented(value: &str) -> String {
+    value.replace('\n', "\n  ")
 }
 
 fn append_markdown_section(body: &mut String, title: &str, items: &[EvidenceItem]) {

@@ -193,7 +193,7 @@ fn packet_budget_and_markdown_bounds_preserve_utf8() {
 }
 
 #[test]
-fn linked_episode_events_isolate_multi_episode_markdown_and_actual_outcomes() {
+fn linked_session_events_render_a_chronological_timeline() {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
     fs::create_dir_all(&project).unwrap();
@@ -245,21 +245,17 @@ fn linked_episode_events_isolate_multi_episode_markdown_and_actual_outcomes() {
         .into_iter()
         .find(|memory| memory.metadata.memory_type == menvane_domain::MemoryType::Session)
         .unwrap();
-    assert_eq!(session.body.matches("## Task episode ").count(), 2);
-    assert!(session.body.contains("Implement export parsing"));
-    assert!(
-        session
-            .body
-            .contains("Now document the dashboard navigation")
-    );
+    assert!(!session.body.contains("## Task episode "));
+    assert!(session.body.contains("[event:goal-a]"));
+    assert!(session.body.contains("[event:goal-b]"));
     assert!(session.body.contains("[event:edit-a]"));
     assert!(session.body.contains("[event:check-b]"));
-    assert!(session.body.contains("cargo check succeeded"));
-    assert!(
-        !session
-            .body
-            .contains("Session evidence was captured and finalized.")
-    );
+    assert!(session.body.contains("Implement export parsing"));
+    assert!(session.body.contains("Now document the dashboard navigation"));
+    assert!(session.body.contains("cargo check"));
+    let goal_a = session.body.find("[event:goal-a]").unwrap();
+    let check_b = session.body.find("[event:check-b]").unwrap();
+    assert!(goal_a < check_b);
     assert!(session.body.len() <= 32_768);
     assert!(
         menvane
@@ -267,18 +263,18 @@ fn linked_episode_events_isolate_multi_episode_markdown_and_actual_outcomes() {
             .unwrap()
             .contains("aggregate_evidence_budget_bytes")
     );
-    let compilation_jobs = menvane
+    let consolidation_jobs = menvane
         .jobs()
         .unwrap()
         .into_iter()
-        .filter(|job| job.job_type == "compile_session")
+        .filter(|job| job.job_type == "consolidate_session")
         .collect::<Vec<_>>();
-    assert_eq!(compilation_jobs.len(), 2);
-    assert!(
-        compilation_jobs
-            .iter()
-            .all(|job| job.dedupe_key.contains(':'))
-    );
+    assert_eq!(consolidation_jobs.len(), 1);
+    assert!(menvane
+        .jobs()
+        .unwrap()
+        .into_iter()
+        .all(|job| job.job_type != "compile_session"));
     let (_, indexed_memories) = menvane.reindex().unwrap();
     assert!(indexed_memories >= 1);
 }
