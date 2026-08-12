@@ -9,7 +9,7 @@ use chrono::Utc;
 use menvane_domain::{
     Memory, MemoryType, NormalizedEvent, Project, ProjectHandoff, ProviderHealth,
 };
-use menvane_engine::{Menvane, ScopeSelection};
+use menvane_engine::Menvane;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -20,12 +20,10 @@ pub fn router() -> Router<Arc<Menvane>> {
         .route("/projects/{id}", get(project_detail))
         .route("/memories", get(memories))
         .route("/memories/{id}", get(memory_detail))
-        .route("/memories/{id}/edit", post(edit_memory))
         .route("/procedures", get(procedures))
         .route("/sessions", get(sessions))
         .route("/sessions/{id}", get(session_detail))
         .route("/handoffs/{project_id}", get(handoff_detail))
-        .route("/search", get(search))
         .route("/imports", get(imports))
         .route("/imports/associate", post(associate_orphan))
         .route("/integrations", get(integrations))
@@ -51,17 +49,9 @@ async fn dashboard_content(menvane: &Menvane) -> anyhow::Result<String> {
         .iter()
         .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
         .count();
-    let global = memories
-        .iter()
-        .filter(|memory| memory.metadata.scope.to_string() == "global")
-        .count();
     let procedures = memories
         .iter()
         .filter(|memory| memory.metadata.memory_type == MemoryType::Procedure)
-        .count();
-    let session_count = memories
-        .iter()
-        .filter(|memory| memory.metadata.memory_type == MemoryType::Session)
         .count();
     let pending = jobs.iter().filter(|job| job.status == "pending").count();
     let failed = jobs.iter().filter(|job| job.status == "failed").count();
@@ -70,20 +60,6 @@ async fn dashboard_content(menvane: &Menvane) -> anyhow::Result<String> {
         .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
         .collect::<Vec<_>>();
     recent.sort_by_key(|memory| std::cmp::Reverse(memory.metadata.created_at));
-    let mut recent_sessions = memories
-        .iter()
-        .filter(|memory| memory.metadata.memory_type == MemoryType::Session)
-        .collect::<Vec<_>>();
-    recent_sessions.sort_by_key(|memory| std::cmp::Reverse(memory.metadata.created_at));
-    let session_rows = if recent_sessions.is_empty() {
-        empty_state("No sessions captured yet. Work in a connected agent and it will appear here.")
-    } else {
-        recent_sessions
-            .iter()
-            .take(3)
-            .map(|memory| session_row(memory, &names))
-            .collect::<String>()
-    };
     let (provider_name, provider_model, provider_ready) = provider
         .map(|(name, model, health)| (name, model, matches!(health, ProviderHealth::Ready)))
         .unwrap_or_else(|| ("unconfigured".to_owned(), String::new(), false));
@@ -112,24 +88,8 @@ async fn dashboard_content(menvane: &Menvane) -> anyhow::Result<String> {
     } else {
         format!("{pending} queued")
     };
-    Ok(format!(
-        "<section class='page-head'><div><h1>Overview</h1><p>Memory inventory, capture activity and system health across all projects.</p></div></section><section class='metrics' aria-label='Memory statistics'>{}{}{}{}{}{}</section><div class='dashboard-grid'><section class='panel'><header class='panel-head'><h2>Recent durable memory</h2><p>Showing {} of {}</p><div class='tabs' role='tablist' aria-label='Memory filters'><button class='tab active' type='button' role='tab' aria-selected='true' data-filter='all'>All</button><button class='tab' type='button' role='tab' aria-selected='false' data-filter='fact'>Facts</button><button class='tab' type='button' role='tab' aria-selected='false' data-filter='procedure'>Procedures</button><button class='tab' type='button' role='tab' aria-selected='false' data-filter='decision'>Decisions</button><button class='tab' type='button' role='tab' aria-selected='false' data-filter='gotcha'>Gotchas</button></div></header><div class='memory-list'>{memory_rows}</div></section><aside class='right-stack'><section class='panel'><header class='panel-head'><h2>Recent sessions</h2><p>Showing {} of {}</p><a class='panel-link' href='/sessions'>All sessions →</a></header><div class='session-list'>{session_rows}</div></section><section class='panel'><header class='panel-head'><h2>System</h2><a class='panel-link' href='/providers'>Providers →</a></header><div class='system-list'><div class='system-row'><span>{} provider</span><div class='system-value'><strong{}>{}</strong><small>{}</small></div></div><div class='system-row'><span>Integrations</span><div class='system-value'><strong>{connected} connected</strong></div></div><div class='system-row'><span>Jobs</span><div class='system-value'><strong{}><a href='/api/v1/jobs'>{queue_summary}</a></strong></div></div></div></section></aside></div><div class='section-title'><h2>Projects</h2><p>Recently active identities</p><a href='/projects'>All projects →</a></div><section class='panel'><table class='project-table'><thead><tr><th scope='col'>Project</th><th scope='col'>Technologies</th><th scope='col'>Memory</th></tr></thead><tbody>{project_rows}</tbody></table></section>{}",
-        metric(1, "Active memory", durable, "DURABLE RECORDS", false),
-        metric(2, "Procedures", procedures, "LEARNED WORK", false),
-        metric(3, "Sessions", session_count, "CAPTURED SESSIONS", false),
-        metric(4, "Projects", projects.len(), "KNOWN IDENTITIES", false),
-        metric(
-            5,
-            "Queue",
-            pending,
-            "PENDING JOBS",
-            pending > 0 || failed > 0
-        ),
-        metric(6, "Global memory", global, "SHARED CONTEXT", false),
-        recent.len().min(4),
-        recent.len(),
-        recent_sessions.len().min(3),
-        recent_sessions.len(),
+    let system = format!(
+        "<section class='panel overview-system'><header class='panel-head'><h2>System</h2><a class='panel-link' href='/providers'>Providers →</a></header><div class='system-list'><div class='system-row'><span>{} provider</span><div class='system-value'><strong{}>{}</strong><small>{}</small></div></div><div class='system-row'><span>Integrations</span><div class='system-value'><strong>{connected} connected</strong></div></div><div class='system-row'><span>Jobs</span><div class='system-value'><strong{}><a href='/api/v1/jobs'>{queue_summary}</a></strong></div></div></div></section>",
         escape(&provider_name),
         if provider_ready {
             ""
@@ -142,7 +102,14 @@ async fn dashboard_content(menvane: &Menvane) -> anyhow::Result<String> {
             " class='pending'"
         } else {
             ""
-        },
+        }
+    );
+    Ok(format!(
+        "<section class='page-head'><div><h1>Overview</h1><p>Projects first, then operational health and durable knowledge.</p></div></section><section class='metrics' aria-label='Memory statistics'>{}{}</section><div class='overview-grid'><section class='overview-projects'><div class='section-title'><h2>Projects</h2><p>Known identities and durable memory</p><a href='/projects'>All projects →</a></div><section class='panel'><table class='project-table'><thead><tr><th>Project</th><th>Technologies</th><th>Memory</th></tr></thead><tbody>{project_rows}</tbody></table></section></section>{system}</div><section class='panel overview-memory'><header class='panel-head'><h2>Recent durable memory</h2><p>Showing {} of {}</p></header><div class='memory-list'>{memory_rows}</div></section>{}",
+        metric("Active memory", durable, "DURABLE RECORDS", false),
+        metric("Procedures", procedures, "LEARNED WORK", false),
+        recent.len().min(4),
+        recent.len(),
         connection_strip(&integrations)
     ))
 }
@@ -175,6 +142,7 @@ async fn project_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Stri
         let memories = menvane
             .all_memories()?
             .into_iter()
+            .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
             .filter(|memory| memory.metadata.project_id.as_deref() == Some(project.id.as_str()))
             .collect::<Vec<_>>();
         let handoff = menvane.current_project_handoff(Some(&project.id))?;
@@ -228,8 +196,10 @@ async fn memories(
     let content = menvane.all_memories().and_then(|memories| {
         let names = project_names(&menvane.all_projects()?);
         let form = filter_form(&filters);
-        let mut matched = memories
-            .iter()
+    let mut matched = memories
+        .iter()
+        .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
+            .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
             .filter(|memory| memory_matches(memory, &filters))
             .collect::<Vec<_>>();
         sort_memories(&mut matched, filters.sort.as_deref());
@@ -253,7 +223,6 @@ async fn memories(
 
 async fn memory_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>) -> Response {
     let content = menvane.read_without_recording(id).and_then(|memory| {
-        let metadata_yaml = serde_yaml::to_string(&memory.metadata)?;
         let metadata = &memory.metadata;
         let projects = menvane.all_projects()?;
         let access_counts = menvane.memory_access_counts(id).unwrap_or_default();
@@ -314,7 +283,7 @@ async fn memory_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>
             .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "never".to_owned());
         Ok(format!(
-            "{}<section class='panel'><div class='detail-grid'><article class='rendered'>{}</article><aside class='detail-side'><p class='stamp'>{} · {} · {:.0}% confidence</p><dl class='metadata'>{project}<dt>Created</dt><dd>{}</dd><dt>Updated</dt><dd>{}</dd><dt>Last verified</dt><dd>{}</dd><dt>Sources</dt><dd>{}</dd><dt>Tags</dt><dd>{}</dd><dt>Applies to</dt><dd>{}</dd><dt>Success / failure</dt><dd>{} / {}</dd><dt>Supersedes</dt><dd>{}</dd></dl><div class='side-section'><h3>Decay</h3><div class='decay-score'><strong>{:.0}%</strong><span>current freshness</span><div class='decay-bar'><i style='width: {:.0}%'></i></div></div><p class='decay-detail'>{} · {}</p><div class='stat-list'><div class='stat-row'><span>Last meaningful access</span><strong>{}</strong></div>{access_rows}</div><h3 class='recall-heading'>Recall signals</h3><p class='recall-detail'>Only agent retrieval and explicit agent reads are counted. UI views do not change these totals.</p></div></aside></div></section><details class='raw'><summary>Raw Markdown and metadata</summary><pre>---\n{}---\n# {}\n\n{}</pre></details><form class='editor panel' method='post' action='/memories/{}/edit'><label>Title<input name='title' value='{}'></label><label>Markdown body<textarea name='body' rows='18'>{}</textarea></label><div class='editor-actions'><button>Commit manual edit</button><a class='quiet-link' href='/memories/{}'>Cancel</a></div></form>",
+            "{}<section class='panel'><div class='detail-grid'><article class='rendered'>{}</article><aside class='detail-side'><p class='stamp'>{} · {} · {:.0}% confidence</p><dl class='metadata'>{project}<dt>Created</dt><dd>{}</dd><dt>Updated</dt><dd>{}</dd><dt>Last verified</dt><dd>{}</dd><dt>Sources</dt><dd>{}</dd><dt>Tags</dt><dd>{}</dd><dt>Applies to</dt><dd>{}</dd><dt>Success / failure</dt><dd>{} / {}</dd><dt>Supersedes</dt><dd>{}</dd></dl><div class='side-section'><h3>Decay</h3><div class='decay-score'><strong>{:.0}%</strong><span>current freshness</span><div class='decay-bar'><i style='width: {:.0}%'></i></div></div><p class='decay-detail'>{} · {}</p><div class='stat-list'><div class='stat-row'><span>Last meaningful access</span><strong>{}</strong></div>{access_rows}</div><h3 class='recall-heading'>Recall signals</h3><p class='recall-detail'>Only agent retrieval and explicit agent reads are counted. UI views do not change these totals.</p></div></aside></div></section>",
             page_head(&memory.title, "Durable record detail"),
             render_memory_content(&memory),
             metadata.scope,
@@ -341,33 +310,9 @@ async fn memory_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>
             escape(decay_label),
             escape(decay_detail),
             escape(&last_meaningful),
-            escape(&metadata_yaml),
-            escape(&memory.title),
-            escape(&memory.body),
-            id,
-            escape_attribute(&memory.title),
-            escape(&memory.body),
-            id
         ))
     });
     page_result(&menvane, "memories", "Memory", content)
-}
-
-#[derive(Deserialize)]
-struct EditMemory {
-    title: String,
-    body: String,
-}
-
-async fn edit_memory(
-    State(menvane): State<Arc<Menvane>>,
-    Path(id): Path<Uuid>,
-    Form(edit): Form<EditMemory>,
-) -> Response {
-    match menvane.edit_memory(id, &edit.title, &edit.body) {
-        Ok(_) => Redirect::to(&format!("/memories/{id}?saved=1")).into_response(),
-        Err(error) => error_page(&menvane, error),
-    }
 }
 
 async fn procedures(State(menvane): State<Arc<Menvane>>) -> Response {
@@ -550,75 +495,6 @@ async fn handoff_detail(
     page_result(&menvane, "projects", "Handoff", content)
 }
 
-#[derive(Default, Deserialize)]
-struct SearchQuery {
-    q: Option<String>,
-    r#type: Option<String>,
-    status: Option<String>,
-}
-
-async fn search(State(menvane): State<Arc<Menvane>>, Query(query): Query<SearchQuery>) -> Response {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let results = query
-        .q
-        .as_deref()
-        .filter(|query| !query.is_empty())
-        .map(|query| menvane.search(&cwd, query, ScopeSelection::Auto, 20))
-        .transpose();
-    let content = results.map(|results| {
-        let asked = query
-            .q
-            .as_deref()
-            .is_some_and(|query| !query.is_empty());
-        let results = results.unwrap_or_default();
-        let filtered_results = results
-            .into_iter()
-            .filter(|memory| {
-                query.r#type.as_deref().is_none_or(|value| {
-                    value.is_empty() || memory.memory_type == value
-                }) && query.status.as_deref().is_none_or(|value| {
-                    value.is_empty() || memory.status == value
-                })
-            })
-            .collect::<Vec<_>>();
-        let rows = if !asked {
-            empty_state("Type a query to run the same retrieval engine used by agents.")
-        } else if filtered_results.is_empty() {
-            empty_state("No memories matched this query.")
-        } else {
-            filtered_results
-                .iter()
-                .map(|memory| {
-                    format!("<a class='memory-row' href='/memories/{}' data-kind='{}'><span class='type'>{}</span><span class='memory-copy'><h3>{}</h3><p>{}</p><span class='memory-meta'><span class='status'>{}</span><span>{}</span><span>{}</span><span class='score-detail' title='FTS rank {} · freshness {:.3} · RRF K=60'>score {:.5}</span></span></span><span class='memory-tail'><span class='scope-tag'>{}</span></span></a>",
-                        memory.id,
-                        escape(&memory.memory_type),
-                        type_letter(&memory.memory_type),
-                        escape(&memory.title),
-                        escape(&memory.excerpt),
-                        title_case(&memory.status),
-                        title_case(&memory.scope),
-                        escape(&recall_reason(memory)),
-                        memory.fts_rank,
-                        menvane_engine::DecayEngine::freshness(&memory.memory_type, memory.age_days),
-                        memory.score,
-                        title_case(&memory.scope))
-                })
-                .collect::<String>()
-        };
-        format!(
-            "{}<form class='search-bar' action='/search'><span>⌕</span><input name='q' value='{}' placeholder='Search historical context'><select name='type'><option value=''>All types</option><option value='fact'>Facts</option><option value='decision'>Decisions</option><option value='procedure'>Procedures</option><option value='gotcha'>Gotchas</option></select><select name='status'><option value=''>All states</option><option value='active'>Active</option><option value='candidate'>Candidate</option><option value='needs-validation'>Needs validation</option></select><button>Search</button></form><section class='panel memory-panel'><header class='panel-head'><h2>Results</h2><p>{}</p></header><div class='memory-list'>{rows}</div></section>",
-            page_head("Recall", "The same retrieval engine used by connected agents."),
-            escape_attribute(query.q.as_deref().unwrap_or_default()),
-            if asked {
-                format!("{} matches", filtered_results.len())
-            } else {
-                "Awaiting a query".to_owned()
-            }
-        )
-    });
-    page_result(&menvane, "search", "Recall", content)
-}
-
 async fn imports(State(menvane): State<Arc<Menvane>>) -> Response {
     let content = menvane.orphans().and_then(|orphans| {
         let projects = menvane.all_projects()?;
@@ -755,49 +631,30 @@ fn page_result(
 }
 
 fn page(menvane: &Menvane, active: &str, title: &str, content: String) -> Response {
-    let projects = menvane.all_projects().unwrap_or_default();
-    let memories = menvane.all_memories().unwrap_or_default();
-    let durable = memories
-        .iter()
-        .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
-        .count();
-    let procedures = memories
-        .iter()
-        .filter(|memory| memory.metadata.memory_type == MemoryType::Procedure)
-        .count();
-    let sessions = memories
-        .iter()
-        .filter(|memory| memory.metadata.memory_type == MemoryType::Session)
-        .count();
-    let nav_item = |key: &str, number: &str, label: &str, href: &str, count: Option<usize>| {
+    let nav_item = |key: &str, label: &str, href: &str| {
         format!(
-            "<a{} href='{}'><span class='nav-icon'>{number}</span>{label}{}</a>",
+            "<a{} href='{}'>{label}</a>",
             if active == key {
                 " class='active' aria-current='page'"
             } else {
                 ""
             },
-            href,
-            count
-                .map(|count| format!("<span class='nav-count'>{count:02}</span>"))
-                .unwrap_or_default()
+            href
         )
     };
     Html(format!(
-        "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Menvane — {}</title><link rel='stylesheet' href='/assets/menvane.css'><script defer src='/assets/menvane.js'></script></head><body><div class='app'><aside class='sidebar' id='sidebar'><a class='brand' href='/' aria-label='Menvane overview'><span class='brand-mark' aria-hidden='true'></span><span class='brand-copy'><strong>MENVANE</strong><small>LOCAL MEMORY</small></span></a><div class='nav-label'>Workspace</div><nav class='nav' aria-label='Workspace'>{}{}{}{}{}{}</nav><div class='nav-label'>System</div><nav class='nav' aria-label='System'>{}{}{}{}</nav><div class='sidebar-foot'><div class='daemon'><i></i>Daemon ready · :{}</div><div class='storage'>{} · Markdown / SQLite FTS5</div></div></aside><main class='main'><header class='topbar'><button class='mobile-menu' id='mobile-menu' type='button' aria-label='Open navigation' aria-expanded='false' aria-controls='sidebar'>≡</button><div class='breadcrumb'>Menvane / <strong>{}</strong></div><button class='command-trigger' id='command-trigger' type='button'><span>⌕</span>Search memory or navigate<kbd>Ctrl K</kbd></button><div class='local-label'>Local only</div></header><div class='workspace'>{content}</div></main></div><div class='palette-backdrop' id='palette-backdrop' role='dialog' aria-modal='true' aria-label='Command palette'><div class='palette'><label class='palette-search'><span>⌕</span><input id='palette-input' type='search' placeholder='Filter actions, or press Enter to search memories'></label><div class='palette-list'><div class='palette-label'>Quick actions</div><a class='palette-item' href='/search'><span>01</span><span>Recall memory</span><kbd>Enter</kbd></a><a class='palette-item' href='/projects'><span>02</span><span>Browse projects</span><kbd>P</kbd></a><a class='palette-item' href='/memories'><span>03</span><span>Browse durable memories</span><kbd>M</kbd></a><a class='palette-item' href='/sessions'><span>04</span><span>Open recent sessions</span><kbd>S</kbd></a></div></div></div><div class='toast' id='toast' role='status'></div></body></html>",
+         "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Menvane — {}</title><link rel='stylesheet' href='/assets/menvane.css'></head><body><div class='app'><aside class='sidebar' id='sidebar'><a class='brand' href='/' aria-label='Menvane overview'><span class='brand-mark' aria-hidden='true'></span><span class='brand-copy'><strong>MENVANE</strong><small>LOCAL MEMORY</small></span></a><div class='nav-label'>Workspace</div><nav class='nav' aria-label='Workspace'>{}{}{}{}{}</nav><div class='nav-label'>System</div><nav class='nav' aria-label='System'>{}{}{}{}</nav><div class='sidebar-foot'><div class='daemon'><i></i>Daemon ready</div><div class='storage'>{}</div></div></aside><main class='main'><header class='topbar'><button class='mobile-menu' id='mobile-menu' type='button' aria-label='Open navigation' aria-expanded='false' aria-controls='sidebar'>≡</button><div class='breadcrumb'>Menvane / <strong>{}</strong></div></header><div class='workspace'>{content}</div></main></div><div class='toast' id='toast' role='status'></div></body></html>",
         escape(title),
-        nav_item("overview", "01", "Overview", "/", None),
-        nav_item("projects", "02", "Projects", "/projects", Some(projects.len())),
-        nav_item("memories", "03", "Memories", "/memories", Some(durable)),
-        nav_item("procedures", "04", "Procedures", "/procedures", Some(procedures)),
-        nav_item("sessions", "05", "Sessions", "/sessions", Some(sessions)),
-        nav_item("search", "06", "Recall", "/search", None),
-        nav_item("imports", "07", "Imports", "/imports", None),
-        nav_item("integrations", "08", "Connections", "/integrations", None),
-        nav_item("providers", "09", "Providers", "/providers", None),
-        nav_item("settings", "10", "Settings", "/settings", None),
-        crate::DEFAULT_PORT,
-        escape(&menvane.home().display().to_string()),
+        nav_item("overview", "Overview", "/"),
+        nav_item("projects", "Projects", "/projects"),
+        nav_item("memories", "Memories", "/memories"),
+        nav_item("procedures", "Procedures", "/procedures"),
+        nav_item("sessions", "Sessions", "/sessions"),
+        nav_item("imports", "Imports", "/imports"),
+        nav_item("integrations", "Connections", "/integrations"),
+        nav_item("providers", "Providers", "/providers"),
+        nav_item("settings", "Settings", "/settings"),
+         escape(&menvane.home().display().to_string()),
         escape(title)
     )).into_response()
 }
@@ -827,9 +684,9 @@ fn page_head(title: &str, subtitle: &str) -> String {
     )
 }
 
-fn metric(index: usize, label: &str, value: usize, note: &str, queue: bool) -> String {
+fn metric(label: &str, value: usize, note: &str, queue: bool) -> String {
     format!(
-        "<article class='metric{}'><span class='metric-label'><b>{index:02}</b>{}</span><strong>{value:02}</strong><small>{}</small></article>",
+        "<article class='metric{}'><span class='metric-label'>{}</span><strong>{value:02}</strong><small>{}</small></article>",
         if queue { " queue" } else { "" },
         escape(label),
         escape(note)
@@ -1040,22 +897,6 @@ fn signal_label(signal: &str) -> String {
         "successfully_applied" => "Successfully applied".to_owned(),
         "failed_application" => "Failed applications".to_owned(),
         other => title_case(&other.replace('_', " ")),
-    }
-}
-
-fn recall_reason(memory: &menvane_engine::SearchResult) -> String {
-    let kind = match memory.memory_type.as_str() {
-        "procedure" => "high-value procedure",
-        "decision" => "project decision",
-        "gotcha" => "protective gotcha",
-        _ => "relevant context",
-    };
-    if memory.scope == "project" {
-        format!("{} · current project", kind)
-    } else if memory.confidence >= 0.85 {
-        format!("{} · high confidence", kind)
-    } else {
-        kind.to_owned()
     }
 }
 
