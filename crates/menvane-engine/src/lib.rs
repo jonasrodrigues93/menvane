@@ -330,6 +330,32 @@ impl Menvane {
         self.search_with_sessions(cwd, query, scope, limit, false)
     }
 
+    pub fn search_without_recording(
+        &self,
+        cwd: &Path,
+        query: &str,
+        scope: ScopeSelection,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let project = match scope {
+            ScopeSelection::Global => None,
+            ScopeSelection::Auto | ScopeSelection::Project => self.ensure_project(cwd)?,
+        };
+        let retrieval_scope = match scope {
+            ScopeSelection::Auto => RetrievalScope::Auto,
+            ScopeSelection::Project => RetrievalScope::Project,
+            ScopeSelection::Global => RetrievalScope::Global,
+        };
+        Retriever::new(&self.index, self.config.decay).retrieve(
+            query,
+            project.as_ref(),
+            retrieval_scope,
+            RetrievalMode::Explicit,
+            false,
+            limit,
+        )
+    }
+
     pub fn search_with_sessions(
         &self,
         cwd: &Path,

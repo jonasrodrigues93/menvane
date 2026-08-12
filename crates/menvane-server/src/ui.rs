@@ -9,7 +9,7 @@ use chrono::Utc;
 use menvane_domain::{
     Memory, MemoryType, NormalizedEvent, Project, ProjectHandoff, ProviderHealth,
 };
-use menvane_engine::Menvane;
+use menvane_engine::{Menvane, ScopeSelection};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -196,11 +196,33 @@ async fn memories(
     let content = menvane.all_memories().and_then(|memories| {
         let names = project_names(&menvane.all_projects()?);
         let form = filter_form(&filters);
-    let mut matched = memories
-        .iter()
-        .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
+        let fts_results = filters
+            .q
+            .as_deref()
+            .filter(|query| !query.trim().is_empty())
+            .map(|query| {
+                menvane.search_without_recording(
+                    &std::env::current_dir().unwrap_or_default(),
+                    query,
+                    ScopeSelection::Auto,
+                    memories.len().max(20),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let fts_ids = fts_results
+            .iter()
+            .map(|result| result.id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut matched = memories
+            .iter()
             .filter(|memory| memory.metadata.memory_type != MemoryType::Session)
-            .filter(|memory| memory_matches(memory, &filters))
+            .filter(|memory| {
+                let query_matches = filters.q.as_deref().is_none_or(|query| {
+                    query.trim().is_empty() || fts_ids.contains(&memory.metadata.id)
+                });
+                query_matches && memory_matches(memory, &filters)
+            })
             .collect::<Vec<_>>();
         sort_memories(&mut matched, filters.sort.as_deref());
         let filtered = if matched.is_empty() {
