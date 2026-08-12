@@ -213,10 +213,12 @@ async fn project_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Stri
 
 #[derive(Default, Deserialize)]
 struct MemoryFilters {
+    q: Option<String>,
     scope: Option<String>,
     r#type: Option<String>,
     status: Option<String>,
     technology: Option<String>,
+    sort: Option<String>,
 }
 
 async fn memories(
@@ -226,10 +228,11 @@ async fn memories(
     let content = menvane.all_memories().and_then(|memories| {
         let names = project_names(&menvane.all_projects()?);
         let form = filter_form(&filters);
-        let matched = memories
+        let mut matched = memories
             .iter()
             .filter(|memory| memory_matches(memory, &filters))
             .collect::<Vec<_>>();
+        sort_memories(&mut matched, filters.sort.as_deref());
         let filtered = if matched.is_empty() {
             empty_state("No memories match these filters.")
         } else {
@@ -313,7 +316,7 @@ async fn memory_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>
         Ok(format!(
             "{}<section class='panel'><div class='detail-grid'><article class='rendered'>{}</article><aside class='detail-side'><p class='stamp'>{} · {} · {:.0}% confidence</p><dl class='metadata'>{project}<dt>Created</dt><dd>{}</dd><dt>Updated</dt><dd>{}</dd><dt>Last verified</dt><dd>{}</dd><dt>Sources</dt><dd>{}</dd><dt>Tags</dt><dd>{}</dd><dt>Applies to</dt><dd>{}</dd><dt>Success / failure</dt><dd>{} / {}</dd><dt>Supersedes</dt><dd>{}</dd></dl><div class='side-section'><h3>Decay</h3><div class='decay-score'><strong>{:.0}%</strong><span>current freshness</span><div class='decay-bar'><i style='width: {:.0}%'></i></div></div><p class='decay-detail'>{} · {}</p><div class='stat-list'><div class='stat-row'><span>Last meaningful access</span><strong>{}</strong></div>{access_rows}</div><h3 class='recall-heading'>Recall signals</h3><p class='recall-detail'>Only agent retrieval and explicit agent reads are counted. UI views do not change these totals.</p></div></aside></div></section><details class='raw'><summary>Raw Markdown and metadata</summary><pre>---\n{}---\n# {}\n\n{}</pre></details><form class='editor panel' method='post' action='/memories/{}/edit'><label>Title<input name='title' value='{}'></label><label>Markdown body<textarea name='body' rows='18'>{}</textarea></label><div class='editor-actions'><button>Commit manual edit</button><a class='quiet-link' href='/memories/{}'>Cancel</a></div></form>",
             page_head(&memory.title, "Durable record detail"),
-            render_markdown(&memory.body),
+            render_memory_content(&memory),
             metadata.scope,
             metadata.status,
             metadata.confidence * 100.0,
@@ -807,11 +810,9 @@ fn type_letter(memory_type: &str) -> &'static str {
 fn memory_row(memory: &Memory, names: &HashMap<String, String>) -> String {
     let metadata = &memory.metadata;
     let kind = metadata.memory_type.to_string();
-    let excerpt = memory
-        .body
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default();
+    let excerpt = memory_summary(memory);
+    let age_days = (Utc::now() - metadata.created_at).num_seconds().max(0) as f64 / 86_400.0;
+    let freshness = menvane_engine::DecayEngine::freshness(&kind, age_days);
     let origin = metadata
         .project_id
         .as_ref()
@@ -830,17 +831,46 @@ fn memory_row(memory: &Memory, names: &HashMap<String, String>) -> String {
         format!("<span>{}</span>", escape(&evidence))
     };
     format!(
-        "<a class='memory-row' href='/memories/{}' data-kind='{kind}'><span class='type'>{}</span><span class='memory-copy'><h3>{}</h3><p>{}</p><span class='memory-meta'><span class='status {}'>{}</span><span>{}</span>{evidence_span}</span></span><span class='memory-tail'><span class='scope-tag'>{}</span><time>{}</time></span></a>",
+        "<a class='memory-row' href='/memories/{}' data-kind='{kind}'><span class='type'>{}</span><span class='memory-copy'><h3>{}</h3><p>{}</p><span class='memory-meta'><span class='status {}'>{}</span><span>{}</span>{evidence_span}<span class='freshness' title='Decay freshness'>{:.0}% fresh</span></span></span><span class='memory-tail'><span class='scope-tag'>{}</span><time>{}</time></span></a>",
         metadata.id,
         type_letter(&kind),
         escape(&memory.title),
-        escape(excerpt),
+        escape(&excerpt),
         metadata.status,
         title_case(&metadata.status.to_string()),
         escape(&origin),
+        freshness * 100.0,
         title_case(&metadata.scope.to_string()),
         metadata.created_at.format("%Y-%m-%d")
     )
+}
+
+fn memory_summary(memory: &Memory) -> String {
+    let section = if memory.metadata.memory_type == MemoryType::Procedure {
+        body_section(&memory.body, "Trigger")
+    } else {
+        None
+    };
+    let source = section.unwrap_or_else(|| {
+        memory
+            .body
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with("---")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    truncate_text(source.trim(), 180)
+}
+
+fn truncate_text(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_owned();
+    }
+    let shortened = value.chars().take(limit).collect::<String>();
+    format!("{}…", shortened.trim_end())
 }
 
 fn empty_state(message: &str) -> String {
@@ -854,6 +884,39 @@ fn body_section(body: &str, heading: &str) -> Option<String> {
     let end = rest.find("\n## ").unwrap_or(rest.len());
     let text = rest[..end].trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn render_memory_content(memory: &Memory) -> String {
+    if memory.metadata.memory_type != MemoryType::Procedure {
+        return render_markdown(&memory.body);
+    }
+    let sections = [
+        ("Trigger", "When this procedure applies"),
+        ("Preconditions", "Before starting"),
+        ("Procedure", "Steps"),
+        ("Decision points", "Decisions"),
+        ("Validation", "How to verify"),
+        ("Failure handling", "If something goes wrong"),
+        ("Expected outcome", "Expected result"),
+    ];
+    let cards = sections
+        .into_iter()
+        .filter_map(|(heading, label)| {
+            body_section(&memory.body, heading).map(|body| {
+                format!(
+                    "<section class='procedure-section'><h2>{}</h2><p class='procedure-label'>{}</p><div>{}</div></section>",
+                    escape(heading),
+                    escape(label),
+                    render_markdown(&body)
+                )
+            })
+        })
+        .collect::<String>();
+    if cards.is_empty() {
+        render_markdown(&memory.body)
+    } else {
+        format!("<div class='procedure-content'>{cards}</div>")
+    }
 }
 
 fn procedure_row(memory: &Memory, names: &HashMap<String, String>) -> String {
@@ -1147,7 +1210,12 @@ fn connection_strip(states: &[menvane_engine::IntegrationRecord]) -> String {
 }
 
 fn memory_matches(memory: &Memory, filters: &MemoryFilters) -> bool {
-    filters
+    filters.q.as_deref().is_none_or(|query| {
+        let query = query.trim().to_ascii_lowercase();
+        query.is_empty()
+            || memory.title.to_ascii_lowercase().contains(&query)
+            || memory.body.to_ascii_lowercase().contains(&query)
+    }) && filters
         .scope
         .as_deref()
         .is_none_or(|value| value.is_empty() || memory.metadata.scope.to_string() == value)
@@ -1165,6 +1233,35 @@ fn memory_matches(memory: &Memory, filters: &MemoryFilters) -> bool {
                     .to_ascii_lowercase()
                     .contains(&value.to_ascii_lowercase())
         })
+}
+
+fn sort_memories(memories: &mut Vec<&Memory>, sort: Option<&str>) {
+    match sort.unwrap_or("recent") {
+        "oldest" => memories.sort_by_key(|memory| memory.metadata.created_at),
+        "confidence" => memories.sort_by(|left, right| {
+            right
+                .metadata
+                .confidence
+                .total_cmp(&left.metadata.confidence)
+        }),
+        "freshness" => memories.sort_by(|left, right| {
+            let left_age =
+                (Utc::now() - left.metadata.created_at).num_seconds().max(0) as f64 / 86_400.0;
+            let right_age = (Utc::now() - right.metadata.created_at)
+                .num_seconds()
+                .max(0) as f64
+                / 86_400.0;
+            menvane_engine::DecayEngine::freshness(
+                &right.metadata.memory_type.to_string(),
+                right_age,
+            )
+            .total_cmp(&menvane_engine::DecayEngine::freshness(
+                &left.metadata.memory_type.to_string(),
+                left_age,
+            ))
+        }),
+        _ => memories.sort_by_key(|memory| std::cmp::Reverse(memory.metadata.created_at)),
+    }
 }
 
 fn filter_form(filters: &MemoryFilters) -> String {
@@ -1189,6 +1286,10 @@ fn filter_form(filters: &MemoryFilters) -> String {
     format!(
         "<form class='filters' action='/memories'>{}<button>Apply</button><a class='quiet-link' href='/memories'>Clear</a></form>",
         [
+            format!(
+                "<input name='q' placeholder='Search title or content' value='{}'>",
+                escape_attribute(filters.q.as_deref().unwrap_or_default())
+            ),
             select(
                 "scope",
                 "All scopes",
@@ -1217,6 +1318,12 @@ fn filter_form(filters: &MemoryFilters) -> String {
             format!(
                 "<input name='technology' placeholder='technology' value='{}'>",
                 escape_attribute(filters.technology.as_deref().unwrap_or_default())
+            ),
+            select(
+                "sort",
+                "Sort: most recent",
+                &["recent", "oldest", "confidence", "freshness"],
+                filters.sort.as_deref()
             )
         ]
         .concat()
@@ -1608,6 +1715,7 @@ a { color: inherit; }
 .memory-copy h3 { margin: 0 0 8px; font-size: 17px; line-height: 1.3; }
 .memory-copy p { overflow: hidden; margin: 0; color: var(--muted); font: 12px/1.5 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .memory-meta { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; color: var(--quiet); font: 11px var(--mono); text-transform: uppercase; }
+.freshness { color: var(--accent); }
 .status { color: var(--text); }
 .status.candidate { color: var(--warn); }
 .memory-tail { display: grid; justify-items: end; gap: 12px; color: var(--quiet); font: 11px var(--mono); text-transform: uppercase; }
@@ -1799,6 +1907,11 @@ a { color: inherit; }
 .rendered code { font-family: var(--mono); font-size: 0.9em; }
 .rendered p code, .rendered li code { padding: 1px 5px; border: 1px solid var(--line); background: var(--surface-muted); }
 .rendered ul { margin: 0 0 12px; padding-left: 24px; }
+.procedure-content { display: grid; gap: 18px; }
+.procedure-section { padding-bottom: 12px; border-bottom: 2px solid var(--line); }
+.procedure-section:last-child { border-bottom: 0; }
+.procedure-section h2 { margin-bottom: 4px; }
+.procedure-label { color: var(--quiet); font: 11px var(--mono); text-transform: uppercase; }
 .metadata dd a, .version-row a, .handoff-meta a { color: var(--accent); text-decoration: none; }
 .metadata dd a:hover, .version-row a:hover, .handoff-meta a:hover { text-decoration: underline; }
 .system-value a { color: inherit; text-decoration: none; }
