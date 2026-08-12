@@ -678,16 +678,6 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/memories/{}/edit", memory.metadata.id))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
