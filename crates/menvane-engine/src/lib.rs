@@ -439,6 +439,10 @@ impl Menvane {
         Ok(memory)
     }
 
+    pub fn read_without_recording(&self, id: Uuid) -> Result<Memory> {
+        Ok(self.index.read_memory(&self.markdown, id)?.0)
+    }
+
     pub fn forget(&self, id: Uuid) -> Result<Memory> {
         let (mut memory, path) = self.index.read_memory(&self.markdown, id)?;
         mark_forgotten(&mut memory);
@@ -505,6 +509,32 @@ impl Menvane {
 
     pub fn session_project_handoff(&self, session_id: Uuid) -> Result<Option<ProjectHandoff>> {
         self.sessions.session_project_handoff(session_id)
+    }
+
+    pub fn handoff_is_stale(&self, project: &Project) -> Result<Option<bool>> {
+        let Some(handoff) = self
+            .sessions
+            .current_project_handoff(Some(project.id.as_str()))?
+        else {
+            return Ok(None);
+        };
+        let Some(cwd) = project.known_paths.first().map(PathBuf::from) else {
+            return Ok(Some(false));
+        };
+        let sanitizer = CaptureSanitizer::new(self.config.capture.clone())?;
+        let repository = handoff::repository_state(&cwd, &[], &sanitizer);
+        Ok(Some(fingerprint_mismatch_handoff(&handoff, &repository)))
+    }
+
+    pub fn memory_access_counts(&self, memory_id: Uuid) -> Result<Vec<(String, u64)>> {
+        self.sessions.access_counts(memory_id)
+    }
+
+    pub fn memory_meaningful_access(
+        &self,
+        memory_id: Uuid,
+    ) -> Result<(u64, Option<chrono::DateTime<Utc>>)> {
+        self.sessions.meaningful_access(memory_id)
     }
 
     pub fn handoff_detail(&self, id: Uuid) -> Result<Option<HandoffDetail>> {

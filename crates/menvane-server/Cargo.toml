@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 fs2.workspace = true
 menvane-domain = { path = "../menvane-domain" }
 menvane-engine = { path = "../menvane-engine" }
@@ -21,6 +22,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-chrono.workspace = true
 tempfile.workspace = true
 tower.workspace = true

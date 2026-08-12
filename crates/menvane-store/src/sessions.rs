@@ -1999,6 +1999,19 @@ impl SessionRepository {
         Ok(())
     }
 
+    pub fn access_counts(&self, memory_id: Uuid) -> Result<Vec<(String, u64)>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT signal, COUNT(*) FROM access_events WHERE memory_id=?1 GROUP BY signal ORDER BY signal",
+        )?;
+        let rows = statement
+            .query_map([memory_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn meaningful_access(&self, memory_id: Uuid) -> Result<(u64, Option<DateTime<Utc>>)> {
         let connection = self.open()?;
         let (count, latest): (u64, Option<String>) = connection.query_row(

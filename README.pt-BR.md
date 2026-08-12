@@ -72,15 +72,13 @@ O Menvane captura eventos normalizados e limitados, remove dados sensíveis e ca
 ### Instale e conecte um agente
 
 ```bash
-cargo build --release --locked
-install -m 755 target/release/menvane ~/.local/bin/menvane
+./install.sh
 
 menvane doctor
-menvane daemon start
 menvane connect claude
 ```
 
-Use `menvane connect codex` ou `menvane connect opencode` para os outros clientes. Captura e recuperação acontecem automaticamente; nenhuma Skill, arquivo de instruções do repositório ou instrução explícita de memória é necessária.
+O script compila o Menvane com Cargo. Use `--binary <caminho>` para instalar um binário de release existente. No Linux, a instalação habilita e inicia um `menvane.service` no escopo do usuário sem bloquear a inicialização do sistema. O daemon e a UI local passam a iniciar automaticamente com a sessão do usuário. Use `menvane connect codex` ou `menvane connect opencode` para os outros clientes. Captura e recuperação acontecem automaticamente; nenhuma Skill, arquivo de instruções do repositório ou instrução explícita de memória é necessária.
 
 O Menvane suporta Linux, macOS e WSL. Windows nativo ainda não é um alvo de release.
 

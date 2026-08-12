@@ -71,8 +71,12 @@ impl SessionConsolidator {
                     CONSOLIDATION_SYSTEM_PROMPT.to_owned()
                 } else {
                     format!(
-                        "{} Return a corrected response after repairing the previous validation error.",
-                        CONSOLIDATION_SYSTEM_PROMPT
+                        "{} Return a corrected response after repairing this validation error: {}",
+                        CONSOLIDATION_SYSTEM_PROMPT,
+                        last_error
+                            .as_ref()
+                            .map(|error: &LlmError| error.message.as_str())
+                            .unwrap_or("the previous response was invalid")
                     )
                 },
                 prompt: prompt.clone(),
@@ -506,6 +510,54 @@ fn consolidation_schema() -> Value {
                     "platforms": { "type": "array", "items": { "type": "string" } }
                 }
             },
+            "empty_content": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [],
+                "properties": {}
+            },
+            "fact_content": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["statement"],
+                "properties": { "statement": { "type": "string" } }
+            },
+            "decision_content": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["decision", "reason", "alternatives", "consequences"],
+                "properties": {
+                    "decision": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "alternatives": { "type": "array", "items": { "type": "string" } },
+                    "consequences": { "type": "array", "items": { "type": "string" } }
+                }
+            },
+            "gotcha_content": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["problem", "cause", "resolution", "avoidance"],
+                "properties": {
+                    "problem": { "type": "string" },
+                    "cause": { "type": "string" },
+                    "resolution": { "type": "string" },
+                    "avoidance": { "type": "string" }
+                }
+            },
+            "procedure_content": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["trigger", "preconditions", "steps", "decision_points", "validation", "failure_handling", "expected_outcome"],
+                "properties": {
+                    "trigger": { "type": "string" },
+                    "preconditions": { "type": "array", "items": { "type": "string" } },
+                    "steps": { "type": "array", "items": { "type": "string" } },
+                    "decision_points": { "type": "array", "items": { "type": "string" } },
+                    "validation": { "type": "array", "items": { "type": "string" } },
+                    "failure_handling": { "type": "array", "items": { "type": "string" } },
+                    "expected_outcome": { "type": "string" }
+                }
+            },
             "memory_operation": {
                 "type": "object",
                 "additionalProperties": false,
@@ -520,7 +572,13 @@ fn consolidation_schema() -> Value {
                     "scope_reason": { "type": "string" },
                     "confidence_signal": { "type": "number", "minimum": 0, "maximum": 1 },
                     "applicability": { "$ref": "#/$defs/applicability" },
-                    "content": { "type": "object" },
+                    "content": { "anyOf": [
+                        { "$ref": "#/$defs/empty_content" },
+                        { "$ref": "#/$defs/fact_content" },
+                        { "$ref": "#/$defs/decision_content" },
+                        { "$ref": "#/$defs/gotcha_content" },
+                        { "$ref": "#/$defs/procedure_content" }
+                    ] },
                     "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
                     "contradicting_event_ids": { "type": "array", "items": { "type": "string" } }
                 }
@@ -572,6 +630,11 @@ mod tests {
         response: Mutex<Value>,
     }
 
+    struct RepairProvider {
+        requests: Mutex<Vec<LlmRequest>>,
+        responses: Mutex<Vec<Value>>,
+    }
+
     #[async_trait]
     impl LlmProvider for FakeProvider {
         async fn generate_structured(
@@ -581,6 +644,42 @@ mod tests {
         ) -> Result<StructuredResponse, LlmError> {
             Ok(StructuredResponse {
                 value: self.response.lock().unwrap().clone(),
+                provider: "fake".to_owned(),
+                model: "deterministic".to_owned(),
+            })
+        }
+
+        async fn health(&self) -> ProviderHealth {
+            ProviderHealth::Ready
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                structured_output: true,
+                json_schema: true,
+                embeddings: false,
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "deterministic"
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for RepairProvider {
+        async fn generate_structured(
+            &self,
+            request: LlmRequest,
+            _schema: JsonSchema,
+        ) -> Result<StructuredResponse, LlmError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(StructuredResponse {
+                value: self.responses.lock().unwrap().remove(0),
                 provider: "fake".to_owned(),
                 model: "deterministic".to_owned(),
             })
@@ -642,6 +741,58 @@ mod tests {
             technology_profile: json!({}),
             current_handoff: None,
         }
+    }
+
+    #[test]
+    fn consolidation_schema_closes_every_object_for_strict_providers() {
+        fn assert_closed(value: &Value, path: &str) {
+            if value.get("type").and_then(Value::as_str) == Some("object") {
+                assert_eq!(
+                    value.get("additionalProperties"),
+                    Some(&Value::Bool(false)),
+                    "object schema at {path} must set additionalProperties to false"
+                );
+            }
+            if let Some(object) = value.as_object() {
+                for (key, child) in object {
+                    assert_closed(child, &format!("{path}/{key}"));
+                }
+            } else if let Some(array) = value.as_array() {
+                for (index, child) in array.iter().enumerate() {
+                    assert_closed(child, &format!("{path}/{index}"));
+                }
+            }
+        }
+
+        assert_closed(&consolidation_schema(), "#");
+    }
+
+    #[tokio::test]
+    async fn repair_retry_includes_the_exact_validation_error() {
+        let provider = Arc::new(RepairProvider {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(vec![
+                json!({
+                    "goals": [{ "kind": "complete", "goal_id": Uuid::from_u128(2), "summary": null, "event_ids": ["goal-event"] }],
+                    "memories": [],
+                    "handoff": null
+                }),
+                json!({ "goals": [], "memories": [], "handoff": null }),
+            ]),
+        });
+
+        SessionConsolidator::new(provider.clone())
+            .consolidate(&packet())
+            .await
+            .unwrap();
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .system
+                .contains("goal transition targets an unknown goal")
+        );
     }
 
     #[tokio::test]

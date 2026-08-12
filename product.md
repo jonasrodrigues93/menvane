@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.23.0
+Version: 1.24.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index. Each durable session is a chronological sanitized capture of the observed events, and semantic interpretation happens separately through one language-model consolidation per session that may identify goals and produce zero or more memory operations. The same processing maintains a single short, replaceable handoff per project.
 
@@ -166,6 +166,8 @@ The search view uses the runtime retrieval engine and exposes FTS rank, RRF cons
 REST endpoints under `/api/v1` cover health, projects, memories, sessions, imports, integrations, settings, jobs, providers, normalized events, recall, and handoffs. Recall accepts the integration client and external session identifier and returns bounded context with intent-ranking diagnostics. HTTP handlers delegate to the same engine used by CLI, MCP, hooks, and UI.
 
 ## Backup, Restore, And Distribution
+
+The repository `install.sh` builds Menvane with Cargo by default, or accepts a prebuilt executable through `--binary`, and installs it at `~/.local/bin/menvane`. On Linux it also installs a user-scoped `menvane.service`, enables it for the user's default target, and requests an immediate non-blocking start. The service runs independently of the system boot critical path, restarts after failures, and serves both the daemon API and local UI. Reinstalling updates the executable and service idempotently. On other supported platforms, the script installs the executable without configuring automatic startup.
 
 `menvane backup <path>` creates a new backup directory containing the complete Markdown memory repository, non-secret configuration, consistent SQLite online backups of both `index.sqlite` and `state.sqlite`, and a checksummed manifest. Existing destinations are never overwritten. `menvane restore <path> --confirm` verifies every checksum, configuration, Markdown frontmatter, and both SQLite databases independently before staging and replacing current state. Restore refuses to run while a daemon PID is present and never replaces state without explicit confirmation.
 

@@ -72,15 +72,13 @@ Menvane captures bounded normalized events, removes sensitive data and ignored p
 ### Install And Connect
 
 ```bash
-cargo build --release --locked
-install -m 755 target/release/menvane ~/.local/bin/menvane
+./install.sh
 
 menvane doctor
-menvane daemon start
 menvane connect claude
 ```
 
-Use `menvane connect codex` or `menvane connect opencode` for the other supported clients. Capture and recall happen automatically; no Skill, repository instruction file, or explicit memory prompt is required.
+The script builds Menvane with Cargo. Pass `--binary <path>` to install an existing release binary instead. On Linux, installation enables and starts a user-scoped `menvane.service` without blocking system startup. The daemon and local UI then start automatically with the user session. Use `menvane connect codex` or `menvane connect opencode` for the other supported clients. Capture and recall happen automatically; no Skill, repository instruction file, or explicit memory prompt is required.
 
 Menvane supports Linux, macOS, and WSL. Native Windows is not currently a release target.
 
