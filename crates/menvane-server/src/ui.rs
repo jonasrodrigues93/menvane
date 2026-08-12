@@ -399,12 +399,29 @@ async fn procedures(State(menvane): State<Arc<Menvane>>) -> Response {
     page_result(&menvane, "procedures", "Procedures", content)
 }
 
-async fn sessions(State(menvane): State<Arc<Menvane>>) -> Response {
+#[derive(Default, Deserialize)]
+struct SessionFilters {
+    client: Option<String>,
+    state: Option<String>,
+}
+
+async fn sessions(
+    State(menvane): State<Arc<Menvane>>,
+    Query(filters): Query<SessionFilters>,
+) -> Response {
     let content = menvane.all_memories().and_then(|memories| {
         let names = project_names(&menvane.all_projects()?);
         let mut sessions = memories
             .iter()
             .filter(|memory| memory.metadata.memory_type == MemoryType::Session)
+            .filter(|memory| {
+                filters.client.as_deref().is_none_or(|client| {
+                    client.is_empty() || memory.metadata.client.as_deref() == Some(client)
+                }) && filters.state.as_deref().is_none_or(|state| {
+                    state.is_empty()
+                        || session_state(memory) == state
+                })
+            })
             .collect::<Vec<_>>();
         sessions.sort_by_key(|memory| std::cmp::Reverse(memory.metadata.created_at));
         let rows = if sessions.is_empty() {
@@ -415,12 +432,22 @@ async fn sessions(State(menvane): State<Arc<Menvane>>) -> Response {
                 .map(|memory| session_row(memory, &names))
                 .collect::<String>()
         };
+        let clients = sessions
+            .iter()
+            .filter_map(|memory| memory.metadata.client.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        let client_options = clients
+            .iter()
+            .map(|client| format!("<option value='{}'{}>{}</option>", escape_attribute(client), if filters.client.as_deref() == Some(client) { " selected" } else { "" }, escape(client)))
+            .collect::<String>();
         Ok(format!(
-            "{}<section class='panel'><header class='panel-head'><h2>Captured sessions</h2><p>{} records</p></header><div class='session-list'>{rows}</div></section>",
+            "{}<form class='filters' action='/sessions'><select name='client'><option value=''>All clients</option>{client_options}</select><select name='state'><option value=''>All states</option><option value='captured'{}>Captured</option><option value='imported'{}>Imported</option></select><button>Apply</button><a class='quiet-link' href='/sessions'>Clear</a></form><section class='panel'><header class='panel-head'><h2>Captured sessions</h2><p>{} records</p></header><div class='session-list'>{rows}</div></section>",
             page_head(
                 "Sessions",
                 "Chronological, sanitized capture reconstructed from operational evidence."
             ),
+            if filters.state.as_deref() == Some("captured") { " selected" } else { "" },
+            if filters.state.as_deref() == Some("imported") { " selected" } else { "" },
             sessions.len()
         ))
     });
@@ -662,14 +689,20 @@ async fn providers(State(menvane): State<Arc<Menvane>>) -> Response {
     let content = menvane.provider_health().await.map(|(provider, model, health)| {
         let ready = matches!(health, ProviderHealth::Ready);
         let (label, explanation) = health_label(&health);
+        let next_action = if ready {
+            "Ready for structured consolidation"
+        } else {
+            "Action required before consolidation can run"
+        };
         format!(
-            "{}<section class='panel'><div class='system-list'><div class='system-row'><span>Active provider</span><div class='system-value'><strong>{}</strong></div></div><div class='system-row'><span>Model</span><div class='system-value'><strong>{}</strong></div></div><div class='system-row'><span>Health</span><div class='system-value'><strong{}>{}</strong><small>{}</small></div></div><div class='system-row'><span>Credentials</span><div class='system-value'><strong>Hidden</strong><small>Environment or existing local authentication; never displayed</small></div></div></div></section>",
+            "{}<section class='panel'><div class='system-list'><div class='system-row'><span>Active provider</span><div class='system-value'><strong>{}</strong></div></div><div class='system-row'><span>Model</span><div class='system-value'><strong>{}</strong></div></div><div class='system-row'><span>Health</span><div class='system-value'><strong{}>{}</strong><small>{}</small></div></div><div class='system-row'><span>Next action</span><div class='system-value'><strong>{}</strong></div></div><div class='system-row'><span>Credentials</span><div class='system-value'><strong>Hidden</strong><small>Environment or existing local authentication; never displayed</small></div></div></div></section>",
             page_head("Providers", "Inference is isolated from retrieval."),
             escape(&provider),
             escape(&model),
             if ready { "" } else { " class='pending'" },
             label,
-            explanation
+            explanation,
+            next_action
         )
     });
     page_result(&menvane, "providers", "Providers", content)
@@ -678,7 +711,7 @@ async fn providers(State(menvane): State<Arc<Menvane>>) -> Response {
 async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
     let content = menvane.configuration_text().map(|configuration| {
         format!(
-            "{}<section class='panel callout'><p>Secret values are environment-only. Restart the daemon after changes.</p></section><form class='editor panel' method='post'><label>Configuration<textarea name='configuration' rows='28'>{}</textarea></label><button>Validate and save</button></form>",
+            "{}<section class='panel callout'><p>Secret values are environment-only. Restart the daemon after changes.</p><p>Sections: capture limits and ignored paths, session finalization, jobs, and language-model provider.</p></section><form class='editor panel' method='post'><label>Configuration<textarea name='configuration' rows='28'>{}</textarea></label><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
             page_head("Settings", "Observable runtime configuration."),
             escape(&configuration)
         )
@@ -1080,15 +1113,31 @@ fn session_row(memory: &Memory, names: &HashMap<String, String>) -> String {
     } else {
         "Captured"
     };
+    let duration = match (metadata.started_at, metadata.ended_at) {
+        (Some(started), Some(ended)) => {
+            format!(" · {} min", (ended - started).num_minutes().max(0))
+        }
+        _ => String::new(),
+    };
     format!(
-        "<article class='session-row'><time>{}</time><div><strong><a href='/sessions/{}'>{}</a></strong><p>{} · {}</p></div><span class='session-state'>{}</span></article>",
-        metadata.created_at.format("%d %b"),
+        "<article class='session-row'><time>{}</time><div><strong><a href='/sessions/{}'>{}</a></strong><p>{} · {}{} · {} events</p></div><span class='session-state'>{}</span></article>",
+        metadata.created_at.format("%Y-%m-%d %H:%M"),
         metadata.id,
         escape(&memory.title),
         escape(&origin),
         escape(client),
+        duration,
+        memory.body.lines().count(),
         state
     )
+}
+
+fn session_state(memory: &Memory) -> &str {
+    if memory.metadata.imported.unwrap_or(false) {
+        "imported"
+    } else {
+        "captured"
+    }
 }
 
 fn session_evidence_row(event: &NormalizedEvent) -> String {
@@ -1216,14 +1265,19 @@ fn connection_strip(states: &[menvane_engine::IntegrationRecord]) -> String {
                 let connected = state.is_some_and(|state| state.connected);
                 let detail = state
                     .map(|state| {
+                        let last_event = state
+                            .last_event_at
+                            .map(|value| format!(" · last event {}", value.format("%Y-%m-%d %H:%M")))
+                            .unwrap_or_default();
                         format!(
-                            "{} · {}",
+                            "{} · {}{}",
                             if state.mcp_registered {
                                 "MCP registered"
                             } else {
                                 "MCP missing"
                             },
-                            state.hook_status
+                            state.hook_status,
+                            last_event
                         )
                     })
                     .unwrap_or_else(|| "not installed".to_owned());
