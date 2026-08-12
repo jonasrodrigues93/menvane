@@ -597,9 +597,9 @@ async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
                 .unwrap_or_else(|| fallback.to_owned())
         };
         format!(
-            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' value='{}'></label></fieldset><fieldset><legend>Decay</legend><p class='field-help'>These values control retrieval freshness. A half-life is the time for freshness to fall by half before the configured floor.</p><label>Facts and gotchas half-life (days)<input name='fact_gotcha_half_life_days' type='number' min='1' value='{}'></label><label>Facts and gotchas floor<input name='fact_gotcha_floor' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Procedures half-life (days)<input name='procedure_half_life_days' type='number' min='1' value='{}'></label><label>Procedures floor<input name='procedure_floor' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Sessions half-life (days)<input name='session_half_life_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<input name='reasoning_effort' value='{}'></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
+            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' value='{}'></label></fieldset><fieldset><legend>Decay</legend><p class='field-help'>These values control retrieval freshness. A half-life is the time for freshness to fall by half before the configured floor.</p><label>Facts and gotchas half-life (days)<input name='fact_gotcha_half_life_days' type='number' min='1' value='{}'></label><label>Facts and gotchas floor<input name='fact_gotcha_floor' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Procedures half-life (days)<input name='procedure_half_life_days' type='number' min='1' value='{}'></label><label>Procedures floor<input name='procedure_floor' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Sessions half-life (days)<input name='session_half_life_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<input name='reasoning_effort' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
             page_head("Settings", "Observable runtime configuration."),
-            get("capture", "max_prompt_bytes", "16384"), get("capture", "max_tool_input_bytes", "4096"), get("capture", "max_tool_output_bytes", "4096"), get("sessions", "idle_finalize_seconds", "120"), get("jobs", "lease_timeout_seconds", "300"), get("decay", "fact_gotcha_half_life_days", "180"), get("decay", "fact_gotcha_floor", "0.50"), get("decay", "procedure_half_life_days", "365"), get("decay", "procedure_floor", "0.65"), get("decay", "session_half_life_days", "45"), get("llm", "provider", "openai"), get("llm", "model", "gpt-5.6-luna"), get("llm", "reasoning_effort", "medium")
+            get("capture", "max_prompt_bytes", "16384"), get("capture", "max_tool_input_bytes", "4096"), get("capture", "max_tool_output_bytes", "4096"), get("sessions", "idle_finalize_seconds", "120"), get("jobs", "lease_timeout_seconds", "300"), get("decay", "fact_gotcha_half_life_days", "180"), get("decay", "fact_gotcha_floor", "0.50"), get("decay", "procedure_half_life_days", "365"), get("decay", "procedure_floor", "0.65"), get("decay", "session_half_life_days", "45"), get("llm", "provider", "openai"), get("llm", "model", "gpt-5.6-luna"), get("llm", "reasoning_effort", "medium"), get("llm", "consolidation_prompt", "")
         )
     });
     page_result(&menvane, "settings", "Settings", content)
@@ -620,6 +620,7 @@ struct SettingsEdit {
     provider: String,
     model: String,
     reasoning_effort: String,
+    consolidation_prompt: String,
 }
 
 async fn update_settings(
@@ -694,6 +695,11 @@ async fn update_settings(
             "llm",
             "reasoning_effort",
             toml::Value::String(edit.reasoning_effort.clone()),
+        ),
+        (
+            "llm",
+            "consolidation_prompt",
+            toml::Value::String(edit.consolidation_prompt.clone()),
         ),
     ] {
         configuration
@@ -1876,6 +1882,13 @@ a { color: inherit; }
 .editor label { display: grid; gap: 9px; width: 100%; color: var(--quiet); font: 11px var(--mono); text-transform: uppercase; }
 .editor input, .editor textarea { width: 100%; padding: 14px; border: 2px solid var(--line-strong); background: var(--surface-raised); color: var(--ink); font: 14px/1.5 var(--mono); }
 .editor textarea { resize: vertical; }
+.settings-form { display: grid; gap: 24px; padding: 24px; }
+.settings-form fieldset { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 18px; margin: 0; padding: 18px; border: 2px solid var(--line); }
+.settings-form legend { padding: 0 8px; color: var(--ink); font: 14px var(--mono); text-transform: uppercase; }
+.settings-form label { display: grid; gap: 7px; color: var(--muted); font: 11px var(--mono); }
+.settings-form input, .settings-form textarea { width: 100%; padding: 10px; border: 2px solid var(--line-strong); background: var(--surface-raised); color: var(--ink); font: 13px/1.4 var(--mono); }
+.settings-form textarea { grid-column: 1 / -1; min-height: 140px; resize: vertical; }
+.field-help { grid-column: 1 / -1; margin: 0; color: var(--muted); font: 12px/1.5 var(--mono); }
 .orphan-row { display: grid; grid-template-columns: 54px minmax(0, 1fr) minmax(210px, auto) auto; gap: 18px; align-items: center; padding: 20px 21px; border-bottom: 2px solid var(--line); }
 .orphan-row:last-child { border-bottom: 0; }
 .orphan-row select { height: 45px; padding: 0 12px; border: 2px solid var(--line-strong); background: var(--surface-raised); font: 12px var(--mono); }
@@ -2034,6 +2047,7 @@ a { color: inherit; }
   .evidence-row { grid-template-columns: 1fr; gap: 9px; }
   .session-handoff-row { grid-template-columns: 1fr auto; }
   .session-handoff-row > div { grid-column: 1 / -1; grid-row: 1; }
+  .settings-form fieldset { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

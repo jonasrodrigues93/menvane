@@ -666,7 +666,6 @@ mod tests {
             &format!("/memories/{}", memory.metadata.id),
             "/procedures",
             "/sessions",
-            "/search",
             "/imports",
             "/integrations",
             "/providers",
@@ -679,19 +678,16 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
-        let body = "title=Edited+memory&body=Immediately+indexed+content";
         let response = router
             .oneshot(
                 Request::builder()
-                    .method("POST")
                     .uri(format!("/memories/{}/edit", memory.metadata.id))
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from(body))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

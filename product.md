@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 1.24.0
+Version: 1.25.0
 
 Menvane is a local persistent memory system for agents. In its current version, it provides a durable command-line memory foundation that stores human-readable Markdown as the source of truth and uses SQLite with FTS5 as a rebuildable search index. Each durable session is a chronological sanitized capture of the observed events, and semantic interpretation happens separately through one language-model consolidation per session that may identify goals and produce zero or more memory operations. The same processing maintains a single short, replaceable handoff per project.
 
@@ -157,11 +157,11 @@ All importers produce client-independent normalized sessions and pass them throu
 
 ## Web Interface
 
-The daemon serves a responsive, server-rendered HTML interface with no CDN, React, or client framework. The dashboard summarizes projects, global memory, procedures, sessions, queue state, integrations, and provider health. Dedicated views cover projects, memories, procedures, sessions, search, imports, integrations, providers, and non-secret settings. Sessions appear as a chronological timeline without episodic sections. Project detail shows a single handoff panel with the current summary, its latest update, and its source sessions, plus a fingerprint-stale warning when applicable; revisions, status buckets, historical cards, and consume/complete/supersede actions are removed.
+The daemon serves a responsive, server-rendered HTML interface with no CDN, React, or client framework. The dashboard prioritizes projects and operational health, followed by durable memory. Dedicated views cover projects, memories, procedures, sessions, imports, integrations, providers, and friendly non-secret settings. Sessions are raw chronological evidence visible only in their dedicated view; they are excluded from memory lists and project memory panels. Project detail shows a single handoff panel with the current summary, its latest update, and its source sessions, plus a fingerprint-stale warning when applicable; revisions, status buckets, historical cards, and consume/complete/supersede actions are removed.
 
-Memory lists filter by physical scope, type, status, and technology. Detail views show rendered content, raw Markdown, metadata, confidence, applicability, source sessions, procedure successes and failures, and supersession evidence. Administrative edits use the same Markdown and index application layer, commit durable history, and update search immediately.
+Memory lists use the FTS5 search engine and filter by physical scope, type, status, and technology. Detail views show rendered content, confidence, applicability, source sessions, procedure successes and failures, supersession evidence, decay, and agent recall signals. The web interface does not edit durable memories or expose raw Markdown and metadata; durable changes use the CLI or consolidation engine.
 
-The search view uses the runtime retrieval engine and exposes FTS rank, RRF constant, freshness, and final score. The visual interface is fully local and uses embedded assets with minimal JavaScript only for progressive page arrival.
+Recall is performed by connected agents and injected into their context; it has no web menu or interactive web search view. The visual interface is fully local and uses embedded assets with minimal JavaScript only for progressive page arrival.
 
 REST endpoints under `/api/v1` cover health, projects, memories, sessions, imports, integrations, settings, jobs, providers, normalized events, recall, and handoffs. Recall accepts the integration client and external session identifier and returns bounded context with intent-ranking diagnostics. HTTP handlers delegate to the same engine used by CLI, MCP, hooks, and UI.
 
