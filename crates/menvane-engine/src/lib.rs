@@ -1121,6 +1121,10 @@ impl Menvane {
         self.config.decay
     }
 
+    pub fn decay_freshness(&self, memory_type: &str, age_days: f64) -> f64 {
+        DecayEngine::freshness_with(&self.config.decay, memory_type, age_days)
+    }
+
     pub fn configure_openai(&self, model: &str, reasoning_effort: Option<&str>) -> Result<()> {
         if model.trim().is_empty() {
             bail!("OpenAI model cannot be empty");

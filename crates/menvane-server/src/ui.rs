@@ -80,7 +80,7 @@ async fn dashboard_content(menvane: &Menvane) -> anyhow::Result<String> {
         recent
             .iter()
             .take(4)
-            .map(|memory| memory_row(memory, &names))
+            .map(|memory| memory_row(memory, &names, menvane.decay_configuration()))
             .collect::<String>()
     };
     let queue_summary = if failed > 0 {
@@ -156,7 +156,7 @@ async fn project_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Stri
         } else {
             sorted
                 .iter()
-                .map(|memory| memory_row(memory, &names))
+                .map(|memory| memory_row(memory, &names, menvane.decay_configuration()))
                 .collect::<String>()
         };
         Ok(format!(
@@ -230,7 +230,7 @@ async fn memories(
         } else {
             matched
                 .iter()
-                .map(|memory| memory_row(memory, &names))
+                .map(|memory| memory_row(memory, &names, menvane.decay_configuration()))
                 .collect::<String>()
         };
         Ok(format!(
@@ -250,7 +250,7 @@ async fn memory_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>
         let access_counts = menvane.memory_access_counts(id).unwrap_or_default();
         let (_, last_meaningful) = menvane.memory_meaningful_access(id).unwrap_or_default();
         let age_days = (Utc::now() - metadata.created_at).num_seconds() as f64 / 86_400.0;
-        let freshness = menvane_engine::DecayEngine::freshness(
+        let freshness = menvane.decay_freshness(
             &metadata.memory_type.to_string(),
             age_days,
         );
@@ -841,12 +841,16 @@ fn type_letter(memory_type: &str) -> &'static str {
     }
 }
 
-fn memory_row(memory: &Memory, names: &HashMap<String, String>) -> String {
+fn memory_row(
+    memory: &Memory,
+    names: &HashMap<String, String>,
+    decay: menvane_engine::DecayConfiguration,
+) -> String {
     let metadata = &memory.metadata;
     let kind = metadata.memory_type.to_string();
     let excerpt = memory_summary(memory);
     let age_days = (Utc::now() - metadata.created_at).num_seconds().max(0) as f64 / 86_400.0;
-    let freshness = menvane_engine::DecayEngine::freshness(&kind, age_days);
+    let freshness = menvane_engine::DecayEngine::freshness_with(&decay, &kind, age_days);
     let origin = metadata
         .project_id
         .as_ref()
