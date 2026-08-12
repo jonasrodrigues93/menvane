@@ -42,7 +42,7 @@ pub use compiler::{
     GLOBAL_SCOPE_CONFIDENCE_THRESHOLD, MemoryCompiler, RELATED_MEMORY_BUDGET_BYTES,
     RELATED_MEMORY_LIMIT, RelatedMemory, RelatedMemoryProvenance,
 };
-pub use decay::DecayEngine;
+pub use decay::{DecayConfiguration, DecayEngine};
 pub use evidence::{
     DEFAULT_EVIDENCE_BUDGET_BYTES, EvidenceBuilder, MAX_SESSION_MARKDOWN_BYTES,
     render_episode_markdown, render_session_markdown,
@@ -138,6 +138,8 @@ struct MenvaneConfig {
     jobs: JobConfiguration,
     #[serde(default)]
     llm: LlmConfiguration,
+    #[serde(default)]
+    decay: DecayConfiguration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -342,7 +344,7 @@ impl Menvane {
             ScopeSelection::Project => RetrievalScope::Project,
             ScopeSelection::Global => RetrievalScope::Global,
         };
-        let results = Retriever::new(&self.index).retrieve(
+        let results = Retriever::new(&self.index, self.config.decay).retrieve(
             query,
             project.as_ref(),
             retrieval_scope,
@@ -359,7 +361,7 @@ impl Menvane {
 
     pub fn recall(&self, cwd: &Path, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let project = self.ensure_project(cwd)?;
-        let results = Retriever::new(&self.index).retrieve(
+        let results = Retriever::new(&self.index, self.config.decay).retrieve(
             query,
             project.as_ref(),
             RetrievalScope::Auto,
@@ -414,12 +416,8 @@ impl Menvane {
                 .filter(|value| !value.is_empty())
                 .collect()
         });
-        let (results, diagnostics) = Retriever::new(&self.index).retrieve_intent(
-            &prompt,
-            context.as_ref(),
-            project.as_ref(),
-            limit,
-        )?;
+        let (results, diagnostics) = Retriever::new(&self.index, self.config.decay)
+            .retrieve_intent(&prompt, context.as_ref(), project.as_ref(), limit)?;
         for memory in &results {
             self.sessions
                 .record_access(memory.id, ReinforcementSignal::Retrieved)?;
@@ -622,7 +620,8 @@ impl Menvane {
                 )
             },
         );
-        let memories = Retriever::new(&self.index).briefing(project.as_ref(), 20)?;
+        let memories =
+            Retriever::new(&self.index, self.config.decay).briefing(project.as_ref(), 20)?;
         for memory in &memories {
             self.sessions
                 .record_access(memory.id, ReinforcementSignal::Retrieved)?;

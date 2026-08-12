@@ -5,8 +5,8 @@ use menvane_domain::{Applicability, Project, ProjectTechnologies};
 use menvane_store::{IndexStore, RecallContext, SearchResult, SearchScope};
 use serde::Serialize;
 
-use crate::DecayEngine;
 use crate::sanitizer::MAX_RECALL_PROMPT_BYTES;
+use crate::{DecayConfiguration, DecayEngine};
 
 pub const RETRIEVAL_RRF_K: f64 = 60.0;
 pub const CURRENT_PROMPT_WEIGHT: f64 = 1.00;
@@ -79,11 +79,12 @@ struct RecallQuery {
 
 pub struct Retriever<'a> {
     index: &'a IndexStore,
+    decay: DecayConfiguration,
 }
 
 impl<'a> Retriever<'a> {
-    pub fn new(index: &'a IndexStore) -> Self {
-        Self { index }
+    pub fn new(index: &'a IndexStore, decay: DecayConfiguration) -> Self {
+        Self { index, decay }
     }
 
     pub fn retrieve(
@@ -123,7 +124,7 @@ impl<'a> Retriever<'a> {
             result.score = rrf
                 * type_multiplier(&result.memory_type)
                 * status_multiplier(&result.status)
-                * DecayEngine::freshness(&result.memory_type, result.age_days);
+                * DecayEngine::freshness_with(&self.decay, &result.memory_type, result.age_days);
         }
         results.sort_by(|left, right| right.score.total_cmp(&left.score));
         let mut seen = HashSet::new();
@@ -203,7 +204,8 @@ impl<'a> Retriever<'a> {
                 let lifecycle = status_multiplier(&result.status);
                 let memory_type = type_multiplier(&result.memory_type);
                 let confidence = confidence_multiplier(result.confidence);
-                let freshness = DecayEngine::freshness(&result.memory_type, result.age_days);
+                let freshness =
+                    DecayEngine::freshness_with(&self.decay, &result.memory_type, result.age_days);
                 let applicability = applicability_multiplier(result, project);
                 let scope = scope_multiplier(result, project);
                 result.score = fused_rrf

@@ -1,5 +1,26 @@
 pub struct DecayEngine;
 
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct DecayConfiguration {
+    pub fact_gotcha_half_life_days: f64,
+    pub fact_gotcha_floor: f64,
+    pub procedure_half_life_days: f64,
+    pub procedure_floor: f64,
+    pub session_half_life_days: f64,
+}
+
+impl Default for DecayConfiguration {
+    fn default() -> Self {
+        Self {
+            fact_gotcha_half_life_days: 180.0,
+            fact_gotcha_floor: 0.50,
+            procedure_half_life_days: 365.0,
+            procedure_floor: 0.65,
+            session_half_life_days: 45.0,
+        }
+    }
+}
+
 impl DecayEngine {
     pub fn session_retention(
         age_days: f64,
@@ -14,10 +35,18 @@ impl DecayEngine {
     }
 
     pub fn freshness(memory_type: &str, age_days: f64) -> f64 {
+        Self::freshness_with(&DecayConfiguration::default(), memory_type, age_days)
+    }
+
+    pub fn freshness_with(config: &DecayConfiguration, memory_type: &str, age_days: f64) -> f64 {
         match memory_type {
-            "fact" | "gotcha" => 0.50_f64.max((-std::f64::consts::LN_2 * age_days / 180.0).exp()),
-            "procedure" => 0.65_f64.max((-std::f64::consts::LN_2 * age_days / 365.0).exp()),
-            "session" => (-std::f64::consts::LN_2 * age_days / 45.0).exp(),
+            "fact" | "gotcha" => config.fact_gotcha_floor.max(
+                (-std::f64::consts::LN_2 * age_days / config.fact_gotcha_half_life_days).exp(),
+            ),
+            "procedure" => config
+                .procedure_floor
+                .max((-std::f64::consts::LN_2 * age_days / config.procedure_half_life_days).exp()),
+            "session" => (-std::f64::consts::LN_2 * age_days / config.session_half_life_days).exp(),
             _ => 1.0,
         }
     }

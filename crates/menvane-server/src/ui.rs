@@ -586,10 +586,20 @@ async fn providers(State(menvane): State<Arc<Menvane>>) -> Response {
 
 async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
     let content = menvane.configuration_text().map(|configuration| {
+        let parsed = toml::from_str::<toml::Value>(&configuration)
+            .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+        let get = |section: &str, key: &str, fallback: &str| {
+            parsed
+                .get(section)
+                .and_then(|value| value.get(key))
+                .map(ToString::to_string)
+                .map(|value| value.trim_matches('"').to_owned())
+                .unwrap_or_else(|| fallback.to_owned())
+        };
         format!(
-            "{}<section class='panel callout'><p>Secret values are environment-only. Restart the daemon after changes.</p><p>Sections: capture limits and ignored paths, session finalization, jobs, and language-model provider.</p></section><form class='editor panel' method='post'><label>Configuration<textarea name='configuration' rows='28'>{}</textarea></label><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
+            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' value='{}'></label></fieldset><fieldset><legend>Decay</legend><p class='field-help'>These values control retrieval freshness. A half-life is the time for freshness to fall by half before the configured floor.</p><label>Facts and gotchas half-life (days)<input name='fact_gotcha_half_life_days' type='number' min='1' value='{}'></label><label>Facts and gotchas floor<input name='fact_gotcha_floor' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Procedures half-life (days)<input name='procedure_half_life_days' type='number' min='1' value='{}'></label><label>Procedures floor<input name='procedure_floor' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Sessions half-life (days)<input name='session_half_life_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<input name='reasoning_effort' value='{}'></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
             page_head("Settings", "Observable runtime configuration."),
-            escape(&configuration)
+            get("capture", "max_prompt_bytes", "16384"), get("capture", "max_tool_input_bytes", "4096"), get("capture", "max_tool_output_bytes", "4096"), get("sessions", "idle_finalize_seconds", "120"), get("jobs", "lease_timeout_seconds", "300"), get("decay", "fact_gotcha_half_life_days", "180"), get("decay", "fact_gotcha_floor", "0.50"), get("decay", "procedure_half_life_days", "365"), get("decay", "procedure_floor", "0.65"), get("decay", "session_half_life_days", "45"), get("llm", "provider", "openai"), get("llm", "model", "gpt-5.6-luna"), get("llm", "reasoning_effort", "medium")
         )
     });
     page_result(&menvane, "settings", "Settings", content)
@@ -597,14 +607,107 @@ async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
 
 #[derive(Deserialize)]
 struct SettingsEdit {
-    configuration: String,
+    max_prompt_bytes: u64,
+    max_tool_input_bytes: u64,
+    max_tool_output_bytes: u64,
+    idle_finalize_seconds: u64,
+    lease_timeout_seconds: u64,
+    fact_gotcha_half_life_days: f64,
+    fact_gotcha_floor: f64,
+    procedure_half_life_days: f64,
+    procedure_floor: f64,
+    session_half_life_days: f64,
+    provider: String,
+    model: String,
+    reasoning_effort: String,
 }
 
 async fn update_settings(
     State(menvane): State<Arc<Menvane>>,
     Form(edit): Form<SettingsEdit>,
 ) -> Response {
-    match menvane.update_configuration_text(&edit.configuration) {
+    let mut configuration = match menvane
+        .configuration_text()
+        .and_then(|value| toml::from_str::<toml::Value>(&value).map_err(Into::into))
+    {
+        Ok(value) => value,
+        Err(error) => return error_page(&menvane, error),
+    };
+    for (section, key, value) in [
+        (
+            "capture",
+            "max_prompt_bytes",
+            toml::Value::Integer(edit.max_prompt_bytes as i64),
+        ),
+        (
+            "capture",
+            "max_tool_input_bytes",
+            toml::Value::Integer(edit.max_tool_input_bytes as i64),
+        ),
+        (
+            "capture",
+            "max_tool_output_bytes",
+            toml::Value::Integer(edit.max_tool_output_bytes as i64),
+        ),
+        (
+            "sessions",
+            "idle_finalize_seconds",
+            toml::Value::Integer(edit.idle_finalize_seconds as i64),
+        ),
+        (
+            "jobs",
+            "lease_timeout_seconds",
+            toml::Value::Integer(edit.lease_timeout_seconds as i64),
+        ),
+        (
+            "decay",
+            "fact_gotcha_half_life_days",
+            toml::Value::Float(edit.fact_gotcha_half_life_days),
+        ),
+        (
+            "decay",
+            "fact_gotcha_floor",
+            toml::Value::Float(edit.fact_gotcha_floor),
+        ),
+        (
+            "decay",
+            "procedure_half_life_days",
+            toml::Value::Float(edit.procedure_half_life_days),
+        ),
+        (
+            "decay",
+            "procedure_floor",
+            toml::Value::Float(edit.procedure_floor),
+        ),
+        (
+            "decay",
+            "session_half_life_days",
+            toml::Value::Float(edit.session_half_life_days),
+        ),
+        (
+            "llm",
+            "provider",
+            toml::Value::String(edit.provider.clone()),
+        ),
+        ("llm", "model", toml::Value::String(edit.model.clone())),
+        (
+            "llm",
+            "reasoning_effort",
+            toml::Value::String(edit.reasoning_effort.clone()),
+        ),
+    ] {
+        configuration
+            .as_table_mut()
+            .expect("configuration must be a table")
+            .entry(section.to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .expect("configuration section must be a table")
+            .insert(key.to_owned(), value);
+    }
+    match menvane
+        .update_configuration_text(&toml::to_string_pretty(&configuration).unwrap_or_default())
+    {
         Ok(_) => Redirect::to("/settings?saved=1").into_response(),
         Err(error) => error_page(&menvane, error),
     }
