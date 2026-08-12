@@ -1922,6 +1922,7 @@ a { color: inherit; }
 .callout pre { margin: 0 0 12px; font: 12px/1.6 var(--mono); }
 .filters { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 27px; }
 .filters select, .filters input { height: 48px; padding: 0 14px; border: 2px solid var(--line-strong); background: var(--surface); color: var(--text); font: 12px var(--mono); }
+.search-bar select { height: 42px; padding: 0 10px; border: 2px solid var(--line); background: var(--surface-raised); color: var(--text); font: 11px var(--mono); }
 .filters button, .editor button, .search-bar button, .orphan-row button { height: 48px; padding: 0 18px; border: 2px solid var(--ink); background: var(--signal); cursor: pointer; font: 12px var(--mono); text-transform: uppercase; box-shadow: 3px 3px 0 var(--ink); }
 .filters button:hover, .editor button:hover, .search-bar button:hover, .orphan-row button:hover { background: var(--signal-soft); }
 .search-bar { display: flex; align-items: center; gap: 15px; margin-bottom: 27px; padding: 0 18px; height: 66px; border: 2px solid var(--line-strong); background: var(--surface); }
@@ -2093,5 +2094,32 @@ a { color: inherit; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --canvas: #171a19;
+    --surface: #202523;
+    --surface-raised: #282e2b;
+    --surface-muted: #303834;
+    --ink: #f2f4ed;
+    --text: #d4d9d0;
+    --muted: #a1aaa0;
+    --quiet: #7f8b80;
+    --line: #3d4740;
+    --line-strong: #657166;
+    --accent: #8ea8ff;
+    --accent-soft: #29334f;
+    --signal: #b9e936;
+    --signal-soft: #34421b;
+    --warn: #f0ad4e;
+    --warn-soft: #49351d;
+    --danger: #ff8878;
+    --danger-soft: #482622;
+  }
+  .sidebar { background: #1d221f; }
+  .topbar { background: rgba(23, 26, 25, .94); }
+  .memory-row:hover, .project-table tbody tr:hover, .session-handoff-row:hover { background: var(--accent-soft); }
 }
 "#;
