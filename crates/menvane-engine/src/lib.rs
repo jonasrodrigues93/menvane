@@ -159,6 +159,8 @@ struct LlmConfiguration {
     #[serde(default = "default_oauth_endpoint")]
     oauth_endpoint: String,
     #[serde(default)]
+    consolidation_prompt: Option<String>,
+    #[serde(default)]
     fallback: Option<Box<LlmConfiguration>>,
 }
 
@@ -172,6 +174,7 @@ impl Default for LlmConfiguration {
             reasoning_effort: Some("medium".to_owned()),
             oauth_issuer: default_oauth_issuer(),
             oauth_endpoint: default_oauth_endpoint(),
+            consolidation_prompt: None,
             fallback: None,
         }
     }
@@ -1088,6 +1091,10 @@ impl Menvane {
         Ok(())
     }
 
+    pub fn decay_configuration(&self) -> DecayConfiguration {
+        self.config.decay
+    }
+
     pub fn configure_openai(&self, model: &str, reasoning_effort: Option<&str>) -> Result<()> {
         if model.trim().is_empty() {
             bail!("OpenAI model cannot be empty");
@@ -1417,7 +1424,14 @@ impl Menvane {
             technology_profile: technology_profile.clone(),
             current_handoff,
         };
+        let consolidation_prompt = self
+            .config
+            .llm
+            .consolidation_prompt
+            .clone()
+            .unwrap_or_else(|| session_consolidator::CONSOLIDATION_SYSTEM_PROMPT.to_owned());
         let outcome = SessionConsolidator::new(self.configured_provider()?)
+            .with_prompt(consolidation_prompt)
             .consolidate(&packet)
             .await
             .map_err(anyhow::Error::new)?;
