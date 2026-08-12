@@ -114,18 +114,18 @@ async fn dashboard_content(menvane: &Menvane) -> anyhow::Result<String> {
     };
     Ok(format!(
         "<section class='page-head'><div><h1>Overview</h1><p>Memory inventory, capture activity and system health across all projects.</p></div></section><section class='metrics' aria-label='Memory statistics'>{}{}{}{}{}{}</section><div class='dashboard-grid'><section class='panel'><header class='panel-head'><h2>Recent durable memory</h2><p>Showing {} of {}</p><div class='tabs' role='tablist' aria-label='Memory filters'><button class='tab active' type='button' role='tab' aria-selected='true' data-filter='all'>All</button><button class='tab' type='button' role='tab' aria-selected='false' data-filter='fact'>Facts</button><button class='tab' type='button' role='tab' aria-selected='false' data-filter='procedure'>Procedures</button><button class='tab' type='button' role='tab' aria-selected='false' data-filter='decision'>Decisions</button><button class='tab' type='button' role='tab' aria-selected='false' data-filter='gotcha'>Gotchas</button></div></header><div class='memory-list'>{memory_rows}</div></section><aside class='right-stack'><section class='panel'><header class='panel-head'><h2>Recent sessions</h2><p>Showing {} of {}</p><a class='panel-link' href='/sessions'>All sessions →</a></header><div class='session-list'>{session_rows}</div></section><section class='panel'><header class='panel-head'><h2>System</h2><a class='panel-link' href='/providers'>Providers →</a></header><div class='system-list'><div class='system-row'><span>{} provider</span><div class='system-value'><strong{}>{}</strong><small>{}</small></div></div><div class='system-row'><span>Integrations</span><div class='system-value'><strong>{connected} connected</strong></div></div><div class='system-row'><span>Jobs</span><div class='system-value'><strong{}><a href='/api/v1/jobs'>{queue_summary}</a></strong></div></div></div></section></aside></div><div class='section-title'><h2>Projects</h2><p>Recently active identities</p><a href='/projects'>All projects →</a></div><section class='panel'><table class='project-table'><thead><tr><th scope='col'>Project</th><th scope='col'>Technologies</th><th scope='col'>Memory</th></tr></thead><tbody>{project_rows}</tbody></table></section>{}",
-        metric(1, "Durable memory", durable, "RECORDS", false),
-        metric(2, "Global memory", global, "SHARED CONTEXT", false),
-        metric(3, "Procedures", procedures, "LEARNED WORK", false),
-        metric(4, "Sessions", session_count, "CAPTURED SESSIONS", false),
-        metric(5, "Projects", projects.len(), "KNOWN IDENTITIES", false),
+        metric(1, "Active memory", durable, "DURABLE RECORDS", false),
+        metric(2, "Procedures", procedures, "LEARNED WORK", false),
+        metric(3, "Sessions", session_count, "CAPTURED SESSIONS", false),
+        metric(4, "Projects", projects.len(), "KNOWN IDENTITIES", false),
         metric(
-            6,
+            5,
             "Queue",
             pending,
             "PENDING JOBS",
             pending > 0 || failed > 0
         ),
+        metric(6, "Global memory", global, "SHARED CONTEXT", false),
         recent.len().min(4),
         recent.len(),
         recent_sessions.len().min(3),
@@ -526,6 +526,8 @@ async fn handoff_detail(
 #[derive(Default, Deserialize)]
 struct SearchQuery {
     q: Option<String>,
+    r#type: Option<String>,
+    status: Option<String>,
 }
 
 async fn search(State(menvane): State<Arc<Menvane>>, Query(query): Query<SearchQuery>) -> Response {
@@ -542,15 +544,25 @@ async fn search(State(menvane): State<Arc<Menvane>>, Query(query): Query<SearchQ
             .as_deref()
             .is_some_and(|query| !query.is_empty());
         let results = results.unwrap_or_default();
+        let filtered_results = results
+            .into_iter()
+            .filter(|memory| {
+                query.r#type.as_deref().is_none_or(|value| {
+                    value.is_empty() || memory.memory_type == value
+                }) && query.status.as_deref().is_none_or(|value| {
+                    value.is_empty() || memory.status == value
+                })
+            })
+            .collect::<Vec<_>>();
         let rows = if !asked {
             empty_state("Type a query to run the same retrieval engine used by agents.")
-        } else if results.is_empty() {
+        } else if filtered_results.is_empty() {
             empty_state("No memories matched this query.")
         } else {
-            results
+            filtered_results
                 .iter()
                 .map(|memory| {
-                    format!("<a class='memory-row' href='/memories/{}' data-kind='{}'><span class='type'>{}</span><span class='memory-copy'><h3>{}</h3><p>{}</p><span class='memory-meta'><span class='status'>{}</span><span>{}</span><span class='score-detail' title='FTS rank {} · freshness {:.3} · RRF K=60'>score {:.5}</span></span></span><span class='memory-tail'><span class='scope-tag'>{}</span></span></a>",
+                    format!("<a class='memory-row' href='/memories/{}' data-kind='{}'><span class='type'>{}</span><span class='memory-copy'><h3>{}</h3><p>{}</p><span class='memory-meta'><span class='status'>{}</span><span>{}</span><span>{}</span><span class='score-detail' title='FTS rank {} · freshness {:.3} · RRF K=60'>score {:.5}</span></span></span><span class='memory-tail'><span class='scope-tag'>{}</span></span></a>",
                         memory.id,
                         escape(&memory.memory_type),
                         type_letter(&memory.memory_type),
@@ -558,6 +570,7 @@ async fn search(State(menvane): State<Arc<Menvane>>, Query(query): Query<SearchQ
                         escape(&memory.excerpt),
                         title_case(&memory.status),
                         title_case(&memory.scope),
+                        escape(&recall_reason(memory)),
                         memory.fts_rank,
                         menvane_engine::DecayEngine::freshness(&memory.memory_type, memory.age_days),
                         memory.score,
@@ -566,11 +579,11 @@ async fn search(State(menvane): State<Arc<Menvane>>, Query(query): Query<SearchQ
                 .collect::<String>()
         };
         format!(
-            "{}<form class='search-bar' action='/search'><span>⌕</span><input name='q' value='{}' placeholder='Search historical context'><button>Search</button></form><section class='panel memory-panel'><header class='panel-head'><h2>Results</h2><p>{}</p></header><div class='memory-list'>{rows}</div></section>",
+            "{}<form class='search-bar' action='/search'><span>⌕</span><input name='q' value='{}' placeholder='Search historical context'><select name='type'><option value=''>All types</option><option value='fact'>Facts</option><option value='decision'>Decisions</option><option value='procedure'>Procedures</option><option value='gotcha'>Gotchas</option></select><select name='status'><option value=''>All states</option><option value='active'>Active</option><option value='candidate'>Candidate</option><option value='needs-validation'>Needs validation</option></select><button>Search</button></form><section class='panel memory-panel'><header class='panel-head'><h2>Results</h2><p>{}</p></header><div class='memory-list'>{rows}</div></section>",
             page_head("Recall", "The same retrieval engine used by connected agents."),
             escape_attribute(query.q.as_deref().unwrap_or_default()),
             if asked {
-                format!("{} matches", results.len())
+                format!("{} matches", filtered_results.len())
             } else {
                 "Awaiting a query".to_owned()
             }
@@ -994,6 +1007,22 @@ fn signal_label(signal: &str) -> String {
         "successfully_applied" => "Successfully applied".to_owned(),
         "failed_application" => "Failed applications".to_owned(),
         other => title_case(&other.replace('_', " ")),
+    }
+}
+
+fn recall_reason(memory: &menvane_engine::SearchResult) -> String {
+    let kind = match memory.memory_type.as_str() {
+        "procedure" => "high-value procedure",
+        "decision" => "project decision",
+        "gotcha" => "protective gotcha",
+        _ => "relevant context",
+    };
+    if memory.scope == "project" {
+        format!("{} · current project", kind)
+    } else if memory.confidence >= 0.85 {
+        format!("{} · high confidence", kind)
+    } else {
+        kind.to_owned()
     }
 }
 
