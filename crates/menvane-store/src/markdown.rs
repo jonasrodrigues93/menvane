@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
-use menvane_domain::{Memory, MemoryMetadata, Project, Scope};
+use menvane_domain::{Memory, MemoryMetadata, Project, Scope, SessionMetadata};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
@@ -38,15 +38,11 @@ impl MarkdownStore {
     }
 
     pub fn initialize(&self) -> Result<()> {
-        for path in [
-            self.home.join("logs"),
-            self.home.join("spool"),
-            self.memory_root.join("archive/sessions"),
-        ] {
+        for path in [self.home.join("logs"), self.home.join("spool")] {
             fs::create_dir_all(&path)
                 .with_context(|| format!("failed to create {}", path.display()))?;
         }
-        for directory in ["facts", "decisions", "procedures", "gotchas"] {
+        for directory in ["context", "playbooks"] {
             fs::create_dir_all(self.memory_root.join("global").join(directory))?;
         }
         let config = self.home.join("config.toml");
@@ -66,7 +62,7 @@ impl MarkdownStore {
 
     pub fn write_project(&self, project: &Project) -> Result<PathBuf> {
         let directory = self.project_directory(project);
-        for name in ["facts", "decisions", "procedures", "gotchas", "sessions"] {
+        for name in ["context", "playbooks", "sessions"] {
             fs::create_dir_all(directory.join(name))?;
         }
         let path = directory.join("project.md");
@@ -83,7 +79,7 @@ impl MarkdownStore {
                 self.project_directory(project)
             }
         };
-        let directory = base.join(memory.metadata.memory_type.directory_name());
+        let directory = base.join(memory.metadata.knowledge_type.directory_name());
         fs::create_dir_all(&directory)?;
         let filename = format!("{}--{}.md", slugify(&memory.title), memory.metadata.id);
         let path = directory.join(filename);
@@ -113,6 +109,46 @@ impl MarkdownStore {
         Ok(parse_frontmatter(path)?.metadata)
     }
 
+    pub fn write_session(
+        &self,
+        metadata: &SessionMetadata,
+        chronological_markdown: &str,
+        project: Option<&Project>,
+    ) -> Result<PathBuf> {
+        let base = project
+            .map(|project| self.project_directory(project))
+            .unwrap_or_else(|| self.memory_root.join("global"));
+        let directory = base.join("sessions");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!(
+            "{}--{}.md",
+            slugify(&metadata.external_session_id),
+            metadata.id
+        ));
+        let body = chronological_markdown.trim().to_owned() + "\n";
+        self.atomic_write(&path, serialize_frontmatter(metadata, &body)?.as_bytes())?;
+        Ok(path)
+    }
+
+    pub fn parse_session(&self, path: &Path) -> Result<ParsedMarkdown<SessionMetadata>> {
+        parse_frontmatter(path)
+    }
+
+    pub fn update_session_summary(
+        &self,
+        path: &Path,
+        metadata: &SessionMetadata,
+        chronological_markdown: &str,
+        summary_markdown: &str,
+    ) -> Result<()> {
+        let body = format!(
+            "{}\n\n## Episodic summary\n\n{}\n",
+            chronological_markdown.trim(),
+            summary_markdown.trim()
+        );
+        self.atomic_write(path, serialize_frontmatter(metadata, &body)?.as_bytes())
+    }
+
     pub fn project_files(&self) -> Result<Vec<PathBuf>> {
         collect_named_files(&self.memory_root.join("projects"), "project.md")
     }
@@ -120,24 +156,30 @@ impl MarkdownStore {
     pub fn memory_files(&self) -> Result<Vec<PathBuf>> {
         let mut files = collect_markdown_files(&self.memory_root.join("global"))?;
         files.extend(collect_markdown_files(&self.memory_root.join("projects"))?);
-        files.extend(collect_markdown_files(
-            &self.memory_root.join("archive/sessions"),
-        )?);
         files.retain(|path| path.file_name().is_some_and(|name| name != "project.md"));
+        files.retain(|path| {
+            !path
+                .parent()
+                .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+        });
+        files.sort();
+        Ok(files)
+    }
+
+    pub fn session_files(&self) -> Result<Vec<PathBuf>> {
+        let mut files = collect_markdown_files(&self.memory_root.join("global/sessions"))?;
+        files.extend(collect_markdown_files(&self.memory_root.join("projects"))?);
+        files.retain(|path| {
+            path.parent()
+                .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
+        });
         files.sort();
         Ok(files)
     }
 
     pub fn archive_session(&self, path: &Path) -> Result<PathBuf> {
-        let filename = path.file_name().context("session path has no filename")?;
-        let destination = self.memory_root.join("archive/sessions").join(filename);
-        fs::create_dir_all(destination.parent().unwrap())?;
-        fs::rename(path, &destination)?;
-        if let Some(parent) = path.parent() {
-            File::open(parent)?.sync_all()?;
-        }
-        File::open(destination.parent().unwrap())?.sync_all()?;
-        Ok(destination)
+        path.file_name().context("session path has no filename")?;
+        Ok(path.to_path_buf())
     }
 
     pub fn commit(&self, message: &str) {
@@ -295,7 +337,7 @@ fn default_config() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use menvane_domain::{Applicability, MemoryMetadata, MemoryType, Scope};
+    use menvane_domain::{Applicability, KnowledgeType, MemoryMetadata, MemoryStatus, Scope};
     use tempfile::TempDir;
 
     use super::*;
@@ -307,12 +349,12 @@ mod tests {
         store.initialize().unwrap();
         let memory = Memory {
             metadata: MemoryMetadata::new(
-                MemoryType::Fact,
+                KnowledgeType::Context,
                 Scope::Global,
                 None,
-                0.9,
                 vec!["rust".to_owned()],
                 Applicability::default(),
+                MemoryStatus::Active,
             ),
             title: "Prefer explicit errors".to_owned(),
             body: "Return actionable failures.".to_owned(),

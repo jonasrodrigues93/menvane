@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::memory::{Applicability, MemoryType, Scope};
+use crate::summary::EpisodicSummary;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -50,138 +50,39 @@ pub enum SessionState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum PromptIntentKind {
-    RootGoal,
-    NewGoal,
-    Refinement,
-    Constraint,
-    Correction,
-    FollowUp,
-    Operational,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EpisodeState {
-    Active,
-    Dormant,
-    Completed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum IntentClassificationSource {
-    Deterministic,
-    ProviderReview,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TaskEpisode {
-    pub id: Uuid,
-    pub project_id: Option<String>,
-    pub conversation_key: String,
-    pub root_event_id: String,
-    pub goal: String,
-    pub ordinal: u32,
-    pub state: EpisodeState,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PromptIntent {
-    pub event_id: String,
-    pub episode_id: Uuid,
-    pub kind: PromptIntentKind,
-    pub confidence: f64,
-    pub weight: f64,
-    pub classifier_version: String,
-    pub source: IntentClassificationSource,
-    pub classified_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HandoffStatus {
-    Active,
+pub enum SummaryStatus {
+    Pending,
     Ready,
-    Consumed,
-    Completed,
-    Stale,
-    Superseded,
+    Skipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HandoffValidation {
-    pub event_id: String,
-    pub command: Option<String>,
-    pub success: bool,
-    pub summary: String,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TaskHandoff {
+#[serde(deny_unknown_fields)]
+pub struct SessionMetadata {
     pub id: Uuid,
+    pub client: String,
+    pub external_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
-    pub conversation_key: String,
-    pub episode_id: Uuid,
-    pub source_session_id: Uuid,
-    pub source_client: String,
-    pub status: HandoffStatus,
-    pub goal: String,
-    pub current_state: String,
-    pub completed_work: Vec<String>,
-    pub pending_work: Vec<String>,
-    pub next_action: Option<String>,
-    pub blockers: Vec<String>,
-    pub changed_files: Vec<String>,
-    pub decisions: Vec<String>,
-    pub validation: Vec<HandoffValidation>,
-    pub relevant_memory_ids: Vec<Uuid>,
-    pub source_event_ids: Vec<String>,
-    pub git_head: Option<String>,
-    pub worktree_state_hash: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub imported: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u32,
+    pub summary_status: SummaryStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<EpisodicSummary>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EvidenceKind {
-    Goal,
-    Prompt,
-    Action,
-    Decision,
-    Discovery,
-    Error,
-    Validation,
-    CompactionContext,
-    UnresolvedQuestion,
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EvidenceItem {
-    pub event_id: String,
-    pub kind: EvidenceKind,
-    pub timestamp: DateTime<Utc>,
-    pub content: String,
-    pub importance: f64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EpisodeEvidencePacket {
-    pub episode_id: Uuid,
-    pub goal: EvidenceItem,
-    pub prompts: Vec<EvidenceItem>,
-    pub actions: Vec<EvidenceItem>,
-    pub decisions: Vec<EvidenceItem>,
-    pub discoveries: Vec<EvidenceItem>,
-    pub errors: Vec<EvidenceItem>,
-    pub validations: Vec<EvidenceItem>,
-    pub files: Vec<String>,
-    pub compaction_context: Vec<EvidenceItem>,
-    pub unresolved_questions: Vec<EvidenceItem>,
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +108,7 @@ impl ReinforcementSignal {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizedEvent {
     pub event_id: String,
     pub kind: NormalizedEventKind,
@@ -236,10 +138,6 @@ pub struct NormalizedEvent {
     pub harness_injected: bool,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 impl NormalizedEvent {
     pub fn is_user_prompt(&self) -> bool {
         !self.harness_injected
@@ -266,7 +164,7 @@ impl NormalizedEvent {
     }
 
     pub fn is_operational(&self) -> bool {
-        self.is_injected_content() || matches!(self.role, NormalizedEventRole::Lifecycle)
+        self.is_injected_content() || self.role == NormalizedEventRole::Lifecycle
     }
 
     pub fn is_durable(&self) -> bool {
@@ -287,6 +185,7 @@ impl NormalizedEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizedSession {
     pub client: String,
     pub external_session_id: String,
@@ -297,179 +196,4 @@ pub struct NormalizedSession {
 
 pub trait SessionImporter {
     fn discover(&self) -> Result<Vec<NormalizedSession>, String>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GoalState {
-    Active,
-    Completed,
-    Abandoned,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Goal {
-    pub id: Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-    pub conversation_key: String,
-    pub summary: String,
-    pub state: GoalState,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GoalOperationKind {
-    Create,
-    Continue,
-    Complete,
-    Abandon,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GoalOperation {
-    pub kind: GoalOperationKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub goal_id: Option<Uuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    pub event_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MemoryOperation {
-    pub operation: String,
-    pub target_memory_ids: Vec<Uuid>,
-    #[serde(rename = "type")]
-    pub memory_type: MemoryType,
-    pub title: String,
-    pub scope: Scope,
-    pub scope_confidence: f64,
-    pub scope_reason: String,
-    pub confidence_signal: f64,
-    pub applies_to: Applicability,
-    pub content: serde_json::Value,
-    pub evidence_event_ids: Vec<String>,
-    pub contradicting_event_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HandoffReplacement {
-    pub summary: String,
-    pub source_session_ids: Vec<Uuid>,
-    pub evidence_event_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConsolidationResponse {
-    pub goals: Vec<GoalOperation>,
-    pub memories: Vec<MemoryOperation>,
-    #[serde(default)]
-    pub handoff: Option<HandoffReplacement>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ProjectHandoff {
-    pub project_id: Option<String>,
-    pub summary: String,
-    pub source_session_ids: Vec<Uuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fingerprint: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn episode_and_intent_vocabulary_is_stable() {
-        assert_eq!(
-            serde_json::to_string(&PromptIntentKind::RootGoal).unwrap(),
-            "\"root-goal\""
-        );
-        assert_eq!(
-            serde_json::from_str::<EpisodeState>("\"completed\"").unwrap(),
-            EpisodeState::Completed
-        );
-        assert_eq!(
-            serde_json::from_str::<HandoffStatus>("\"consumed\"").unwrap(),
-            HandoffStatus::Consumed
-        );
-        assert_eq!(
-            serde_json::to_string(&EvidenceKind::CompactionContext).unwrap(),
-            "\"compaction-context\""
-        );
-    }
-
-    #[test]
-    fn legacy_normalized_events_use_compatible_capture_defaults() {
-        let event: NormalizedEvent = serde_json::from_value(serde_json::json!({
-            "event_id": "legacy",
-            "kind": "user-prompt",
-            "client": "claude-code",
-            "external_session_id": "session",
-            "timestamp": "2026-01-01T00:00:00Z",
-            "cwd": "/tmp"
-        }))
-        .unwrap();
-        assert!(event.is_user_prompt());
-        assert_eq!(event.origin, NormalizedEventOrigin::User);
-        assert_eq!(event.role, NormalizedEventRole::UserPrompt);
-        assert!(!event.harness_injected);
-        assert!(event.is_consolidation_eligible());
-        assert!(event.is_durable());
-        assert!(!event.is_operational());
-    }
-
-    #[test]
-    fn harness_injected_and_lifecycle_events_are_never_durable() {
-        let base = NormalizedEvent {
-            event_id: "id".to_owned(),
-            kind: NormalizedEventKind::UserPrompt,
-            origin: NormalizedEventOrigin::User,
-            role: NormalizedEventRole::UserPrompt,
-            client: "client".to_owned(),
-            external_session_id: "session".to_owned(),
-            timestamp: Utc::now(),
-            cwd: "/tmp".to_owned(),
-            project_id: None,
-            tool_family: None,
-            bounded_input: Some("content".to_owned()),
-            bounded_output: None,
-            attributed_path: None,
-            success: None,
-            model: None,
-            harness_injected: false,
-        };
-        assert!(base.is_durable());
-        assert!(base.is_consolidation_eligible());
-        assert!(!base.is_operational());
-
-        let mut injected = base.clone();
-        injected.harness_injected = true;
-        assert!(injected.is_injected_content());
-        assert!(!injected.is_user_prompt());
-        assert!(injected.is_operational());
-        assert!(!injected.is_durable());
-        assert!(!injected.is_consolidation_eligible());
-
-        let mut system = base.clone();
-        system.origin = NormalizedEventOrigin::System;
-        system.role = NormalizedEventRole::SystemPrompt;
-        assert!(system.is_injected_content());
-        assert!(system.is_operational());
-        assert!(!system.is_durable());
-
-        let mut lifecycle = base.clone();
-        lifecycle.kind = NormalizedEventKind::SessionEnded;
-        lifecycle.origin = NormalizedEventOrigin::System;
-        lifecycle.role = NormalizedEventRole::Lifecycle;
-        assert!(lifecycle.is_operational());
-        assert!(!lifecycle.is_durable());
-        assert!(!lifecycle.is_consolidation_eligible());
-    }
 }

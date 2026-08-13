@@ -103,6 +103,7 @@ impl LlmProvider for CodexProvider {
             value,
             provider: "codex".to_owned(),
             model: self.model.clone(),
+            usage: None,
         })
     }
 
@@ -290,6 +291,7 @@ impl LlmProvider for OpenRouterProvider {
             value,
             provider: "openrouter".to_owned(),
             model: self.model.clone(),
+            usage: None,
         })
     }
 

@@ -2,7 +2,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use menvane_domain::{Applicability, MemoryMetadata, MemoryType, Scope};
+use menvane_domain::{Applicability, KnowledgeType, MemoryMetadata, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -134,23 +134,16 @@ impl<'a> McpServer<'a> {
             "global" => ScopeSelection::Global,
             value => anyhow::bail!("unsupported scope: {value}"),
         };
-        let results = self.menvane.search_with_sessions(
-            &self.cwd,
-            &query,
-            scope,
-            limit,
-            arguments.include_sessions,
-        )?;
+        let results = self.menvane.search(&self.cwd, &query, scope, limit)?;
         let mut output = Vec::new();
         for memory in results.into_iter().take(MAX_MCP_SEARCH_RESULTS) {
             output.push(json!({
                 "id": memory.id,
-                "type": memory.memory_type,
+                "type": memory.knowledge_type,
                 "scope": memory.scope,
                 "title": truncate_chars(&memory.title, MAX_MCP_METADATA_STRING_CHARS),
                 "score": memory.score,
                 "status": memory.status,
-                "confidence": memory.confidence,
                 "applicability": bounded_applicability(&memory.applicability),
                 "short_excerpt": truncate_chars(&memory.excerpt, MAX_MCP_SEARCH_EXCERPT_CHARS)
             }));
@@ -193,9 +186,10 @@ impl<'a> McpServer<'a> {
     fn memory_write(&self, arguments: Value) -> Result<Value> {
         let arguments: WriteArguments = serde_json::from_value(arguments)?;
         let (title, body) = split_content(&arguments.content);
-        let memory_type = match arguments.memory_type.as_str() {
-            "auto" => infer_memory_type(&arguments.content),
-            value => value.parse()?,
+        let knowledge_type = match arguments.knowledge_type.as_str() {
+            "context" => KnowledgeType::Context,
+            "playbook" => KnowledgeType::Playbook,
+            value => anyhow::bail!("unsupported memory type: {value}"),
         };
         let scope = match arguments.scope.as_str() {
             "auto" | "project" => Scope::Project,
@@ -207,15 +201,14 @@ impl<'a> McpServer<'a> {
             WriteMemory {
                 title,
                 body,
-                memory_type,
+                knowledge_type,
                 scope,
-                confidence: 1.0,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
             },
         )?;
         Ok(
-            json!({ "id": memory.metadata.id, "type": memory.metadata.memory_type, "scope": memory.metadata.scope }),
+            json!({ "id": memory.metadata.id, "type": memory.metadata.knowledge_type, "scope": memory.metadata.scope }),
         )
     }
 
@@ -237,8 +230,6 @@ struct SearchArguments {
     limit: usize,
     #[serde(default = "default_auto")]
     scope: String,
-    #[serde(default)]
-    include_sessions: bool,
 }
 
 #[derive(Deserialize)]
@@ -255,8 +246,8 @@ struct ReadArguments {
 #[derive(Deserialize)]
 struct WriteArguments {
     content: String,
-    #[serde(default = "default_auto", rename = "type")]
-    memory_type: String,
+    #[serde(default = "default_context", rename = "type")]
+    knowledge_type: String,
     #[serde(default = "default_auto")]
     scope: String,
 }
@@ -284,6 +275,10 @@ fn default_auto() -> String {
     "auto".to_owned()
 }
 
+fn default_context() -> String {
+    "context".to_owned()
+}
+
 fn split_content(content: &str) -> (String, String) {
     let content = content.trim();
     if let Some(rest) = content.strip_prefix("# ") {
@@ -299,18 +294,6 @@ fn split_content(content: &str) -> (String, String) {
         .take(80)
         .collect();
     (title, content.to_owned())
-}
-
-fn infer_memory_type(content: &str) -> MemoryType {
-    if content.contains("## Decision") {
-        MemoryType::Decision
-    } else if content.contains("## Procedure") {
-        MemoryType::Procedure
-    } else if content.contains("## Problem") && content.contains("## Resolution") {
-        MemoryType::Gotcha
-    } else {
-        MemoryType::Fact
-    }
 }
 
 fn truncate_utf8_bytes(value: &str, maximum: usize) -> String {
@@ -366,14 +349,6 @@ fn bounded_metadata(metadata: &MemoryMetadata) -> Value {
     metadata.applies_to.databases = bounded_strings(&metadata.applies_to.databases);
     metadata.applies_to.platforms = bounded_strings(&metadata.applies_to.platforms);
     metadata.supersedes = bounded_uuid_list(&metadata.supersedes);
-    metadata.client = metadata
-        .client
-        .as_deref()
-        .map(|value| truncate_chars(value, MAX_MCP_METADATA_STRING_CHARS));
-    metadata.external_session_id = metadata
-        .external_session_id
-        .as_deref()
-        .map(|value| truncate_chars(value, MAX_MCP_METADATA_STRING_CHARS));
     metadata.source_project_ids = bounded_strings(&metadata.source_project_ids);
     serde_json::to_value(metadata).unwrap_or_else(|_| json!({}))
 }
@@ -478,7 +453,6 @@ fn tool_definitions() -> Vec<Value> {
                     "query": { "type": "string", "maxLength": MAX_MCP_SEARCH_QUERY_BYTES },
                     "limit": { "type": "integer", "default": 10, "minimum": 1, "maximum": MAX_MCP_SEARCH_LIMIT },
                     "scope": { "type": "string", "enum": ["auto", "project", "global"], "default": "auto" },
-                    "include_sessions": { "type": "boolean", "default": false }
                 },
                 "required": ["query"],
                 "additionalProperties": false,
@@ -510,15 +484,15 @@ fn tool_definitions() -> Vec<Value> {
             "memory_write",
             "Create a durable memory",
             json!({
-                "type": "object",
-                "properties": {
-                    "content": { "type": "string" },
-                    "type": { "type": "string", "enum": ["auto", "fact", "decision", "procedure", "gotcha"], "default": "auto" },
-                    "scope": { "type": "string", "enum": ["auto", "project", "global"], "default": "auto" }
-                },
-                "required": ["content"],
-                "additionalProperties": false
-            }),
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string" },
+            "type": { "type": "string", "enum": ["context", "playbook"] },
+                            "scope": { "type": "string", "enum": ["auto", "project", "global"], "default": "auto" }
+                        },
+                        "required": ["content"],
+                        "additionalProperties": false
+                    }),
         ),
         tool(
             "memory_forget",
@@ -630,9 +604,8 @@ mod tests {
                 WriteMemory {
                     title: "Oversized query target".to_owned(),
                     body: "oversized-marker".to_owned(),
-                    memory_type: MemoryType::Fact,
+                    knowledge_type: KnowledgeType::Context,
                     scope: Scope::Global,
-                    confidence: 1.0,
                     tags: Vec::new(),
                     applies_to: Applicability::default(),
                 },
@@ -671,9 +644,8 @@ mod tests {
                 WriteMemory {
                     title: "Large UTF-8 memory".to_owned(),
                     body,
-                    memory_type: MemoryType::Fact,
+                    knowledge_type: KnowledgeType::Context,
                     scope: Scope::Global,
-                    confidence: 1.0,
                     tags: Vec::new(),
                     applies_to: Applicability::default(),
                 },
@@ -717,9 +689,8 @@ mod tests {
                 WriteMemory {
                     title: "Byte range memory".to_owned(),
                     body: "prefix😀suffix".to_owned(),
-                    memory_type: MemoryType::Fact,
+                    knowledge_type: KnowledgeType::Context,
                     scope: Scope::Global,
-                    confidence: 1.0,
                     tags: Vec::new(),
                     applies_to: Applicability::default(),
                 },
@@ -749,10 +720,9 @@ mod tests {
     #[test]
     fn metadata_and_provenance_are_bounded() {
         let mut metadata = MemoryMetadata::new(
-            MemoryType::Fact,
+            KnowledgeType::Context,
             Scope::Global,
             None,
-            1.0,
             vec!["tag".repeat(1_000); MAX_MCP_METADATA_ITEMS * 2],
             Applicability {
                 languages: vec!["language".repeat(1_000); MAX_MCP_METADATA_ITEMS * 2],
@@ -761,6 +731,7 @@ mod tests {
                 databases: Vec::new(),
                 platforms: Vec::new(),
             },
+            menvane_domain::MemoryStatus::Active,
         );
         metadata.source_sessions = (0..MAX_MCP_METADATA_ITEMS * 2)
             .map(|_| Uuid::now_v7())

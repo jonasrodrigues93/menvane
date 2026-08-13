@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use menvane_domain::{Applicability, Memory, MemoryStatus, Project};
+use menvane_domain::{Applicability, KnowledgeType, Memory, MemoryStatus, Project};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -24,7 +24,6 @@ CREATE TABLE IF NOT EXISTS memories (
     project_id TEXT,
     title TEXT NOT NULL,
     status TEXT NOT NULL,
-    confidence REAL NOT NULL,
     path TEXT NOT NULL UNIQUE,
     body TEXT NOT NULL,
     applicability_json TEXT NOT NULL,
@@ -55,28 +54,6 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
 );
 "#;
 
-const LEGACY_OPERATIONAL_TABLES: &[&str] = &[
-    "sessions",
-    "session_events",
-    "observations",
-    "jobs",
-    "imports",
-    "access_events",
-    "integration_state",
-    "session_injections",
-    "briefing_deliveries",
-    "procedure_applications",
-    "orphan_sessions",
-    "conversations",
-    "task_episodes",
-    "prompt_intents",
-    "prompt_intent_history",
-    "handoffs",
-    "handoff_versions",
-    "handoff_evidence",
-    "checkpoint_state",
-];
-
 #[derive(Debug, Clone, Copy)]
 pub enum SearchScope<'a> {
     Auto(&'a str),
@@ -87,11 +64,10 @@ pub enum SearchScope<'a> {
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub id: Uuid,
-    pub memory_type: String,
+    pub knowledge_type: KnowledgeType,
     pub scope: String,
     pub title: String,
     pub status: String,
-    pub confidence: f64,
     pub applicability: Applicability,
     pub excerpt: String,
     pub score: f64,
@@ -151,7 +127,7 @@ impl IndexStore {
         query: &str,
         scope: SearchScope<'_>,
         limit: usize,
-        include_sessions: bool,
+        _include_sessions: bool,
         match_all_terms: bool,
     ) -> Result<Vec<SearchResult>> {
         let fts_query = fts_query(query, match_all_terms);
@@ -167,21 +143,16 @@ impl IndexStore {
             SearchScope::Global => ("m.scope = 'global'", ""),
         };
         let sql = format!(
-            "SELECT m.id, m.type, m.scope, m.title, m.status, m.confidence, m.applicability_json, m.source_sessions_json, m.supersedes_json, snippet(memory_fts, 2, '', '', ' … ', 24), -bm25(memory_fts) AS score, MAX(0, julianday('now') - julianday(m.updated_at))
+            "SELECT m.id, m.type, m.scope, m.title, m.status, m.applicability_json, m.source_sessions_json, m.supersedes_json, snippet(memory_fts, 2, '', '', ' ... ', 24), -bm25(memory_fts) AS score, MAX(0, julianday('now') - julianday(m.updated_at))
              FROM memory_fts
              JOIN memories m ON m.id = memory_fts.id
-             WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten' AND (?4 OR m.type != 'session') AND m.path NOT LIKE '%/archive/sessions/%'
+             WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten'
              ORDER BY score DESC
              LIMIT ?3"
         );
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
-            params![
-                fts_query,
-                project_id,
-                i64::try_from(limit)?,
-                include_sessions
-            ],
+            params![fts_query, project_id, i64::try_from(limit)?,],
             |row| {
                 let id: String = row.get(0)?;
                 Ok(SearchResult {
@@ -192,12 +163,26 @@ impl IndexStore {
                             Box::new(error),
                         )
                     })?,
-                    memory_type: row.get(1)?,
+                    knowledge_type: row.get::<_, String>(1)?.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
                     scope: row.get(2)?,
                     title: row.get(3)?,
                     status: row.get(4)?,
-                    confidence: row.get(5)?,
-                    applicability: serde_json::from_str(&row.get::<_, String>(6)?).map_err(
+                    applicability: serde_json::from_str(&row.get::<_, String>(5)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    source_session_count: json_array_count(&row.get::<_, String>(6)?).map_err(
                         |error| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 6,
@@ -206,7 +191,7 @@ impl IndexStore {
                             )
                         },
                     )?,
-                    source_session_count: json_array_count(&row.get::<_, String>(7)?).map_err(
+                    supersession_count: json_array_count(&row.get::<_, String>(7)?).map_err(
                         |error| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 7,
@@ -215,19 +200,10 @@ impl IndexStore {
                             )
                         },
                     )?,
-                    supersession_count: json_array_count(&row.get::<_, String>(8)?).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                8,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        },
-                    )?,
-                    excerpt: row.get(9)?,
-                    score: row.get(10)?,
+                    excerpt: row.get(8)?,
+                    score: row.get(9)?,
                     fts_rank: 0,
-                    age_days: row.get(11)?,
+                    age_days: row.get(10)?,
                 })
             },
         )?;
@@ -245,7 +221,7 @@ impl IndexStore {
         &self,
         scope: SearchScope<'_>,
         limit: usize,
-        include_sessions: bool,
+        _include_sessions: bool,
     ) -> Result<Vec<SearchResult>> {
         let connection = self.open_initialized()?;
         let (scope_sql, project_id) = match scope {
@@ -254,64 +230,66 @@ impl IndexStore {
             SearchScope::Global => ("scope = 'global'", ""),
         };
         let sql = format!(
-            "SELECT id, type, scope, title, status, confidence, applicability_json, source_sessions_json, supersedes_json, substr(body, 1, 500), 0.0, MAX(0, julianday('now') - julianday(updated_at))
+            "SELECT id, type, scope, title, status, applicability_json, source_sessions_json, supersedes_json, substr(body, 1, 500), 0.0, MAX(0, julianday('now') - julianday(updated_at))
              FROM memories
-             WHERE {scope_sql} AND status != 'forgotten' AND (?3 OR type != 'session') AND path NOT LIKE '%/archive/sessions/%'
+             WHERE {scope_sql} AND status != 'forgotten'
              ORDER BY updated_at DESC
              LIMIT ?2"
         );
         let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(
-            params![project_id, i64::try_from(limit)?, include_sessions],
-            |row| {
-                let id: String = row.get(0)?;
-                Ok(SearchResult {
-                    id: Uuid::parse_str(&id).map_err(|error| {
+        let rows = statement.query_map(params![project_id, i64::try_from(limit)?], |row| {
+            let id: String = row.get(0)?;
+            Ok(SearchResult {
+                id: Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        id.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                knowledge_type: row.get::<_, String>(1)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                scope: row.get(2)?,
+                title: row.get(3)?,
+                status: row.get(4)?,
+                applicability: serde_json::from_str(&row.get::<_, String>(5)?).map_err(
+                    |error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            id.len(),
+                            5,
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         )
-                    })?,
-                    memory_type: row.get(1)?,
-                    scope: row.get(2)?,
-                    title: row.get(3)?,
-                    status: row.get(4)?,
-                    confidence: row.get(5)?,
-                    applicability: serde_json::from_str(&row.get::<_, String>(6)?).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                6,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        },
-                    )?,
-                    source_session_count: json_array_count(&row.get::<_, String>(7)?).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                7,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        },
-                    )?,
-                    supersession_count: json_array_count(&row.get::<_, String>(8)?).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                8,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        },
-                    )?,
-                    excerpt: row.get(9)?,
-                    score: row.get(10)?,
-                    fts_rank: 0,
-                    age_days: row.get(11)?,
-                })
-            },
-        )?;
+                    },
+                )?,
+                source_session_count: json_array_count(&row.get::<_, String>(6)?).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    },
+                )?,
+                supersession_count: json_array_count(&row.get::<_, String>(7)?).map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    },
+                )?,
+                excerpt: row.get(8)?,
+                score: row.get(9)?,
+                fts_rank: 0,
+                age_days: row.get(10)?,
+            })
+        })?;
         rows.enumerate()
             .map(|(index, row)| {
                 let mut result = row?;
@@ -345,7 +323,6 @@ impl IndexStore {
     }
 
     pub fn reindex(&self, markdown: &MarkdownStore) -> Result<(usize, usize)> {
-        self.ensure_legacy_operational_tables_are_migrated()?;
         let temporary = self
             .path
             .with_extension(format!("reindex-{}", Uuid::now_v7()));
@@ -399,51 +376,6 @@ impl IndexStore {
 
     fn open_initialized(&self) -> Result<Connection> {
         self.open()
-    }
-
-    fn ensure_legacy_operational_tables_are_migrated(&self) -> Result<()> {
-        let connection = self.open_initialized()?;
-        let legacy_tables = LEGACY_OPERATIONAL_TABLES
-            .iter()
-            .map(|table| format!("'{table}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let legacy_count: i64 = connection.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ({legacy_tables})"
-            ),
-            [],
-            |row| row.get(0),
-        )?;
-        if legacy_count == 0 {
-            return Ok(());
-        }
-        let state_path = self
-            .path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("state.sqlite");
-        if !state_path.exists() {
-            bail!(
-                "cannot replace legacy operational tables without {}",
-                state_path.display()
-            );
-        }
-        let state = Connection::open(&state_path).with_context(|| {
-            format!(
-                "cannot replace legacy operational tables without {}",
-                state_path.display()
-            )
-        })?;
-        let markers: i64 = state.query_row(
-            "SELECT COUNT(*) FROM operational_migration_markers WHERE migration='index-to-state-v1'",
-            [],
-            |row| row.get(0),
-        )?;
-        if markers != i64::try_from(LEGACY_OPERATIONAL_TABLES.len())? {
-            bail!("cannot reindex while legacy operational tables are not fully migrated");
-        }
-        Ok(())
     }
 }
 
@@ -503,17 +435,16 @@ fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Resul
         [metadata.id.to_string()],
     )?;
     connection.execute(
-        "INSERT INTO memories(id, type, scope, project_id, title, status, confidence, path, body, applicability_json, tags_json, created_at, updated_at, source_sessions_json, supersedes_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-         ON CONFLICT(id) DO UPDATE SET type=excluded.type, scope=excluded.scope, project_id=excluded.project_id, title=excluded.title, status=excluded.status, confidence=excluded.confidence, path=excluded.path, body=excluded.body, applicability_json=excluded.applicability_json, tags_json=excluded.tags_json, updated_at=excluded.updated_at, source_sessions_json=excluded.source_sessions_json, supersedes_json=excluded.supersedes_json",
+            "INSERT INTO memories(id, type, scope, project_id, title, status, path, body, applicability_json, tags_json, created_at, updated_at, source_sessions_json, supersedes_json)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+          ON CONFLICT(id) DO UPDATE SET type=excluded.type, scope=excluded.scope, project_id=excluded.project_id, title=excluded.title, status=excluded.status, path=excluded.path, body=excluded.body, applicability_json=excluded.applicability_json, tags_json=excluded.tags_json, updated_at=excluded.updated_at, source_sessions_json=excluded.source_sessions_json, supersedes_json=excluded.supersedes_json",
         params![
             metadata.id.to_string(),
-            metadata.memory_type.to_string(),
+            metadata.knowledge_type.to_string(),
             metadata.scope.to_string(),
             metadata.project_id,
             memory.title,
             metadata.status.to_string(),
-            metadata.confidence,
             path.to_string_lossy(),
             memory.body,
             serde_json::to_string(&metadata.applies_to)?,
@@ -560,7 +491,7 @@ pub fn mark_forgotten(memory: &mut Memory) {
 
 #[cfg(test)]
 mod tests {
-    use menvane_domain::{Applicability, MemoryMetadata, MemoryType, Scope};
+    use menvane_domain::{Applicability, KnowledgeType, MemoryMetadata, MemoryStatus, Scope};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -575,12 +506,12 @@ mod tests {
         index.initialize().unwrap();
         let mut memory = Memory {
             metadata: MemoryMetadata::new(
-                MemoryType::Fact,
+                KnowledgeType::Context,
                 Scope::Global,
                 None,
-                1.0,
                 Vec::new(),
                 Applicability::default(),
+                MemoryStatus::Active,
             ),
             title: "Durable rust fact".to_owned(),
             body: "SQLite is derived.".to_owned(),
@@ -614,12 +545,12 @@ mod tests {
         index.initialize().unwrap();
         let mut memory = Memory {
             metadata: MemoryMetadata::new(
-                MemoryType::Fact,
+                KnowledgeType::Context,
                 Scope::Global,
                 None,
-                1.0,
                 Vec::new(),
                 Applicability::default(),
+                MemoryStatus::Active,
             ),
             title: "Provenance marker".to_owned(),
             body: "Durable provenance search content".to_owned(),

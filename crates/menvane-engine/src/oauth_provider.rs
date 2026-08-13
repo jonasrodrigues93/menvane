@@ -300,6 +300,7 @@ impl LlmProvider for OpenAiOAuthProvider {
             value,
             provider: "openai".to_owned(),
             model: self.model.clone(),
+            usage: None,
         })
     }
 

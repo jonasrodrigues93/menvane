@@ -8,56 +8,44 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum MemoryType {
-    Fact,
-    Decision,
-    Procedure,
-    Gotcha,
-    Session,
+pub enum KnowledgeType {
+    Context,
+    Playbook,
 }
 
-impl MemoryType {
+impl KnowledgeType {
     pub fn directory_name(self) -> &'static str {
         match self {
-            Self::Fact => "facts",
-            Self::Decision => "decisions",
-            Self::Procedure => "procedures",
-            Self::Gotcha => "gotchas",
-            Self::Session => "sessions",
+            Self::Context => "context",
+            Self::Playbook => "playbooks",
         }
     }
 }
 
-impl Display for MemoryType {
+impl Display for KnowledgeType {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Fact => "fact",
-            Self::Decision => "decision",
-            Self::Procedure => "procedure",
-            Self::Gotcha => "gotcha",
-            Self::Session => "session",
+            Self::Context => "context",
+            Self::Playbook => "playbook",
         })
     }
 }
 
-impl FromStr for MemoryType {
-    type Err = ParseMemoryTypeError;
+impl FromStr for KnowledgeType {
+    type Err = ParseKnowledgeTypeError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "fact" => Ok(Self::Fact),
-            "decision" => Ok(Self::Decision),
-            "procedure" => Ok(Self::Procedure),
-            "gotcha" => Ok(Self::Gotcha),
-            "session" => Ok(Self::Session),
-            _ => Err(ParseMemoryTypeError(value.to_owned())),
+            "context" => Ok(Self::Context),
+            "playbook" => Ok(Self::Playbook),
+            _ => Err(ParseKnowledgeTypeError(value.to_owned())),
         }
     }
 }
 
 #[derive(Debug, Error)]
-#[error("unsupported memory type: {0}")]
-pub struct ParseMemoryTypeError(String);
+#[error("unsupported knowledge type: {0}")]
+pub struct ParseKnowledgeTypeError(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -91,14 +79,12 @@ impl FromStr for Scope {
 #[error("unsupported scope: {0}")]
 pub struct ParseScopeError(String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MemoryStatus {
     Active,
     Candidate,
-    NeedsValidation,
     Superseded,
-    Historical,
     Forgotten,
 }
 
@@ -107,9 +93,7 @@ impl Display for MemoryStatus {
         formatter.write_str(match self {
             Self::Active => "active",
             Self::Candidate => "candidate",
-            Self::NeedsValidation => "needs-validation",
             Self::Superseded => "superseded",
-            Self::Historical => "historical",
             Self::Forgotten => "forgotten",
         })
     }
@@ -129,16 +113,25 @@ pub struct Applicability {
     pub platforms: Vec<String>,
 }
 
+impl Applicability {
+    pub fn is_empty(&self) -> bool {
+        self.languages.is_empty()
+            && self.frameworks.is_empty()
+            && self.tools.is_empty()
+            && self.databases.is_empty()
+            && self.platforms.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryMetadata {
     pub id: Uuid,
     #[serde(rename = "type")]
-    pub memory_type: MemoryType,
+    pub knowledge_type: KnowledgeType,
     pub scope: Scope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     pub status: MemoryStatus,
-    pub confidence: f64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,54 +148,27 @@ pub struct MemoryMetadata {
     pub successes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failures: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub external_session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub imported: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_project_ids: Vec<String>,
 }
 
-impl Applicability {
-    pub fn is_empty(&self) -> bool {
-        self.languages.is_empty()
-            && self.frameworks.is_empty()
-            && self.tools.is_empty()
-            && self.databases.is_empty()
-            && self.platforms.is_empty()
-    }
-}
-
 impl MemoryMetadata {
     pub fn new(
-        memory_type: MemoryType,
+        knowledge_type: KnowledgeType,
         scope: Scope,
         project_id: Option<String>,
-        confidence: f64,
         tags: Vec<String>,
         applies_to: Applicability,
+        status: MemoryStatus,
     ) -> Self {
         let now = Utc::now();
-        let procedure = memory_type == MemoryType::Procedure;
+        let playbook = knowledge_type == KnowledgeType::Playbook;
         Self {
             id: Uuid::now_v7(),
-            memory_type,
+            knowledge_type,
             scope,
             project_id,
-            status: if procedure {
-                MemoryStatus::Candidate
-            } else {
-                MemoryStatus::Active
-            },
-            confidence,
+            status,
             created_at: now,
             updated_at: now,
             last_verified_at: Some(now),
@@ -210,14 +176,8 @@ impl MemoryMetadata {
             tags,
             applies_to,
             supersedes: Vec::new(),
-            successes: procedure.then_some(1),
-            failures: procedure.then_some(0),
-            client: None,
-            external_session_id: None,
-            started_at: None,
-            ended_at: None,
-            imported: None,
-            generation: None,
+            successes: playbook.then_some(0),
+            failures: playbook.then_some(0),
             source_project_ids: Vec::new(),
         }
     }

@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 
-use menvane_domain::{MemoryStatus, MemoryType, Scope};
+use menvane_domain::{KnowledgeType, MemoryStatus, Scope};
 use menvane_store::MarkdownStore;
 
 #[test]
-fn parses_canonical_fact_fixture() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fact.md");
+fn parses_canonical_context_fixture() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/context.md");
     let store = MarkdownStore::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let memory = store.parse_memory(&fixture).unwrap();
-    assert_eq!(memory.metadata.memory_type, MemoryType::Fact);
+    assert_eq!(memory.metadata.knowledge_type, KnowledgeType::Context);
     assert_eq!(memory.metadata.scope, Scope::Global);
     assert_eq!(memory.metadata.status, MemoryStatus::Active);
     assert_eq!(memory.metadata.applies_to.databases, ["sqlite"]);

@@ -42,6 +42,14 @@ pub struct StructuredResponse {
     pub value: Value,
     pub provider: String,
     pub model: String,
+    pub usage: Option<ResponseUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponseUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub credits: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

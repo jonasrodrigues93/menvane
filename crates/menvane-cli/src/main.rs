@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use chrono::{Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use menvane_domain::{Applicability, MemoryType, Scope};
+use menvane_domain::{Applicability, KnowledgeType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use menvane_integrations::{
     ClaudeHook, ClaudeInstaller, ClaudePaths, CodexHook, CodexInstaller, CodexPaths, JsonlImporter,
@@ -44,7 +44,6 @@ enum Command {
     Forget(ForgetArgs),
     Reindex,
     Doctor,
-    Gc,
     Handoff(HandoffArgs),
     Mcp,
 }
@@ -241,8 +240,6 @@ struct WriteArgs {
     r#type: WritableType,
     #[arg(long, value_enum, default_value = "project")]
     scope: PhysicalScope,
-    #[arg(long, default_value_t = 1.0)]
-    confidence: f64,
     #[arg(long, value_delimiter = ',')]
     tags: Vec<String>,
     #[arg(long, value_delimiter = ',')]
@@ -284,10 +281,8 @@ struct ForgetArgs {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum WritableType {
-    Fact,
-    Decision,
-    Procedure,
-    Gotcha,
+    Context,
+    Playbook,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -560,17 +555,14 @@ async fn main() -> Result<()> {
                 WriteMemory {
                     title: arguments.title,
                     body: arguments.content,
-                    memory_type: match arguments.r#type {
-                        WritableType::Fact => MemoryType::Fact,
-                        WritableType::Decision => MemoryType::Decision,
-                        WritableType::Procedure => MemoryType::Procedure,
-                        WritableType::Gotcha => MemoryType::Gotcha,
+                    knowledge_type: match arguments.r#type {
+                        WritableType::Context => KnowledgeType::Context,
+                        WritableType::Playbook => KnowledgeType::Playbook,
                     },
                     scope: match arguments.scope {
                         PhysicalScope::Global => Scope::Global,
                         PhysicalScope::Project => Scope::Project,
                     },
-                    confidence: arguments.confidence,
                     tags: arguments.tags,
                     applies_to: Applicability {
                         languages: arguments.languages,
@@ -595,7 +587,7 @@ async fn main() -> Result<()> {
                 println!(
                     "{}\t{}\t{}\t{}\t{:.3}\t{}",
                     result.id,
-                    result.memory_type,
+                    result.knowledge_type,
                     result.scope,
                     result.status,
                     result.score,
@@ -651,15 +643,17 @@ async fn main() -> Result<()> {
                 bail!("one or more doctor checks failed");
             }
         }
-        Command::Gc => {
-            println!("archived {} sessions", menvane.gc()?);
-        }
         Command::Handoff(arguments) => match arguments.command {
             HandoffCommand::Inspect => {
                 let cwd = std::env::current_dir()?;
                 let project_id = menvane.ensure_project(&cwd)?.map(|project| project.id);
                 match menvane.current_project_handoff(project_id.as_deref())? {
-                    Some(handoff) => println!("{}", serde_json::to_string_pretty(&handoff)?),
+                    Some(handoff) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "project_id": handoff.project_id, "items": handoff.items })
+                        )?
+                    ),
                     None => println!("no current handoff for this project"),
                 }
             }

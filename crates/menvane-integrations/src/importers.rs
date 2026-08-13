@@ -508,7 +508,7 @@ fn collect_jsonl(root: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use menvane_engine::{ImportOutcome, Menvane, ScopeSelection};
+    use menvane_engine::{ImportOutcome, Menvane};
     use tempfile::TempDir;
 
     use super::*;
@@ -546,19 +546,19 @@ mod tests {
             .unwrap()
             .block_on(menvane.process_next_job())
             .unwrap();
-        let results = menvane
-            .search_with_sessions(
-                &project,
-                "imported-session-goal",
-                ScopeSelection::Project,
-                10,
-                true,
-            )
+        let finalized = menvane
+            .jobs()
+            .unwrap()
+            .into_iter()
+            .find(|job| job.job_type == "finalize_session")
             .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(
-            menvane.read(results[0].id).unwrap().metadata.imported,
-            Some(true)
+        let session_id = finalized.dedupe_key.parse().unwrap();
+        let events = menvane.session_events(session_id).unwrap();
+        assert_eq!(events.len(), scan.sessions[0].events.len());
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.bounded_input.as_deref() == Some("imported-session-goal") })
         );
     }
 
