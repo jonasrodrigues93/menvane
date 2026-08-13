@@ -9,6 +9,9 @@ use uuid::Uuid;
 use crate::MarkdownStore;
 
 const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version INTEGER PRIMARY KEY CHECK (version = 1)
+);
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
     identity TEXT NOT NULL UNIQUE,
@@ -90,8 +93,9 @@ impl IndexStore {
     pub fn initialize(&self) -> Result<()> {
         let connection = self.open()?;
         connection.execute_batch("PRAGMA journal_mode = WAL;")?;
+        reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
-        ensure_memory_metadata_columns(&connection)?;
+        connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         Ok(())
     }
 
@@ -328,7 +332,9 @@ impl IndexStore {
             .with_extension(format!("reindex-{}", Uuid::now_v7()));
         let connection = Connection::open(&temporary)?;
         configure_connection(&connection, false)?;
+        reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         let project_files = markdown.project_files()?;
         for path in &project_files {
             let project = markdown.parse_project(path)?;
@@ -388,21 +394,33 @@ fn configure_connection(connection: &Connection, wal: bool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_memory_metadata_columns(connection: &Connection) -> Result<()> {
-    for column in ["source_sessions_json", "supersedes_json"] {
-        let exists: Option<()> = connection
-            .query_row(
-                "SELECT 1 FROM pragma_table_info('memories') WHERE name=?1",
-                [column],
-                |_| Ok(()),
-            )
+fn reject_unversioned_database(connection: &Connection) -> Result<()> {
+    let has_schema_meta = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if has_schema_meta {
+        let version: Option<i64> = connection
+            .query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
+                row.get(0)
+            })
             .optional()?;
-        if exists.is_none() {
-            connection.execute(
-                &format!("ALTER TABLE memories ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'"),
-                [],
-            )?;
+        if version != Some(1) {
+            bail!("unsupported index schema version")
         }
+        return Ok(());
+    }
+    let user_table_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if user_table_count != 0 {
+        bail!("unversioned index database requires recreation")
     }
     Ok(())
 }

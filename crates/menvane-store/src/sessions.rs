@@ -20,6 +20,9 @@ pub const MAX_CHECKPOINT_DEBOUNCE_SECONDS: i64 = 86_400;
 pub const GLOBAL_HANDOFF_KEY: &str = "__global__";
 
 const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_meta (
+    version INTEGER PRIMARY KEY CHECK (version = 1)
+);
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     client TEXT NOT NULL,
@@ -232,7 +235,9 @@ impl SessionRepository {
 
     pub fn initialize(&self) -> Result<()> {
         let connection = self.open()?;
+        reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         Ok(())
     }
 
@@ -719,9 +724,42 @@ impl SessionRepository {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
+        reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         Ok(connection)
     }
+}
+
+fn reject_unversioned_database(connection: &Connection) -> Result<()> {
+    let has_schema_meta = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if has_schema_meta {
+        let version: Option<i64> = connection
+            .query_row("SELECT version FROM schema_meta LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if version != Some(1) {
+            bail!("unsupported state schema version")
+        }
+        return Ok(());
+    }
+    let user_table_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if user_table_count != 0 {
+        bail!("unversioned state database requires recreation")
+    }
+    Ok(())
 }
 
 fn create_session(

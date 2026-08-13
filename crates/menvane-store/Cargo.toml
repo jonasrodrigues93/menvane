@@ -17,4 +17,5 @@ sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true
