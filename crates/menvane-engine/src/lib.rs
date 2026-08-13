@@ -946,6 +946,9 @@ impl Menvane {
     async fn process_consolidate_job(&self, job: &JobRecord) -> Result<String> {
         let session_id: Uuid = job.dedupe_key.parse()?;
         if let Some(marker) = self.sessions.consolidation_result(session_id)? {
+            let session = self.sessions.session(session_id)?;
+            self.update_session_summary(&session, &marker.result)?;
+            self.apply_consolidation(session_id, session.project_id.as_deref(), &marker.result)?;
             return Ok(marker.execution.provider);
         }
         let session = self.sessions.session(session_id)?;
@@ -956,17 +959,29 @@ impl Menvane {
             .into_iter()
             .filter_map(|event| sanitizer.filter_durable_event(event))
             .collect::<Vec<_>>();
-        if events
-            .iter()
-            .all(|event| !event.is_consolidation_eligible())
-        {
+        if !session_engine::is_session_worth_compiling(&events) {
             self.sessions
                 .set_session_summary(session_id, SummaryStatus::Skipped, None)?;
             return Ok("none".to_owned());
         }
+        let packet_events = events
+            .iter()
+            .filter(|event| {
+                event.is_consolidation_eligible()
+                    && (event
+                        .bounded_input
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty())
+                        || event
+                            .bounded_output
+                            .as_ref()
+                            .is_some_and(|value| !value.trim().is_empty()))
+            })
+            .cloned()
+            .collect();
         let packet = ConsolidationPacket {
             session_id,
-            events: events.clone(),
+            events: packet_events,
             handoff_items: self
                 .sessions
                 .current_handoff(session.project_id.as_deref())?,
@@ -984,13 +999,10 @@ impl Menvane {
             .consolidate(&packet)
             .await
             .map_err(anyhow::Error::new)?;
-        self.apply_consolidation(
-            session_id,
-            session.project_id.as_deref(),
-            &outcome.response,
-            &outcome.execution,
-        )?;
         self.update_session_summary(&session, &outcome.response)?;
+        self.apply_consolidation(session_id, session.project_id.as_deref(), &outcome.response)?;
+        self.sessions
+            .record_consolidation(session_id, &outcome.response, &outcome.execution)?;
         Ok(outcome.provider)
     }
 
@@ -999,16 +1011,13 @@ impl Menvane {
         session_id: Uuid,
         project_id: Option<&str>,
         result: &ConsolidationResult,
-        execution: &menvane_domain::ConsolidationExecution,
     ) -> Result<()> {
-        for operation in &result.handoff {
-            self.apply_handoff_operation(session_id, project_id, operation)?;
+        for (index, operation) in result.handoff.iter().enumerate() {
+            self.apply_handoff_operation(session_id, project_id, index, operation)?;
         }
         for (index, operation) in result.knowledge.iter().enumerate() {
             self.apply_knowledge_operation(session_id, project_id, operation, index)?;
         }
-        self.sessions
-            .record_consolidation(session_id, result, execution)?;
         Ok(())
     }
 
@@ -1016,6 +1025,7 @@ impl Menvane {
         &self,
         session_id: Uuid,
         project_id: Option<&str>,
+        operation_index: usize,
         operation: &HandoffItemOperation,
     ) -> Result<()> {
         let now = Utc::now();
@@ -1027,6 +1037,13 @@ impl Menvane {
             HandoffItemOperation::Keep { .. } => {}
             HandoffItemOperation::Uncertain { item_id } => {
                 let mut item = self.handoff_item(*item_id, project_id)?;
+                if item.low_confidence
+                    && item.sources.iter().any(|source| {
+                        source.session_id == session_id && source.event_ids.is_empty()
+                    })
+                {
+                    return Ok(());
+                }
                 item.low_confidence = true;
                 item.updated_at = now;
                 item.sources.push(source(&[]));
@@ -1034,6 +1051,17 @@ impl Menvane {
             }
             HandoffItemOperation::Update(value) => {
                 let mut item = self.handoff_item(value.item_id, project_id)?;
+                if item.kind == value.kind
+                    && item.state == value.state
+                    && item.next_step == value.next_step
+                    && item.blocker == value.blocker
+                    && item.sources.iter().any(|source| {
+                        source.session_id == session_id
+                            && source.event_ids == value.evidence_event_ids
+                    })
+                {
+                    return Ok(());
+                }
                 item.kind = value.kind;
                 item.state = value.state.clone();
                 item.next_step = value.next_step.clone();
@@ -1051,6 +1079,7 @@ impl Menvane {
                 self.create_handoff_item(
                     session_id,
                     project_id,
+                    operation_index,
                     &value.replacement,
                     &value.evidence_event_ids,
                     now,
@@ -1059,6 +1088,7 @@ impl Menvane {
             HandoffItemOperation::Create(value) => self.create_handoff_item(
                 session_id,
                 project_id,
+                operation_index,
                 &value.item,
                 &value.evidence_event_ids,
                 now,
@@ -1071,12 +1101,34 @@ impl Menvane {
         &self,
         session_id: Uuid,
         project_id: Option<&str>,
+        operation_index: usize,
         value: &menvane_domain::NewHandoffItem,
         event_ids: &[String],
         now: chrono::DateTime<Utc>,
     ) -> Result<()> {
+        let id = deterministic_uuid(
+            session_id,
+            &[operation_index.to_string()],
+            &serde_json::to_vec(value)?,
+        );
+        if let Some(existing) = self
+            .sessions
+            .current_handoff(project_id)?
+            .into_iter()
+            .find(|item| item.id == id)
+            && existing.kind == value.kind
+            && existing.state == value.state
+            && existing.next_step == value.next_step
+            && existing.blocker == value.blocker
+            && existing
+                .sources
+                .iter()
+                .any(|source| source.session_id == session_id && source.event_ids == event_ids)
+        {
+            return Ok(());
+        }
         self.sessions.upsert_handoff_item(&HandoffItem {
-            id: Uuid::now_v7(),
+            id,
             project_id: project_id.map(str::to_owned),
             kind: value.kind,
             state: value.state.clone(),
@@ -1113,9 +1165,10 @@ impl Menvane {
             KnowledgeOperationKind::Reinforce => {
                 if let Some(id) = operation.target_memory_ids.first() {
                     let (mut memory, path) = self.index.read_memory(&self.markdown, *id)?;
-                    if !memory.metadata.source_sessions.contains(&session_id) {
-                        memory.metadata.source_sessions.push(session_id);
+                    if memory.metadata.source_sessions.contains(&session_id) {
+                        return Ok(());
                     }
+                    memory.metadata.source_sessions.push(session_id);
                     memory.metadata.updated_at = Utc::now();
                     self.markdown.update_memory(&path, &memory)?;
                     self.index.upsert_memory(&memory, &path)?;
@@ -1149,7 +1202,12 @@ impl Menvane {
                         MemoryStatus::Active
                     },
                 );
+                metadata.id =
+                    deterministic_uuid(session_id, &[index.to_string()], title.as_bytes());
                 metadata.source_sessions.push(session_id);
+                if self.index.read_memory(&self.markdown, metadata.id).is_ok() {
+                    return Ok(());
+                }
                 let body = operation
                     .content
                     .as_ref()
@@ -1169,6 +1227,9 @@ impl Menvane {
             KnowledgeOperationKind::Merge | KnowledgeOperationKind::Supersede => {
                 for id in &operation.target_memory_ids {
                     let (mut memory, path) = self.index.read_memory(&self.markdown, *id)?;
+                    if memory.metadata.status == MemoryStatus::Superseded {
+                        continue;
+                    }
                     memory.metadata.status = MemoryStatus::Superseded;
                     memory.metadata.updated_at = Utc::now();
                     self.markdown.update_memory(&path, &memory)?;
@@ -1230,6 +1291,10 @@ impl Menvane {
             return Ok(());
         };
         let parsed = self.markdown.parse_session(path)?;
+        let chronology = parsed
+            .body
+            .split_once("\n## Episodic summary\n")
+            .map_or(parsed.body.as_str(), |value| value.0);
         let metadata = SessionMetadata {
             summary_status: SummaryStatus::Ready,
             summary: Some(result.summary.clone()),
@@ -1245,7 +1310,7 @@ impl Menvane {
         self.markdown.update_session_summary(
             path,
             &metadata,
-            &parsed.body,
+            chronology,
             &summary_markdown(&result.summary),
         )?;
         self.markdown
@@ -1425,6 +1490,19 @@ fn lexical_tokens(value: &str) -> HashSet<String> {
 }
 fn content_identifier(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn deterministic_uuid(session_id: Uuid, parts: &[String], discriminator: &[u8]) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(session_id.as_bytes());
+    for part in parts {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    digest.update(discriminator);
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest.finalize()[..16]);
+    Uuid::from_bytes(bytes)
 }
 fn provider_from_configuration(
     configuration: &LlmConfiguration,

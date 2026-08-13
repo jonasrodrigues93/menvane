@@ -67,7 +67,7 @@ impl SessionConsolidator {
                             .as_str())
                 )
             };
-            let response = self
+            let response = match self
                 .provider
                 .generate_structured(
                     LlmRequest {
@@ -77,7 +77,15 @@ impl SessionConsolidator {
                     },
                     JsonSchema(consolidation_result_schema()),
                 )
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(error) if error.kind == LlmErrorKind::InvalidSchema && attempt == 1 => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match parse_response(response.value, packet) {
                 Ok(result) => {
                     let execution = execution(

@@ -1,15 +1,79 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use chrono::{TimeZone, Utc};
 use menvane_domain::{
-    Applicability, HandoffItem, HandoffItemKind, HandoffItemSource, KnowledgeType, NormalizedEvent,
-    NormalizedEventKind, Scope,
+    Applicability, HandoffItem, HandoffItemKind, HandoffItemSource, JsonSchema, KnowledgeType,
+    LlmError, LlmErrorKind, LlmProvider, LlmRequest, NormalizedEvent, NormalizedEventKind,
+    ProviderCapabilities, ProviderHealth, ResponseUsage, Scope, StructuredResponse,
 };
 use menvane_engine::{CaptureOutcome, Menvane, ScopeSelection, WriteMemory};
 use menvane_store::{MarkdownStore, SessionRepository};
 use tempfile::TempDir;
 use uuid::Uuid;
+
+struct FakeLlmProvider {
+    responses: Mutex<Vec<Result<serde_json::Value, LlmError>>>,
+    calls: Mutex<Vec<LlmRequest>>,
+}
+
+impl FakeLlmProvider {
+    fn new(responses: Vec<Result<serde_json::Value, LlmError>>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for FakeLlmProvider {
+    async fn generate_structured(
+        &self,
+        request: LlmRequest,
+        _schema: JsonSchema,
+    ) -> Result<StructuredResponse, LlmError> {
+        self.calls.lock().unwrap().push(request);
+        match self.responses.lock().unwrap().remove(0) {
+            Ok(value) => Ok(StructuredResponse {
+                value,
+                provider: "fake".to_owned(),
+                model: "deterministic".to_owned(),
+                usage: Some(ResponseUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    credits: Some(0.25),
+                }),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn health(&self) -> ProviderHealth {
+        ProviderHealth::Ready
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            structured_output: true,
+            json_schema: true,
+            embeddings: false,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
+    fn model(&self) -> &str {
+        "deterministic"
+    }
+}
 
 #[test]
 fn context_and_playbook_round_trip_through_markdown_and_search() {
@@ -134,6 +198,153 @@ fn normalized_session_capture_is_sanitized_ordered_and_provider_independent() {
 }
 
 #[test]
+fn consolidation_preserves_chronology_and_records_execution() {
+    let (_temporary, project, provider, menvane) = setup_provider(vec![Ok(valid_result())]);
+    ingest_meaningful_session(&menvane, &project);
+    process_next_job(&menvane);
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    let session = repository
+        .latest_session("test-client", "external-session")
+        .unwrap()
+        .unwrap();
+    let path = session.markdown_path.unwrap();
+    let before = fs::read_to_string(&path).unwrap();
+    let before_chronology = chronology_bytes(&before);
+    assert_eq!(
+        session.summary_status,
+        menvane_domain::SummaryStatus::Pending
+    );
+
+    process_next_job(&menvane);
+
+    let after = fs::read_to_string(&path).unwrap();
+    assert_eq!(chronology_bytes(&after), before_chronology);
+    assert!(after.contains("## Episodic summary"));
+    assert_eq!(
+        repository
+            .consolidation_result(session.id)
+            .unwrap()
+            .unwrap()
+            .execution
+            .provider,
+        "fake"
+    );
+    assert_eq!(provider.call_count(), 1);
+    assert_eq!(
+        repository.session(session.id).unwrap().summary_status,
+        menvane_domain::SummaryStatus::Ready
+    );
+}
+
+#[test]
+fn unavailable_provider_keeps_pending_session_and_retryable_job() {
+    let (_temporary, project, provider, menvane) = setup_provider(vec![Err(LlmError {
+        kind: LlmErrorKind::Unavailable,
+        message: "offline".to_owned(),
+    })]);
+    ingest_meaningful_session(&menvane, &project);
+    process_next_job(&menvane);
+    process_next_job(&menvane);
+
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    let session = repository
+        .latest_session("test-client", "external-session")
+        .unwrap()
+        .unwrap();
+    let consolidation_job = repository
+        .jobs()
+        .unwrap()
+        .into_iter()
+        .find(|job| job.job_type == "consolidate_session")
+        .unwrap();
+    assert_eq!(
+        session.summary_status,
+        menvane_domain::SummaryStatus::Pending
+    );
+    assert_eq!(consolidation_job.status, "pending");
+    assert!(consolidation_job.last_error.unwrap().contains("offline"));
+    assert_eq!(provider.call_count(), 1);
+}
+
+#[test]
+fn invalid_output_is_repaired_once_and_then_rolls_back_without_changes() {
+    let (_temporary, project, provider, menvane) = setup_provider(vec![
+        Ok(serde_json::json!({"invalid": true})),
+        Ok(serde_json::json!({"still": "invalid"})),
+    ]);
+    ingest_meaningful_session(&menvane, &project);
+    process_next_job(&menvane);
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    let session = repository
+        .latest_session("test-client", "external-session")
+        .unwrap()
+        .unwrap();
+    let path = session.markdown_path.unwrap();
+    let before = fs::read_to_string(&path).unwrap();
+
+    process_next_job(&menvane);
+
+    let after = fs::read_to_string(&path).unwrap();
+    assert_eq!(after, before);
+    assert!(
+        repository
+            .consolidation_result(session.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repository
+            .current_handoff(session.project_id.as_deref())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(menvane.all_memories().unwrap().len(), 0);
+    assert_eq!(
+        repository.session(session.id).unwrap().summary_status,
+        menvane_domain::SummaryStatus::Pending
+    );
+    assert_eq!(provider.call_count(), 2);
+}
+
+#[test]
+fn operational_session_is_skipped_without_provider_call() {
+    let (_temporary, project, provider, menvane) = setup_provider(Vec::new());
+    let timestamp = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+    menvane
+        .ingest_event(event(
+            &project,
+            "start",
+            NormalizedEventKind::SessionStarted,
+            timestamp,
+            None,
+            None,
+        ))
+        .unwrap();
+    menvane
+        .ingest_event(event(
+            &project,
+            "end",
+            NormalizedEventKind::SessionEnded,
+            timestamp + chrono::Duration::seconds(1),
+            None,
+            None,
+        ))
+        .unwrap();
+    process_next_job(&menvane);
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    let session = repository
+        .latest_session("test-client", "external-session")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.summary_status,
+        menvane_domain::SummaryStatus::Skipped
+    );
+    assert_eq!(provider.call_count(), 0);
+    assert_eq!(repository.jobs().unwrap().len(), 1);
+}
+
+#[test]
 fn current_handoff_items_are_project_scoped_and_rendered_deterministically() {
     let (_temporary, project, menvane) = setup_project();
     let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
@@ -236,6 +447,77 @@ fn setup_project() -> (TempDir, PathBuf, Menvane) {
     assert!(status.success());
     let menvane = Menvane::new(temporary.path().join("home")).unwrap();
     (temporary, project, menvane)
+}
+
+fn setup_provider(
+    responses: Vec<Result<serde_json::Value, LlmError>>,
+) -> (TempDir, PathBuf, Arc<FakeLlmProvider>, Menvane) {
+    let temporary = TempDir::new().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let status = std::process::Command::new("git")
+        .args(["-C", project.to_str().unwrap(), "init", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let provider = Arc::new(FakeLlmProvider::new(responses));
+    let menvane =
+        Menvane::new_with_provider(temporary.path().join("home"), provider.clone()).unwrap();
+    (temporary, project, provider, menvane)
+}
+
+fn ingest_meaningful_session(menvane: &Menvane, project: &Path) {
+    let timestamp = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+    menvane
+        .ingest_event(event(
+            project,
+            "prompt",
+            NormalizedEventKind::UserPrompt,
+            timestamp,
+            Some("continue the export"),
+            None,
+        ))
+        .unwrap();
+    menvane
+        .ingest_event(event(
+            project,
+            "end",
+            NormalizedEventKind::SessionEnded,
+            timestamp + chrono::Duration::seconds(1),
+            None,
+            None,
+        ))
+        .unwrap();
+}
+
+fn valid_result() -> serde_json::Value {
+    serde_json::json!({
+        "summary": {
+            "intentions": ["continue the export"],
+            "actions": [],
+            "outcome": "inconclusive",
+            "result": "The export remains open.",
+            "continuity": [],
+            "candidate-learnings": []
+        },
+        "handoff": [],
+        "knowledge": []
+    })
+}
+
+fn chronology_bytes(markdown: &str) -> Vec<u8> {
+    let body = markdown.split_once("\n---\n").unwrap().1;
+    body.split_once("\n## Episodic summary\n")
+        .map_or(body, |value| value.0)
+        .as_bytes()
+        .to_vec()
+}
+
+fn process_next_job(menvane: &Menvane) {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(menvane.process_next_job())
+        .unwrap();
 }
 
 fn event(

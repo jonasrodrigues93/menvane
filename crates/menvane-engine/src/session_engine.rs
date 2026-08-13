@@ -60,6 +60,7 @@ impl<'a> SessionEngine<'a> {
                 path,
                 job.id,
                 job.owner.as_deref().unwrap_or_default(),
+                session.summary_status,
             )?;
             return Ok(());
         }
@@ -95,6 +96,13 @@ impl<'a> SessionEngine<'a> {
             summary: None,
         };
         let markdown = render_session_markdown(&events, MAX_SESSION_MARKDOWN_BYTES);
+        let summary_status = is_session_worth_compiling(&events)
+            .then_some(SummaryStatus::Pending)
+            .unwrap_or(SummaryStatus::Skipped);
+        let metadata = SessionMetadata {
+            summary_status,
+            ..metadata
+        };
         let path = self
             .menvane
             .markdown
@@ -104,6 +112,7 @@ impl<'a> SessionEngine<'a> {
             &path,
             job.id,
             job.owner.as_deref().unwrap_or_default(),
+            summary_status,
         )?;
         self.menvane
             .markdown
@@ -115,13 +124,13 @@ impl<'a> SessionEngine<'a> {
 pub fn is_session_worth_compiling(events: &[NormalizedEvent]) -> bool {
     events.iter().any(|event| {
         event.is_consolidation_eligible()
-            && event
+            && (event
                 .bounded_input
                 .as_ref()
                 .is_some_and(|value| !value.trim().is_empty())
-            || event
-                .bounded_output
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
+                || event
+                    .bounded_output
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty()))
     })
 }

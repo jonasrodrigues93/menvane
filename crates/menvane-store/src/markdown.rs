@@ -141,11 +141,22 @@ impl MarkdownStore {
         chronological_markdown: &str,
         summary_markdown: &str,
     ) -> Result<()> {
-        let body = format!(
-            "{}\n\n## Episodic summary\n\n{}\n",
-            chronological_markdown.trim(),
-            summary_markdown.trim()
-        );
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let rest = content
+            .strip_prefix("---\n")
+            .with_context(|| format!("missing YAML frontmatter in {}", path.display()))?;
+        let (_, existing_body) = rest
+            .split_once("\n---\n")
+            .with_context(|| format!("unterminated YAML frontmatter in {}", path.display()))?;
+        let marker = "\n## Episodic summary\n\n";
+        let chronological = existing_body
+            .split_once(marker)
+            .map_or(existing_body, |value| value.0);
+        if chronological.trim() != chronological_markdown.trim() {
+            bail!("session chronology does not match the canonical Markdown");
+        }
+        let body = format!("{chronological}{marker}{}\n", summary_markdown.trim());
         self.atomic_write(path, serialize_frontmatter(metadata, &body)?.as_bytes())
     }
 

@@ -345,19 +345,24 @@ impl SessionRepository {
         markdown_path: &Path,
         job_id: Uuid,
         owner: &str,
+        summary_status_value: SummaryStatus,
     ) -> Result<()> {
-        let connection = self.open()?;
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = Utc::now().to_rfc3339();
-        connection.execute(
-            "UPDATE sessions SET markdown_path=?1 WHERE id=?2",
-            params![markdown_path.to_string_lossy(), session_id.to_string()],
+        transaction.execute(
+            "UPDATE sessions SET markdown_path=?1, summary_status=?2, summary_json=NULL WHERE id=?3",
+            params![
+                markdown_path.to_string_lossy(),
+                summary_status(summary_status_value),
+                session_id.to_string()
+            ],
         )?;
-        connection.execute("UPDATE jobs SET status='completed', owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE id=?2 AND status='running' AND owner=?3", params![now, job_id.to_string(), owner])?;
-        connection.execute(
-            "UPDATE sessions SET summary_status='pending' WHERE id=?1 AND summary_status='pending'",
-            [session_id.to_string()],
-        )?;
-        connection.execute("INSERT OR IGNORE INTO jobs(id, job_type, dedupe_key, status, payload_json, next_retry_at, created_at, updated_at) VALUES (?1, 'consolidate_session', ?2, 'pending', '{}', ?3, ?3, ?3)", params![Uuid::now_v7().to_string(), session_id.to_string(), now])?;
+        transaction.execute("UPDATE jobs SET status='completed', owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE id=?2 AND status='running' AND owner=?3", params![now, job_id.to_string(), owner])?;
+        if summary_status_value == SummaryStatus::Pending {
+            transaction.execute("INSERT OR IGNORE INTO jobs(id, job_type, dedupe_key, status, payload_json, next_retry_at, created_at, updated_at) VALUES (?1, 'consolidate_session', ?2, 'pending', '{}', ?3, ?3, ?3)", params![Uuid::now_v7().to_string(), session_id.to_string(), now])?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -508,15 +513,20 @@ impl SessionRepository {
         result: &ConsolidationResult,
         execution: &ConsolidationExecution,
     ) -> Result<bool> {
-        let connection = self.open()?;
-        let inserted = connection.execute("INSERT OR IGNORE INTO consolidation_results(session_id, result_json, execution_json, applied_at) VALUES (?1, ?2, ?3, ?4)", params![session_id.to_string(), serde_json::to_string(result)?, serde_json::to_string(execution)?, Utc::now().to_rfc3339()])?;
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute("INSERT OR IGNORE INTO consolidation_results(session_id, result_json, execution_json, applied_at) VALUES (?1, ?2, ?3, ?4)", params![session_id.to_string(), serde_json::to_string(result)?, serde_json::to_string(execution)?, Utc::now().to_rfc3339()])?;
         if inserted == 1 {
-            self.set_session_summary(
-                session_id,
-                SummaryStatus::Ready,
-                Some(&serde_json::to_string(&result.summary)?),
+            transaction.execute(
+                "UPDATE sessions SET summary_status=?1, summary_json=?2 WHERE id=?3",
+                params![
+                    summary_status(SummaryStatus::Ready),
+                    serde_json::to_string(&result.summary)?,
+                    session_id.to_string()
+                ],
             )?;
         }
+        transaction.commit()?;
         Ok(inserted == 1)
     }
 
