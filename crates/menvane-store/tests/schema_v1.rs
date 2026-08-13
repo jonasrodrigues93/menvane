@@ -29,6 +29,13 @@ fn clean_home_has_only_version_one_tables() {
                 "memory_fts_idx",
                 "projects",
                 "schema_meta",
+                "session_summaries",
+                "session_summary_fts",
+                "session_summary_fts_config",
+                "session_summary_fts_content",
+                "session_summary_fts_data",
+                "session_summary_fts_docsize",
+                "session_summary_fts_idx",
             ]
             .map(str::to_owned)
         )

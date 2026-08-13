@@ -25,8 +25,9 @@ use menvane_domain::{
     SessionMetadata, SummaryStatus,
 };
 use menvane_store::{
-    IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MarkdownStore, OrphanRecord,
-    SearchResult, SearchScope, SessionRepository, mark_forgotten,
+    IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MAX_SUMMARY_SELECTION_BYTES,
+    MAX_SUMMARY_SELECTION_SESSIONS, MarkdownStore, OrphanRecord, SearchResult, SearchScope,
+    SessionRepository, mark_forgotten,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -498,10 +499,13 @@ impl Menvane {
         context.push_str(
             "\nAdditional memory is available through recall.\nEND MENVANE MEMORY CONTEXT",
         );
-        let content_id = content_identifier(&context);
+        let handoff_content_id = content_identifier(&session_rendering::render_handoff_items(
+            &handoff,
+            usize::MAX,
+        ));
         if self
             .sessions
-            .claim_delivery(&identity, "session-start", &content_id)?
+            .claim_delivery(&identity, "handoff", &handoff_content_id)?
         {
             Ok(context)
         } else {
@@ -549,9 +553,17 @@ impl Menvane {
             })
             .collect::<Vec<_>>();
         let mut context = String::new();
-        if !related.is_empty() {
+        let related_handoff = session_rendering::render_handoff_items(&related, 2_000);
+        let related_content_id = content_identifier(&related_handoff);
+        if !related.is_empty()
+            && self.sessions.claim_delivery(
+                &recall.identity,
+                "handoff-prompt",
+                &related_content_id,
+            )?
+        {
             context.push_str("MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n[CURRENT HANDOFF]\n");
-            context.push_str(&session_rendering::render_handoff_items(&related, 2_000));
+            context.push_str(&related_handoff);
         }
         for result in &recall.results {
             let entry = format!(
@@ -985,7 +997,13 @@ impl Menvane {
             handoff_items: self
                 .sessions
                 .current_handoff(session.project_id.as_deref())?,
-            related_summaries: Vec::new(),
+            related_summaries: self.related_summaries(
+                &events,
+                &self
+                    .sessions
+                    .current_handoff(session.project_id.as_deref())?,
+                session.project_id.as_deref(),
+            )?,
             related_memories: self.related_memories(&events, session.project_id.as_deref())?,
         };
         let prompt = self
@@ -1029,18 +1047,19 @@ impl Menvane {
         operation: &HandoffItemOperation,
     ) -> Result<()> {
         let now = Utc::now();
-        let source = |ids: &[String]| HandoffItemSource {
+        let source = |event_ids: &[String]| HandoffItemSource {
             session_id,
-            event_ids: ids.to_vec(),
+            event_ids: event_ids.to_vec(),
         };
         match operation {
             HandoffItemOperation::Keep { .. } => {}
             HandoffItemOperation::Uncertain { item_id } => {
                 let mut item = self.handoff_item(*item_id, project_id)?;
                 if item.low_confidence
-                    && item.sources.iter().any(|source| {
-                        source.session_id == session_id && source.event_ids.is_empty()
-                    })
+                    && item
+                        .sources
+                        .iter()
+                        .any(|value| value.session_id == session_id && value.event_ids.is_empty())
                 {
                     return Ok(());
                 }
@@ -1063,9 +1082,9 @@ impl Menvane {
                     return Ok(());
                 }
                 item.kind = value.kind;
-                item.state = value.state.clone();
-                item.next_step = value.next_step.clone();
-                item.blocker = value.blocker.clone();
+                item.state.clone_from(&value.state);
+                item.next_step.clone_from(&value.next_step);
+                item.blocker.clone_from(&value.blocker);
                 item.last_confirmed_at = now;
                 item.updated_at = now;
                 item.sources.push(source(&value.evidence_event_ids));
@@ -1315,7 +1334,44 @@ impl Menvane {
         )?;
         self.markdown
             .commit(&format!("feat(session): summarize {}", session.id));
+        self.index.upsert_session_summary(
+            session.id,
+            session.project_id.as_deref(),
+            session.ended_at,
+            &result.summary,
+        )?;
         Ok(())
+    }
+
+    fn related_summaries(
+        &self,
+        events: &[NormalizedEvent],
+        handoff: &[HandoffItem],
+        project_id: Option<&str>,
+    ) -> Result<Vec<menvane_domain::RelatedSummary>> {
+        let query = events
+            .iter()
+            .flat_map(|event| {
+                [
+                    event.bounded_input.as_deref(),
+                    event.bounded_output.as_deref(),
+                    event.attributed_path.as_deref(),
+                ]
+            })
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source_sessions = handoff
+            .iter()
+            .flat_map(|item| item.sources.iter().map(|source| source.session_id))
+            .collect::<Vec<_>>();
+        self.index.related_summaries(
+            project_id,
+            &source_sessions,
+            &query,
+            MAX_SUMMARY_SELECTION_SESSIONS.min(5),
+            MAX_SUMMARY_SELECTION_BYTES,
+        )
     }
 
     fn search_inner(

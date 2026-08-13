@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use menvane_domain::{
     ConsolidationExecution, ConsolidationResult, JsonSchema, LlmError, LlmErrorKind, LlmProvider,
-    LlmRequest, ResponseUsage, consolidation_result_schema, validate_consolidation_result,
+    LlmRequest, ResponseUsage, consolidation_result_schema, preserve_handoff_transitions,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -117,9 +117,7 @@ fn parse_response(
 ) -> Result<ConsolidationResult, LlmError> {
     let result: ConsolidationResult = serde_json::from_value(value)
         .map_err(|error| invalid_schema(format!("consolidation schema mismatch: {error}")))?;
-    validate_consolidation_result(packet, &result)
-        .map_err(|error| invalid_schema(error.to_string()))?;
-    Ok(result)
+    preserve_handoff_transitions(result, packet).map_err(|error| invalid_schema(error.to_string()))
 }
 
 fn execution(

@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use menvane_domain::{Applicability, KnowledgeType, Memory, MemoryStatus, Project};
+use chrono::{DateTime, Utc};
+use menvane_domain::{
+    Applicability, EpisodicSummary, KnowledgeType, Memory, MemoryStatus, Project, RelatedSummary,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -55,6 +58,20 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     updated_at TEXT NOT NULL,
     PRIMARY KEY(memory_id, provider, model)
 );
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY,
+    project_id TEXT,
+    ended_at TEXT,
+    summary_json TEXT NOT NULL,
+    selection_text TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS session_summaries_project ON session_summaries(project_id, ended_at);
+CREATE VIRTUAL TABLE IF NOT EXISTS session_summary_fts USING fts5(
+    session_id UNINDEXED,
+    selection_text,
+    tokenize = 'unicode61'
+);
 "#;
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +102,9 @@ pub struct IndexStore {
     path: PathBuf,
 }
 
+pub const MAX_SUMMARY_SELECTION_SESSIONS: usize = 24;
+pub const MAX_SUMMARY_SELECTION_BYTES: usize = 24_000;
+
 impl IndexStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -110,6 +130,143 @@ impl IndexStore {
         insert_memory(&transaction, memory, path)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn upsert_session_summary(
+        &self,
+        session_id: Uuid,
+        project_id: Option<&str>,
+        ended_at: Option<DateTime<Utc>>,
+        summary: &EpisodicSummary,
+    ) -> Result<()> {
+        let mut connection = self.open_initialized()?;
+        let transaction = connection.transaction()?;
+        let summary_json = serde_json::to_string(summary)?;
+        let selection_text = summary_selection_text(summary);
+        transaction.execute(
+            "DELETE FROM session_summary_fts WHERE session_id=?1",
+            [session_id.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO session_summaries(session_id, project_id, ended_at, summary_json, selection_text, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET project_id=excluded.project_id, ended_at=excluded.ended_at, summary_json=excluded.summary_json, selection_text=excluded.selection_text, updated_at=excluded.updated_at",
+            params![
+                session_id.to_string(),
+                project_id,
+                ended_at.map(|value| value.to_rfc3339()),
+                summary_json,
+                selection_text,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO session_summary_fts(session_id, selection_text) VALUES (?1, ?2)",
+            params![session_id.to_string(), summary_selection_text(summary)],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn related_summaries(
+        &self,
+        project_id: Option<&str>,
+        source_sessions: &[Uuid],
+        query: &str,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<RelatedSummary>> {
+        let connection = self.open_initialized()?;
+        let limit = limit.min(MAX_SUMMARY_SELECTION_SESSIONS);
+        let max_bytes = max_bytes.min(MAX_SUMMARY_SELECTION_BYTES);
+        let fts_query = fts_query(query, false);
+        let scope = project_id.map_or_else(
+            || "s.project_id IS NULL".to_owned(),
+            |_| "s.project_id = ?2".to_owned(),
+        );
+        let sql = if fts_query.is_empty() {
+            format!(
+                "SELECT s.session_id, s.ended_at, s.summary_json, 0 FROM session_summaries s WHERE 0 AND {scope} LIMIT ?3"
+            )
+        } else {
+            format!(
+                "SELECT s.session_id, s.ended_at, s.summary_json, bm25(session_summary_fts) FROM session_summary_fts JOIN session_summaries s ON s.session_id=session_summary_fts.session_id WHERE session_summary_fts MATCH ?1 AND {scope} ORDER BY bm25(session_summary_fts), s.ended_at DESC, s.session_id LIMIT ?3"
+            )
+        };
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![
+                fts_query,
+                project_id,
+                i64::try_from(MAX_SUMMARY_SELECTION_SESSIONS)?
+            ],
+            |row| {
+                let session_id: String = row.get(0)?;
+                let ended_at: Option<String> = row.get(1)?;
+                let summary_json: String = row.get(2)?;
+                let rank: f64 = row.get(3)?;
+                Ok((
+                    Uuid::parse_str(&session_id).map_err(sql_error)?,
+                    ended_at.as_deref().map(parse_timestamp).transpose()?,
+                    serde_json::from_str::<EpisodicSummary>(&summary_json).map_err(sql_error)?,
+                    rank,
+                ))
+            },
+        )?;
+        let mut candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for source_session in source_sessions {
+            if candidates
+                .iter()
+                .any(|candidate| candidate.0 == *source_session)
+            {
+                continue;
+            }
+            if let Some(candidate) = connection
+                .query_row(
+                    "SELECT session_id, ended_at, summary_json, 0 FROM session_summaries WHERE session_id=?1 AND project_id IS ?2",
+                    params![source_session.to_string(), project_id],
+                    |row| {
+                        let session_id: String = row.get(0)?;
+                        Ok((
+                            Uuid::parse_str(&session_id).map_err(sql_error)?,
+                            row.get::<_, Option<String>>(1)?.as_deref().map(parse_timestamp).transpose()?,
+                            serde_json::from_str::<EpisodicSummary>(&row.get::<_, String>(2)?).map_err(sql_error)?,
+                            0.0,
+                        ))
+                    },
+                )
+                .optional()?
+            {
+                candidates.push(candidate);
+            }
+        }
+        candidates.sort_by(|left, right| {
+            let left_source = source_sessions.contains(&left.0);
+            let right_source = source_sessions.contains(&right.0);
+            right_source
+                .cmp(&left_source)
+                .then_with(|| left.3.total_cmp(&right.3))
+                .then_with(|| right.1.cmp(&left.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut total = 0;
+        let mut selected = Vec::new();
+        for (session_id, ended_at, summary, _) in candidates.into_iter().take(limit) {
+            let bytes = serde_json::to_vec(&summary)?.len();
+            if selected.is_empty() && bytes > max_bytes {
+                continue;
+            }
+            if total + bytes > max_bytes {
+                break;
+            }
+            total += bytes;
+            selected.push(RelatedSummary {
+                session_id,
+                ended_at,
+                summary,
+            });
+        }
+        Ok(selected)
     }
 
     pub fn read_memory(&self, markdown: &MarkdownStore, id: Uuid) -> Result<(Memory, PathBuf)> {
@@ -345,6 +502,18 @@ impl IndexStore {
             let memory = markdown.parse_memory(path)?;
             insert_memory(&connection, &memory, path)?;
         }
+        for path in &markdown.session_files()? {
+            let session = markdown.parse_session(path)?;
+            if let Some(summary) = session.metadata.summary {
+                insert_session_summary(
+                    &connection,
+                    session.metadata.id,
+                    session.metadata.project_id.as_deref(),
+                    session.metadata.ended_at,
+                    &summary,
+                )?;
+            }
+        }
         connection.execute_batch("PRAGMA optimize;")?;
         drop(connection);
         for suffix in ["-wal", "-shm"] {
@@ -493,6 +662,68 @@ fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Resul
     Ok(())
 }
 
+fn insert_session_summary(
+    connection: &Connection,
+    session_id: Uuid,
+    project_id: Option<&str>,
+    ended_at: Option<DateTime<Utc>>,
+    summary: &EpisodicSummary,
+) -> Result<()> {
+    connection.execute(
+        "DELETE FROM session_summary_fts WHERE session_id=?1",
+        [session_id.to_string()],
+    )?;
+    let selection_text = summary_selection_text(summary);
+    connection.execute(
+        "INSERT INTO session_summaries(session_id, project_id, ended_at, summary_json, selection_text, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET project_id=excluded.project_id, ended_at=excluded.ended_at, summary_json=excluded.summary_json, selection_text=excluded.selection_text, updated_at=excluded.updated_at",
+        params![
+            session_id.to_string(),
+            project_id,
+            ended_at.map(|value| value.to_rfc3339()),
+            serde_json::to_string(summary)?,
+            selection_text,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO session_summary_fts(session_id, selection_text) VALUES (?1, ?2)",
+        params![session_id.to_string(), summary_selection_text(summary)],
+    )?;
+    Ok(())
+}
+
+fn summary_selection_text(summary: &EpisodicSummary) -> String {
+    summary
+        .intentions
+        .iter()
+        .chain(&summary.actions)
+        .chain(std::iter::once(&summary.result))
+        .chain(summary.continuity.iter().map(|item| &item.front))
+        .chain(&summary.candidate_learnings)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_timestamp(value: &str) -> rusqlite::Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(sql_error)
+}
+
+fn sql_error(error: impl std::fmt::Display) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            error.to_string(),
+        )),
+    )
+}
+
 fn fts_query(query: &str, match_all_terms: bool) -> String {
     query
         .split(|character: char| !character.is_alphanumeric() && character != '_')
@@ -509,7 +740,11 @@ pub fn mark_forgotten(memory: &mut Memory) {
 
 #[cfg(test)]
 mod tests {
-    use menvane_domain::{Applicability, KnowledgeType, MemoryMetadata, MemoryStatus, Scope};
+    use chrono::TimeZone;
+    use menvane_domain::{
+        Applicability, EpisodicSummary, KnowledgeType, MemoryMetadata, MemoryStatus, Scope,
+        SummaryOutcome,
+    };
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -584,5 +819,51 @@ mod tests {
             .unwrap();
         assert_eq!(result.source_session_count, 2);
         assert_eq!(result.supersession_count, 1);
+    }
+
+    #[test]
+    fn summary_selection_prioritizes_sources_and_is_bounded() {
+        let temporary = TempDir::new().unwrap();
+        let index = IndexStore::new(temporary.path().join("index.sqlite"));
+        index.initialize().unwrap();
+        let project = "project";
+        let source = Uuid::from_u128(1);
+        let unrelated = Uuid::from_u128(2);
+        let summary = |text: &str| EpisodicSummary {
+            intentions: vec![text.to_owned()],
+            actions: Vec::new(),
+            outcome: SummaryOutcome::Advanced,
+            result: text.to_owned(),
+            continuity: Vec::new(),
+            candidate_learnings: Vec::new(),
+        };
+        index
+            .upsert_session_summary(
+                source,
+                Some(project),
+                Some(chrono::Utc.timestamp_opt(1, 0).single().unwrap()),
+                &summary("source session unrelated wording"),
+            )
+            .unwrap();
+        index
+            .upsert_session_summary(
+                unrelated,
+                Some(project),
+                Some(chrono::Utc.timestamp_opt(2, 0).single().unwrap()),
+                &summary("export schema error"),
+            )
+            .unwrap();
+        let selected = index
+            .related_summaries(Some(project), &[source], "export schema error", 2, 10_000)
+            .unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].session_id, source);
+        assert_eq!(
+            index
+                .related_summaries(Some(project), &[source], "export", 2, 1)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }

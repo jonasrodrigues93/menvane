@@ -5,7 +5,7 @@ use uuid::Uuid;
 pub const MAX_HANDOFF_ITEMS: usize = 100;
 pub const MAX_HANDOFF_TEXT_CHARS: usize = 2_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HandoffItemKind {
     InProgress,

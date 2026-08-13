@@ -389,6 +389,112 @@ fn current_handoff_items_are_project_scoped_and_rendered_deterministically() {
 }
 
 #[test]
+fn handoff_delivery_is_claimed_by_session_and_rendered_content() {
+    let (_temporary, project, menvane) = setup_project();
+    let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    let item = handoff_item(
+        Uuid::from_u128(9),
+        &project_id,
+        HandoffItemKind::InProgress,
+        "Export remains open",
+        None,
+        None,
+        Uuid::from_u128(8),
+    );
+    repository.upsert_handoff_item(&item).unwrap();
+
+    let first = menvane
+        .session_briefing_for_client(&project, "test-client", "session")
+        .unwrap();
+    assert!(!first.is_empty());
+    assert!(
+        menvane
+            .session_briefing_for_client(&project, "test-client", "session")
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut changed = item;
+    changed.state = "Export is blocked".to_owned();
+    repository.upsert_handoff_item(&changed).unwrap();
+    let second = menvane
+        .session_briefing_for_client(&project, "test-client", "session")
+        .unwrap();
+    assert!(!second.is_empty());
+    assert!(second.contains("Export is blocked"));
+}
+
+#[test]
+fn unrelated_project_changes_do_not_change_handoff_content() {
+    let (_temporary, project, menvane) = setup_project();
+    let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    repository
+        .upsert_handoff_item(&handoff_item(
+            Uuid::from_u128(10),
+            &project_id,
+            HandoffItemKind::OpenQuestion,
+            "Confirm export schema",
+            None,
+            None,
+            Uuid::from_u128(11),
+        ))
+        .unwrap();
+    let before = menvane.render_current_handoff(Some(&project_id)).unwrap();
+    fs::write(project.join("unrelated.txt"), "unrelated").unwrap();
+    let after = menvane.render_current_handoff(Some(&project_id)).unwrap();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn consolidation_applies_resolve_discard_and_uncertain_deterministically() {
+    let (_temporary, project, provider, menvane) = setup_provider(vec![
+        Ok(transition_result("resolve", Uuid::from_u128(21))),
+        Ok(transition_result("resolve", Uuid::from_u128(21))),
+    ]);
+    let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    repository
+        .upsert_handoff_item(&handoff_item(
+            Uuid::from_u128(21),
+            &project_id,
+            HandoffItemKind::InProgress,
+            "resolve this front",
+            None,
+            None,
+            Uuid::from_u128(20),
+        ))
+        .unwrap();
+    ingest_meaningful_session(&menvane, &project);
+    process_next_job(&menvane);
+    process_next_job(&menvane);
+
+    assert!(
+        repository
+            .current_handoff(Some(&project_id))
+            .unwrap()
+            .is_empty()
+    );
+    let session = repository
+        .latest_session("test-client", "external-session")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repository
+            .consolidation_result(session.id)
+            .unwrap()
+            .unwrap()
+            .result
+            .summary
+            .continuity[0]
+            .disposition,
+        menvane_domain::ContinuityDisposition::Resolved
+    );
+    assert_eq!(provider.call_count(), 1);
+}
+
+#[test]
 fn reindex_rebuilds_knowledge_without_touching_session_state() {
     let (_temporary, project, menvane) = setup_project();
     let memory = menvane
@@ -503,6 +609,30 @@ fn valid_result() -> serde_json::Value {
         "handoff": [],
         "knowledge": []
     })
+}
+
+fn transition_result(operation: &str, item_id: Uuid) -> serde_json::Value {
+    let mut result = valid_result();
+    let operation = match operation {
+        "resolve" => serde_json::json!({
+            "resolve": {
+                "item_id": item_id,
+                "text": "The front was resolved.",
+                "evidence_event_ids": ["prompt"]
+            }
+        }),
+        "discard" => serde_json::json!({
+            "discard": {
+                "item_id": item_id,
+                "text": "The front was discarded.",
+                "evidence_event_ids": ["prompt"]
+            }
+        }),
+        "uncertain" => serde_json::json!({"uncertain": {"item_id": item_id}}),
+        _ => unreachable!(),
+    };
+    result["handoff"] = serde_json::json!([operation]);
+    result
 }
 
 fn chronology_bytes(markdown: &str) -> Vec<u8> {

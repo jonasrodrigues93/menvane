@@ -9,11 +9,13 @@ use crate::handoff::{
 };
 use crate::memory::{Applicability, KnowledgeType, MemoryStatus, Scope};
 use crate::session::NormalizedEvent;
-use crate::summary::{EpisodicSummary, MAX_SUMMARY_ITEMS, MAX_SUMMARY_TEXT_CHARS};
+use crate::summary::{
+    ContinuityDisposition, ContinuityItem, EpisodicSummary, MAX_SUMMARY_ITEMS,
+    MAX_SUMMARY_TEXT_CHARS,
+};
 
 pub const MAX_KNOWLEDGE_OPERATIONS: usize = 10;
 pub const MAX_RELATED_SUMMARIES: usize = 5;
-pub const MAX_RELATED_MEMORIES: usize = 50;
 pub const MAX_KNOWLEDGE_BODY_CHARS: usize = 8_000;
 pub const GLOBAL_SCOPE_CONFIDENCE_THRESHOLD: f64 = 0.9;
 
@@ -144,11 +146,21 @@ pub fn validate_consolidation_result(
             "too many knowledge operations".into(),
         ));
     }
+    if packet.related_summaries.len() > MAX_RELATED_SUMMARIES {
+        return Err(ConsolidationValidationError(
+            "packet contains too many related summaries".into(),
+        ));
+    }
     let item_ids = packet
         .handoff_items
         .iter()
         .map(|item| item.id)
         .collect::<HashSet<_>>();
+    if item_ids.len() != packet.handoff_items.len() {
+        return Err(ConsolidationValidationError(
+            "packet contains repeated handoff items".into(),
+        ));
+    }
     if packet.handoff_items.len() > MAX_HANDOFF_ITEMS {
         return Err(ConsolidationValidationError(
             "handoff contains too many items".into(),
@@ -226,6 +238,54 @@ pub fn validate_consolidation_result(
     Ok(())
 }
 
+pub fn preserve_handoff_transitions(
+    mut result: ConsolidationResult,
+    packet: &ConsolidationPacket,
+) -> Result<ConsolidationResult, ConsolidationValidationError> {
+    let mut continuity = result.summary.continuity.clone();
+    for operation in &result.handoff {
+        let (item_id, disposition, front) = match operation {
+            HandoffItemOperation::Resolve(value) => (
+                value.item_id,
+                ContinuityDisposition::Resolved,
+                value.text.clone(),
+            ),
+            HandoffItemOperation::Discard(value) => (
+                value.item_id,
+                ContinuityDisposition::Discarded,
+                value.text.clone(),
+            ),
+            HandoffItemOperation::Replace(value) => (
+                value.item_id,
+                ContinuityDisposition::Replaced,
+                value.replacement.state.clone(),
+            ),
+            _ => continue,
+        };
+        if let Some(item) = continuity
+            .iter_mut()
+            .find(|item| item.item_id == Some(item_id))
+        {
+            item.front = front;
+            item.disposition = disposition;
+        } else {
+            continuity.push(ContinuityItem {
+                item_id: Some(item_id),
+                front,
+                disposition,
+            });
+        }
+    }
+    if continuity.len() > MAX_SUMMARY_ITEMS {
+        return Err(ConsolidationValidationError(
+            "summary contains too many continuity items".into(),
+        ));
+    }
+    result.summary.continuity = continuity;
+    validate_consolidation_result(packet, &result)?;
+    Ok(result)
+}
+
 fn validate_summary(summary: &EpisodicSummary) -> Result<(), ConsolidationValidationError> {
     if summary.intentions.len() > MAX_SUMMARY_ITEMS
         || summary.actions.len() > MAX_SUMMARY_ITEMS
@@ -245,6 +305,15 @@ fn validate_summary(summary: &EpisodicSummary) -> Result<(), ConsolidationValida
     if strings.any(|value| value.chars().count() > MAX_SUMMARY_TEXT_CHARS) {
         return Err(ConsolidationValidationError(
             "summary text exceeds the limit".into(),
+        ));
+    }
+    if summary
+        .continuity
+        .iter()
+        .any(|item| item.front.chars().count() > MAX_SUMMARY_TEXT_CHARS)
+    {
+        return Err(ConsolidationValidationError(
+            "summary continuity text exceeds the limit".into(),
         ));
     }
     Ok(())
@@ -437,4 +506,97 @@ pub fn consolidation_result_schema() -> serde_json::Value {
             "knowledge": {"type": "array", "maxItems": MAX_KNOWLEDGE_OPERATIONS}
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::handoff::HandoffTransition;
+
+    fn item(id: Uuid) -> HandoffItem {
+        let timestamp = Utc.timestamp_opt(1, 0).single().unwrap();
+        HandoffItem {
+            id,
+            project_id: Some("project".to_owned()),
+            kind: crate::handoff::HandoffItemKind::InProgress,
+            state: "open".to_owned(),
+            next_step: None,
+            blocker: None,
+            low_confidence: false,
+            last_confirmed_at: timestamp,
+            sources: Vec::new(),
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
+    }
+
+    fn summary() -> EpisodicSummary {
+        EpisodicSummary {
+            intentions: Vec::new(),
+            actions: Vec::new(),
+            outcome: crate::summary::SummaryOutcome::Inconclusive,
+            result: "result".to_owned(),
+            continuity: Vec::new(),
+            candidate_learnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn transitions_are_preserved_in_summary_continuity() {
+        let id = Uuid::from_u128(1);
+        let packet = ConsolidationPacket {
+            session_id: Uuid::from_u128(2),
+            events: Vec::new(),
+            handoff_items: vec![item(id)],
+            related_summaries: Vec::new(),
+            related_memories: Vec::new(),
+        };
+        for operation in [
+            HandoffItemOperation::Resolve(HandoffTransition {
+                item_id: id,
+                text: "resolved".to_owned(),
+                evidence_event_ids: Vec::new(),
+            }),
+            HandoffItemOperation::Discard(HandoffTransition {
+                item_id: id,
+                text: "discarded".to_owned(),
+                evidence_event_ids: Vec::new(),
+            }),
+        ] {
+            let result = preserve_handoff_transitions(
+                ConsolidationResult {
+                    summary: summary(),
+                    handoff: vec![operation],
+                    knowledge: Vec::new(),
+                },
+                &packet,
+            )
+            .unwrap();
+            assert_eq!(result.summary.continuity.len(), 1);
+        }
+    }
+
+    #[test]
+    fn every_previous_item_requires_one_operation() {
+        let id = Uuid::from_u128(1);
+        let packet = ConsolidationPacket {
+            session_id: Uuid::from_u128(2),
+            events: Vec::new(),
+            handoff_items: vec![item(id)],
+            related_summaries: Vec::new(),
+            related_memories: Vec::new(),
+        };
+        let error = validate_consolidation_result(
+            &packet,
+            &ConsolidationResult {
+                summary: summary(),
+                handoff: Vec::new(),
+                knowledge: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("every previous handoff item"));
+    }
 }

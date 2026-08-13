@@ -9,4 +9,7 @@ pub use sessions::{
     MAX_HANDOFF_SOURCE_EVENTS, MAX_HANDOFF_TOTAL_BYTES, OrphanRecord, RecallContext, SessionEvent,
     SessionRecord, SessionRepository, conversation_key,
 };
-pub use sqlite::{IndexStore, SearchResult, SearchScope, mark_forgotten};
+pub use sqlite::{
+    IndexStore, MAX_SUMMARY_SELECTION_BYTES, MAX_SUMMARY_SELECTION_SESSIONS, SearchResult,
+    SearchScope, mark_forgotten,
+};
