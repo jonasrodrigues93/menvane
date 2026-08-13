@@ -4,7 +4,7 @@
 
 [Portuguese (Brazil)](README.pt-BR.md)
 
-Menvane gives coding agents continuity across sessions and projects. It captures task progress, preserves operational handoffs, consolidates reusable knowledge from evidence, and recalls relevant context when work resumes.
+Menvane gives coding agents operational continuity across sessions, agents, and days. It captures chronological session evidence, distills an episodic summary per session, maintains a handoff of still-live work fronts, and recalls non-obvious knowledge on demand when work resumes.
 
 Menvane is local-first: durable knowledge is human-readable Markdown, while SQLite provides a fast, rebuildable search index.
 
@@ -25,9 +25,9 @@ Menvane is local-first: durable knowledge is human-readable Markdown, while SQLi
 
 Menvane is designed for teams and developers who want agents to remember the work without handing their project context to a hosted memory service.
 
-- **Resume work faster:** one short, replaceable project handoff summarizes recent facts and pending work.
-- **Reuse proven knowledge:** facts, decisions, procedures, and gotchas are consolidated from captured evidence.
-- **Recall the right context:** automatic retrieval considers the current prompt and the project's consolidated goals.
+- **Resume work faster:** a per-project handoff tracks only still-live work fronts, with provenance and next steps.
+- **Reuse proven knowledge:** non-obvious contexts and playbooks are consolidated from captured evidence, and most sessions promote nothing.
+- **Recall the right context:** each prompt receives only the handoff items related to its intent plus up to three knowledge cards.
 - **Keep projects isolated:** project memory is separated from unrelated repositories, with applicable global knowledge available when appropriate.
 - **Inspect and own the data:** Markdown is the durable source of truth and remains readable without Menvane.
 - **Avoid instruction pollution:** `AGENTS.md`, `SKILL.md`, and files under `skills` directories are not processed as memory or handoff file evidence.
@@ -36,11 +36,11 @@ Menvane is designed for teams and developers who want agents to remember the wor
 
 ### Cross-session continuity
 
-Each durable session is a chronological, sanitized capture of the observed events. A single short, replaceable handoff per project carries only recent relevant facts and pending decisions or work, so later sessions resume without reconstructing the task.
+Each durable session is a chronological, sanitized capture of the observed events. Consolidation appends an episodic summary to the session and maintains a per-project handoff of still-live work fronts — in-progress work, open questions, parked ideas, and blockers — so later sessions resume without reconstructing the task. Concluded, discarded, and superseded fronts leave the handoff automatically.
 
 ### Evidence-based memory
 
-One language-model consolidation per finalized session interprets the chronological capture and can identify goals and produce durable facts, decisions, procedures, and gotchas while retaining source-event provenance and respecting contradictions, scope, confidence, and forgotten-memory rules.
+One language-model consolidation per finalized session interprets the chronological capture and produces the episodic summary, explicit operations over every handoff item, and zero or more durable contexts or playbooks — only non-obvious knowledge reusable beyond the current task passes the promotion barrier.
 
 ### Local and rebuildable storage
 
@@ -56,13 +56,15 @@ Claude Code, Codex, and OpenCode use the same capture, sanitization, recall, and
 Agent session
      |
      v
-Capture -> sanitize -> chronological session -> LLM consolidation -> goals, memory, handoff
-                                      |
-                                      v
-                              evidence-based memory
-                                      |
-                                      v
-Prompt recall <- project and applicable global knowledge
+Capture -> sanitize -> chronological session -> LLM consolidation
+                                                   |
+                    episodic summary <-+-----------+-----------+-> handoff items
+                                       |                        |
+                                       v                        v
+                            on-demand knowledge        live work fronts
+                                       |
+                                       v
+Prompt recall <- related handoff items + up to 3 knowledge cards
 ```
 
 Menvane captures bounded normalized events, removes sensitive data and ignored paths, and keeps real user prompts, tool activity, and lifecycle events distinct without guessing intent. Lifecycle events produce a deterministic session record and queue one consolidation job without blocking the agent.
@@ -84,7 +86,7 @@ Menvane supports Linux, macOS, and WSL. Native Windows is not currently a releas
 
 ### Enable Memory Compilation
 
-Capture, search, and manual memory operations work without a language-model provider. Handoff and evidence-based memory consolidation require a configured provider. To enable consolidation with OpenAI:
+Capture, search, and manual memory operations work without a language-model provider. Episodic summaries, handoff maintenance, and knowledge consolidation require a configured provider. To enable consolidation with OpenAI:
 
 ```bash
 menvane provider configure openai --model gpt-5.6-luna --reasoning-effort medium
@@ -110,11 +112,12 @@ The local dashboard is available at <http://127.0.0.1:47831/>.
 ```bash
 menvane search "database migration"
 menvane read <memory-id>
-menvane write --type gotcha --title "Migration rule" --content "..."
+menvane write --type context --title "Migration rule" --content "..."
 menvane forget <memory-id>
+menvane handoff inspect
 ```
 
-Automatic prompt recall combines independently ranked searches for the sanitized current prompt and the project's consolidated goals. It applies project scope, global applicability, memory lifecycle, type, confidence, freshness, and technology context, and never calls a language-model provider on the hot path.
+Session start delivers only minimal project identity and the current handoff. Each prompt then receives only the handoff items related to its intent plus up to three context or playbook cards, selected locally; the hot path never calls a language-model provider. Full memory bodies stay available through explicit reads.
 
 Explicit search uses the query provided by the caller. Full Markdown and bounded provenance remain available through `menvane read` and the local UI.
 
