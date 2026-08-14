@@ -312,8 +312,8 @@ impl IndexStore {
             "SELECT m.id, m.type, m.scope, m.title, m.status, m.applicability_json, m.source_sessions_json, m.supersedes_json, snippet(memory_fts, 2, '', '', ' ... ', 24), -bm25(memory_fts) AS score, MAX(0, julianday('now') - julianday(m.updated_at))
              FROM memory_fts
              JOIN memories m ON m.id = memory_fts.id
-             WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status != 'forgotten'
-             ORDER BY score DESC
+              WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status IN ('active', 'candidate')
+              ORDER BY CASE m.status WHEN 'active' THEN 0 ELSE 1 END, score DESC
              LIMIT ?3"
         );
         let mut statement = connection.prepare(&sql)?;

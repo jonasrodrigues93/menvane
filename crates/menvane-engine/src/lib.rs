@@ -365,7 +365,30 @@ impl Menvane {
                 identity,
             });
         }
-        let results = self.search_inner(cwd, &prompt, ScopeSelection::Auto, limit)?;
+        let mut terms = lexical_tokens(&prompt).into_iter().collect::<Vec<_>>();
+        terms.sort();
+        let query = terms.join(" ");
+        if query.is_empty() {
+            return Ok(PromptRecall {
+                results: Vec::new(),
+                diagnostics: RecallDiagnostics {
+                    query: prompt,
+                    result_count: 0,
+                },
+                identity,
+            });
+        }
+        let results = self.search_inner(
+            cwd,
+            &query,
+            ScopeSelection::Auto,
+            limit.saturating_mul(4).max(limit),
+        )?;
+        let results = results
+            .into_iter()
+            .filter(|result| automatically_eligible(result, project.as_ref()))
+            .take(limit)
+            .collect::<Vec<_>>();
         for result in &results {
             self.sessions
                 .record_access(result.id, ReinforcementSignal::Retrieved)?;
@@ -1701,10 +1724,16 @@ fn bullets(values: &[String]) -> String {
 }
 
 fn lexical_tokens(value: &str) -> HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "all", "and", "any", "are", "but", "can", "could", "each", "for", "from", "has", "have",
+        "how", "its", "more", "not", "should", "some", "such", "than", "that", "the", "their",
+        "them", "then", "there", "these", "they", "this", "those", "was", "were", "what", "when",
+        "where", "which", "while", "who", "why", "will", "with", "would", "you", "your",
+    ];
     value
         .split(|character: char| !character.is_ascii_alphanumeric())
         .map(str::to_ascii_lowercase)
-        .filter(|token| token.len() >= 3)
+        .filter(|token| token.len() >= 3 && !STOPWORDS.contains(&token.as_str()))
         .collect()
 }
 
@@ -1714,6 +1743,13 @@ fn normalize_memory_text(value: &str) -> String {
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn automatically_eligible(result: &SearchResult, project: Option<&Project>) -> bool {
+    if result.scope == "project" || result.applicability.is_empty() {
+        return true;
+    }
+    project.is_some_and(|project| result.applicability.overlaps(&project.technologies))
 }
 
 fn content_identifier(value: &str) -> String {

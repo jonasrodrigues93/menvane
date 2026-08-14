@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::project::ProjectTechnologies;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KnowledgeType {
@@ -120,6 +122,20 @@ impl Applicability {
             && self.tools.is_empty()
             && self.databases.is_empty()
             && self.platforms.is_empty()
+    }
+
+    pub fn overlaps(&self, technologies: &ProjectTechnologies) -> bool {
+        fn dimension_overlaps(values: &[String], detected: &[String]) -> bool {
+            values.is_empty()
+                || values
+                    .iter()
+                    .any(|value| detected.iter().any(|item| item.eq_ignore_ascii_case(value)))
+        }
+        dimension_overlaps(&self.languages, &technologies.languages)
+            && dimension_overlaps(&self.frameworks, &technologies.frameworks)
+            && dimension_overlaps(&self.tools, &technologies.tools)
+            && dimension_overlaps(&self.databases, &technologies.databases)
+            && dimension_overlaps(&self.platforms, &technologies.platforms)
     }
 }
 

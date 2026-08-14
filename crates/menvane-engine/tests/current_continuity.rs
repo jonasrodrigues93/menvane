@@ -5,12 +5,12 @@ use std::sync::{Arc, Mutex};
 use chrono::{TimeZone, Utc};
 use menvane_domain::{
     Applicability, HandoffItem, HandoffItemKind, HandoffItemSource, JsonSchema, KnowledgeType,
-    LlmError, LlmErrorKind, LlmProvider, LlmRequest, MemoryStatus, NormalizedEvent,
-    NormalizedEventKind, ProviderCapabilities, ProviderHealth, ResponseUsage, Scope,
-    StructuredResponse,
+    LlmError, LlmErrorKind, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryStatus,
+    NormalizedEvent, NormalizedEventKind, ProviderCapabilities, ProviderHealth, ResponseUsage,
+    Scope, StructuredResponse,
 };
 use menvane_engine::{CaptureOutcome, Menvane, ScopeSelection, WriteMemory};
-use menvane_store::{MarkdownStore, SessionRepository};
+use menvane_store::{IndexStore, MarkdownStore, SessionRepository};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -797,6 +797,381 @@ fn reindex_rebuilds_knowledge_without_touching_session_state() {
     );
 }
 
+#[test]
+fn unrelated_prompt_receives_no_handoff_items_or_cards() {
+    let (_temporary, project, menvane) = setup_project();
+    let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    repository
+        .upsert_handoff_item(&handoff_item(
+            Uuid::from_u128(30),
+            &project_id,
+            HandoffItemKind::InProgress,
+            "Export implementation is underway",
+            Some("run the export tests".to_owned()),
+            None,
+            Uuid::from_u128(31),
+        ))
+        .unwrap();
+    menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Export runner".to_owned(),
+                body: "The export runner requires a remote approval window.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    let context = menvane
+        .prompt_context(&project, "water the balcony garden", "session")
+        .unwrap();
+    assert!(context.is_empty());
+}
+
+#[test]
+fn related_prompt_receives_matching_items_and_bounded_cards() {
+    let (_temporary, project, menvane) = setup_project();
+    let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    repository
+        .upsert_handoff_item(&handoff_item(
+            Uuid::from_u128(40),
+            &project_id,
+            HandoffItemKind::Blocked,
+            "Export is blocked on the schema",
+            None,
+            Some("schema review".to_owned()),
+            Uuid::from_u128(41),
+        ))
+        .unwrap();
+    repository
+        .upsert_handoff_item(&handoff_item(
+            Uuid::from_u128(42),
+            &project_id,
+            HandoffItemKind::InProgress,
+            "Billing invoice cleanup",
+            Some("reconcile the invoice ledger".to_owned()),
+            None,
+            Uuid::from_u128(43),
+        ))
+        .unwrap();
+    for number in 0..5 {
+        menvane
+            .write(
+                &project,
+                WriteMemory {
+                    title: format!("Export schema note {number}"),
+                    body: format!(
+                        "Export schema guidance number {number} explains the remote runner \
+                         approval flow in detail with several additional descriptive filler \
+                         words so the stored body stays well beyond the excerpt window and \
+                         only ends with the FULL_BODY_MARKER token."
+                    ),
+                    knowledge_type: KnowledgeType::Context,
+                    scope: Scope::Project,
+                    tags: Vec::new(),
+                    applies_to: Applicability::default(),
+                },
+            )
+            .unwrap();
+    }
+
+    let context = menvane
+        .prompt_context(&project, "continue the export schema work", "session")
+        .unwrap();
+    assert!(context.contains("[CURRENT HANDOFF]"));
+    assert!(context.contains("Export is blocked on the schema"));
+    assert!(!context.contains("Billing invoice cleanup"));
+    assert!(context.matches("[MEMORY CARD]").count() <= 3);
+    assert!(context.contains("[MEMORY CARD]"));
+    assert!(!context.contains("FULL_BODY_MARKER"));
+}
+
+#[test]
+fn automatic_recall_enforces_project_isolation_and_global_eligibility() {
+    let (temporary, project, menvane) = setup_project();
+    fs::write(project.join("Cargo.toml"), "[package]\nname = \"alpha\"\n").unwrap();
+    let other = temporary.path().join("other");
+    fs::create_dir_all(&other).unwrap();
+    let status = std::process::Command::new("git")
+        .args(["-C", other.to_str().unwrap(), "init", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::write(other.join("pyproject.toml"), "[project]\nname = \"beta\"\n").unwrap();
+
+    let alpha = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Alpha export rule".to_owned(),
+                body: "The alpha export rule requires the remote runner.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    let beta = menvane
+        .write(
+            &other,
+            WriteMemory {
+                title: "Beta export rule".to_owned(),
+                body: "The beta export rule requires the local runner.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    let universal = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Universal export guideline".to_owned(),
+                body: "Every export verification records the runner output.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Global,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    let contextual = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Python export caveat".to_owned(),
+                body: "Python export jobs need an explicit interpreter pin.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Global,
+                tags: Vec::new(),
+                applies_to: Applicability {
+                    languages: vec!["python".to_owned()],
+                    ..Applicability::default()
+                },
+            },
+        )
+        .unwrap();
+
+    let recall = menvane
+        .prompt_recall(&project, "test", "recall-alpha", "export", 10)
+        .unwrap();
+    let ids = recall
+        .results
+        .iter()
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&alpha.metadata.id));
+    assert!(ids.contains(&universal.metadata.id));
+    assert!(!ids.contains(&beta.metadata.id));
+    assert!(!ids.contains(&contextual.metadata.id));
+
+    let other_recall = menvane
+        .prompt_recall(&other, "test", "recall-beta", "export", 10)
+        .unwrap();
+    let other_ids = other_recall
+        .results
+        .iter()
+        .map(|result| result.id)
+        .collect::<Vec<_>>();
+    assert!(other_ids.contains(&beta.metadata.id));
+    assert!(other_ids.contains(&universal.metadata.id));
+    assert!(other_ids.contains(&contextual.metadata.id));
+    assert!(!other_ids.contains(&alpha.metadata.id));
+}
+
+#[test]
+fn explicit_search_may_inspect_incompatible_contextual_memory() {
+    let (_temporary, project, menvane) = setup_project();
+    fs::write(project.join("Cargo.toml"), "[package]\nname = \"alpha\"\n").unwrap();
+    let contextual = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Python export caveat".to_owned(),
+                body: "Python export jobs need an explicit interpreter pin.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Global,
+                tags: Vec::new(),
+                applies_to: Applicability {
+                    languages: vec!["python".to_owned()],
+                    ..Applicability::default()
+                },
+            },
+        )
+        .unwrap();
+
+    let results = menvane
+        .search_without_recording(&project, "python export caveat", ScopeSelection::Auto, 10)
+        .unwrap();
+    assert!(
+        results
+            .iter()
+            .any(|result| result.id == contextual.metadata.id)
+    );
+}
+
+#[test]
+fn superseded_memories_leave_retrieval_but_remain_inspectable() {
+    let (_temporary, project, provider, menvane) = setup_provider(Vec::new());
+    let target = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Old export rule".to_owned(),
+                body: "The old export rule uses a local runner.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    provider
+        .responses
+        .lock()
+        .unwrap()
+        .push(Ok(supersede_result(target.metadata.id)));
+    ingest_promotion_session(&menvane, &project);
+    process_next_job(&menvane);
+    process_next_job(&menvane);
+
+    let results = menvane
+        .search_without_recording(
+            &project,
+            "old export rule local runner",
+            ScopeSelection::Auto,
+            10,
+        )
+        .unwrap();
+    assert!(!results.iter().any(|result| result.id == target.metadata.id));
+    let inspectable = menvane.read_without_recording(target.metadata.id).unwrap();
+    assert_eq!(inspectable.metadata.status, MemoryStatus::Superseded);
+    let replacement = menvane
+        .search_without_recording(
+            &project,
+            "replacement export rule",
+            ScopeSelection::Auto,
+            10,
+        )
+        .unwrap();
+    assert_eq!(replacement.len(), 1);
+}
+
+#[test]
+fn hot_path_never_calls_the_provider() {
+    let (_temporary, project, provider, menvane) = setup_provider(Vec::new());
+    let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    repository
+        .upsert_handoff_item(&handoff_item(
+            Uuid::from_u128(50),
+            &project_id,
+            HandoffItemKind::InProgress,
+            "Export is blocked on the schema",
+            Some("confirm the schema".to_owned()),
+            None,
+            Uuid::from_u128(51),
+        ))
+        .unwrap();
+    menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Export schema constraint".to_owned(),
+                body: "The export schema requires an external approval window.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    let briefing = menvane
+        .session_briefing_for_client(&project, "test", "hot-path")
+        .unwrap();
+    assert!(briefing.contains("Export is blocked on the schema"));
+    let (context, _) = menvane
+        .prompt_context_for_client(&project, "test", "hot-path", "continue the export schema")
+        .unwrap();
+    assert!(context.contains("[CURRENT HANDOFF]"));
+    assert_eq!(provider.call_count(), 0);
+}
+
+#[test]
+fn prompt_context_stays_fast_with_large_corpus() {
+    let (_temporary, project, menvane) = setup_project();
+    let project_record = menvane.ensure_project(&project).unwrap().unwrap();
+    let markdown = MarkdownStore::new(menvane.home());
+    let index = IndexStore::new(menvane.home().join("index.sqlite"));
+    for number in 0..1_000u32 {
+        let metadata = MemoryMetadata::new(
+            KnowledgeType::Context,
+            Scope::Project,
+            Some(project_record.id.clone()),
+            Vec::new(),
+            Applicability::default(),
+            MemoryStatus::Active,
+        );
+        let memory = Memory {
+            metadata,
+            title: format!("Corpus note {number}"),
+            body: format!(
+                "Corpus body {number} records export schema guidance with several descriptive \
+                 filler words so the stored body resembles durable knowledge."
+            ),
+        };
+        let path = markdown
+            .write_memory(&memory, Some(&project_record))
+            .unwrap();
+        index.upsert_memory(&memory, &path).unwrap();
+    }
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    for number in 0..100u128 {
+        repository
+            .upsert_handoff_item(&handoff_item(
+                Uuid::from_u128(1_000 + number),
+                &project_record.id,
+                HandoffItemKind::InProgress,
+                &format!("Corpus front {number} tracks export task {number}"),
+                None,
+                None,
+                Uuid::from_u128(10_000 + number),
+            ))
+            .unwrap();
+    }
+
+    for number in 0..3 {
+        menvane
+            .prompt_context(&project, "export schema", &format!("warm-{number}"))
+            .unwrap();
+    }
+    let mut samples = Vec::new();
+    for number in 0..30 {
+        let start = std::time::Instant::now();
+        menvane
+            .prompt_context(&project, "export schema", &format!("sample-{number}"))
+            .unwrap();
+        samples.push(start.elapsed());
+    }
+    samples.sort();
+    let p50 = samples[samples.len() / 2];
+    let p95 = samples[samples.len() * 95 / 100];
+    assert!(
+        p95 < std::time::Duration::from_millis(300),
+        "p50 {p50:?} p95 {p95:?}"
+    );
+}
+
 fn setup_project() -> (TempDir, PathBuf, Menvane) {
     let temporary = TempDir::new().unwrap();
     let project = temporary.path().join("project");
@@ -924,6 +1299,25 @@ fn promotion_result() -> serde_json::Value {
             "scope_confidence": 0.95,
             "applies_to": {},
             "content": {"playbook": {"trigger": "When deploying remotely", "applicability": {}, "steps": ["Request approval", "Deploy remotely"], "validation": ["Confirm deployment output"], "failure_handling": "Stop and request approval again."}},
+            "evidence_event_ids": ["tool"],
+            "contradicting_event_ids": []
+        }
+    ]);
+    result
+}
+
+fn supersede_result(target: Uuid) -> serde_json::Value {
+    let mut result = valid_result();
+    result["knowledge"] = serde_json::json!([
+        {
+            "operation": "supersede",
+            "target_memory_ids": [target],
+            "knowledge_type": "context",
+            "title": "Replacement export rule",
+            "scope": "project",
+            "scope_confidence": 0.95,
+            "applies_to": {},
+            "content": {"context": {"body": "The replacement export rule uses the remote runner."}},
             "evidence_event_ids": ["tool"],
             "contradicting_event_ids": []
         }
