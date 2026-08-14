@@ -364,7 +364,7 @@ async fn recall(
     let (context, diagnostics) = match request.kind.as_str() {
         "session-start" => (
             menvane
-                .session_briefing_for_client(cwd, &request.client, &request.session_id)
+                .session_start_context_for_client(cwd, &request.client, &request.session_id)
                 .map_err(internal_server_error)?,
             None,
         ),

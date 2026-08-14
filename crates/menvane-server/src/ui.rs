@@ -83,7 +83,7 @@ async fn project_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Stri
             escape(&project.known_paths.join(" · ")),
             escape(&technologies(&project)),
             handoff_sections(handoff.as_ref()),
-            memory_list(&memories, &project_names(&[project.clone()]))
+            memory_list(&memories, &project_names(std::slice::from_ref(&project)))
         ))
     });
     page_result(&menvane, "projects", "Project", content)

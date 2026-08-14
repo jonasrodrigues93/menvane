@@ -1,8 +1,4 @@
-use anyhow::Result;
-use menvane_domain::{
-    ConsolidationPacket, HandoffItem, NormalizedEvent, NormalizedEventKind, NormalizedEventOrigin,
-};
-use sha2::Digest;
+use menvane_domain::{HandoffItem, NormalizedEvent, NormalizedEventKind, NormalizedEventOrigin};
 
 pub const MAX_SESSION_MARKDOWN_BYTES: usize = 32_768;
 
@@ -44,46 +40,6 @@ pub fn render_handoff_items(items: &[HandoffItem], max_bytes: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     bounded_string(&body, max_bytes)
-}
-
-pub fn session_packet(
-    events: &[NormalizedEvent],
-    budget_bytes: usize,
-) -> Result<ConsolidationPacket> {
-    let events = events
-        .iter()
-        .filter(|event| event.is_durable())
-        .cloned()
-        .collect::<Vec<_>>();
-    if events.is_empty() {
-        anyhow::bail!("session has no durable evidence");
-    }
-    let session_id = session_id(&events);
-    let mut packet = ConsolidationPacket {
-        session_id,
-        events,
-        handoff_items: Vec::new(),
-        related_summaries: Vec::new(),
-        related_memories: Vec::new(),
-    };
-    while serde_json::to_vec(&packet)?.len() > budget_bytes && packet.events.len() > 1 {
-        packet.events.remove(0);
-    }
-    if serde_json::to_vec(&packet)?.len() > budget_bytes {
-        anyhow::bail!("evidence budget is too small for session metadata");
-    }
-    Ok(packet)
-}
-
-fn session_id(events: &[NormalizedEvent]) -> uuid::Uuid {
-    let value = events
-        .first()
-        .map(|event| format!("{}:{}", event.client, event.external_session_id))
-        .unwrap_or_default();
-    let digest = sha2::Sha256::digest(value.as_bytes());
-    let mut bytes = [0; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    uuid::Uuid::from_bytes(bytes)
 }
 
 fn render_event(event: &NormalizedEvent) -> String {

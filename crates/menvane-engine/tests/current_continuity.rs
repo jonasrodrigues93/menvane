@@ -331,7 +331,7 @@ fn normalized_session_capture_is_sanitized_ordered_and_provider_independent() {
     assert!(menvane.configured_provider().is_ok());
     assert!(
         !menvane
-            .session_briefing_for_client(&project, "client", "new-session")
+            .session_start_context_for_client(&project, "client", "new-session")
             .unwrap()
             .is_empty()
     );
@@ -635,12 +635,12 @@ fn handoff_delivery_is_claimed_by_session_and_rendered_content() {
     repository.upsert_handoff_item(&item).unwrap();
 
     let first = menvane
-        .session_briefing_for_client(&project, "test-client", "session")
+        .session_start_context_for_client(&project, "test-client", "session")
         .unwrap();
     assert!(!first.is_empty());
     assert!(
         menvane
-            .session_briefing_for_client(&project, "test-client", "session")
+            .session_start_context_for_client(&project, "test-client", "session")
             .unwrap()
             .is_empty()
     );
@@ -649,7 +649,7 @@ fn handoff_delivery_is_claimed_by_session_and_rendered_content() {
     changed.state = "Export is blocked".to_owned();
     repository.upsert_handoff_item(&changed).unwrap();
     let second = menvane
-        .session_briefing_for_client(&project, "test-client", "session")
+        .session_start_context_for_client(&project, "test-client", "session")
         .unwrap();
     assert!(!second.is_empty());
     assert!(second.contains("Export is blocked"));
@@ -1096,10 +1096,10 @@ fn hot_path_never_calls_the_provider() {
         )
         .unwrap();
 
-    let briefing = menvane
-        .session_briefing_for_client(&project, "test", "hot-path")
+    let context = menvane
+        .session_start_context_for_client(&project, "test", "hot-path")
         .unwrap();
-    assert!(briefing.contains("Export is blocked on the schema"));
+    assert!(context.contains("Export is blocked on the schema"));
     let (context, _) = menvane
         .prompt_context_for_client(&project, "test", "hot-path", "continue the export schema")
         .unwrap();

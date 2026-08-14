@@ -523,7 +523,7 @@ mod tests {
         fs::write(
             sessions.join("session.jsonl"),
             format!(
-                "{{\"session_id\":\"external-1\",\"cwd\":{:?},\"role\":\"user\",\"content\":\"imported-session-goal\"}}\nnot-json\n{{\"session_id\":\"external-1\",\"role\":\"tool\",\"tool_name\":\"test\",\"success\":true}}\n",
+                "{{\"session_id\":\"external-1\",\"cwd\":{:?},\"role\":\"user\",\"content\":\"imported-session-prompt\"}}\nnot-json\n{{\"session_id\":\"external-1\",\"role\":\"tool\",\"tool_name\":\"test\",\"success\":true}}\n",
                 project.to_string_lossy()
             ),
         )
@@ -569,7 +569,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| { event.bounded_input.as_deref() == Some("imported-session-goal") })
+                .any(|event| { event.bounded_input.as_deref() == Some("imported-session-prompt") })
         );
     }
 

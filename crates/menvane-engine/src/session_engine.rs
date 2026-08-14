@@ -96,9 +96,11 @@ impl<'a> SessionEngine<'a> {
             summary: None,
         };
         let markdown = render_session_markdown(&events, MAX_SESSION_MARKDOWN_BYTES);
-        let summary_status = is_session_worth_compiling(&events)
-            .then_some(SummaryStatus::Pending)
-            .unwrap_or(SummaryStatus::Skipped);
+        let summary_status = if is_session_worth_compiling(&events) {
+            SummaryStatus::Pending
+        } else {
+            SummaryStatus::Skipped
+        };
         let metadata = SessionMetadata {
             summary_status,
             ..metadata

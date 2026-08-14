@@ -797,7 +797,7 @@ mod tests {
                 Applicability::default(),
                 MemoryStatus::Active,
             ),
-            title: "Durable rust fact".to_owned(),
+            title: "Durable rust context".to_owned(),
             body: "SQLite is derived.".to_owned(),
         };
         let path = markdown.write_memory(&memory, None).unwrap();

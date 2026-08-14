@@ -548,11 +548,11 @@ impl Menvane {
         Ok(true)
     }
 
-    pub fn session_briefing(&self, cwd: &Path, session_key: &str) -> Result<String> {
-        self.session_briefing_for_client(cwd, "legacy", session_key)
+    pub fn session_start_context(&self, cwd: &Path, session_key: &str) -> Result<String> {
+        self.session_start_context_for_client(cwd, "direct", session_key)
     }
 
-    pub fn session_briefing_for_client(
+    pub fn session_start_context_for_client(
         &self,
         cwd: &Path,
         client: &str,
@@ -1920,6 +1920,7 @@ fn acquire_daemon_lock(home: &Path) -> Result<File> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(home.join("daemon.lock"))?;
     file.try_lock_exclusive()
         .context("cannot reindex while the Menvane daemon is running")?;
