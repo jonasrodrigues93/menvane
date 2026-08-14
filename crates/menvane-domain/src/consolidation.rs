@@ -604,13 +604,155 @@ pub fn consolidation_result_schema() -> serde_json::Value {
                     "actions": {"type": "array", "maxItems": MAX_SUMMARY_ITEMS, "items": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS}},
                     "outcome": {"type": "string", "enum": ["completed", "advanced", "blocked", "abandoned", "inconclusive"]},
                     "result": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS},
-                    "continuity": {"type": "array", "maxItems": MAX_SUMMARY_ITEMS},
+                    "continuity": {
+                        "type": "array",
+                        "maxItems": MAX_SUMMARY_ITEMS,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["item_id", "front", "disposition"],
+                            "properties": {
+                                "item_id": {"type": ["string", "null"]},
+                                "front": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS},
+                                "disposition": {"type": "string", "enum": ["continues", "resolved", "discarded", "replaced"]}
+                            }
+                        }
+                    },
                     "candidate-learnings": {"type": "array", "maxItems": MAX_SUMMARY_ITEMS, "items": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS}}
                 }
             },
-            "handoff": {"type": "array", "maxItems": 120},
-            "knowledge": {"type": "array", "maxItems": MAX_KNOWLEDGE_OPERATIONS}
+            "handoff": {"type": "array", "maxItems": 120, "items": handoff_operation_schema()},
+            "knowledge": {"type": "array", "maxItems": MAX_KNOWLEDGE_OPERATIONS, "items": knowledge_operation_schema()}
         }
+    })
+}
+
+fn handoff_operation_schema() -> serde_json::Value {
+    let new_item = || {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "state", "next_step", "blocker"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["in-progress", "open-question", "parked", "blocked"]},
+                "state": {"type": "string", "maxLength": MAX_HANDOFF_TEXT_CHARS},
+                "next_step": {"type": ["string", "null"], "maxLength": MAX_HANDOFF_TEXT_CHARS},
+                "blocker": {"type": ["string", "null"], "maxLength": MAX_HANDOFF_TEXT_CHARS}
+            }
+        })
+    };
+    let evidence = serde_json::json!({"type": "array", "items": {"type": "string"}});
+    serde_json::json!({
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["keep"],
+                "properties": {"keep": {"type": "object", "additionalProperties": false, "required": ["item_id"], "properties": {"item_id": {"type": "string"}}}}
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["update"],
+                "properties": {"update": {"type": "object", "additionalProperties": false, "required": ["item_id", "kind", "state", "next_step", "blocker", "evidence_event_ids"], "properties": {"item_id": {"type": "string"}, "kind": {"type": "string", "enum": ["in-progress", "open-question", "parked", "blocked"]}, "state": {"type": "string", "maxLength": MAX_HANDOFF_TEXT_CHARS}, "next_step": {"type": ["string", "null"]}, "blocker": {"type": ["string", "null"]}, "evidence_event_ids": evidence}}}
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["resolve"],
+                "properties": {"resolve": transition_schema()}
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["discard"],
+                "properties": {"discard": transition_schema()}
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["replace"],
+                "properties": {"replace": {"type": "object", "additionalProperties": false, "required": ["item_id", "replacement", "evidence_event_ids"], "properties": {"item_id": {"type": "string"}, "replacement": new_item(), "evidence_event_ids": evidence}}}
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["uncertain"],
+                "properties": {"uncertain": {"type": "object", "additionalProperties": false, "required": ["item_id"], "properties": {"item_id": {"type": "string"}}}}
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["create"],
+                "properties": {"create": {"type": "object", "additionalProperties": false, "required": ["item", "evidence_event_ids"], "properties": {"item": new_item(), "evidence_event_ids": evidence}}}
+            }
+        ]
+    })
+}
+
+fn transition_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["item_id", "text", "evidence_event_ids"],
+        "properties": {
+            "item_id": {"type": "string"},
+            "text": {"type": "string", "maxLength": MAX_HANDOFF_TEXT_CHARS},
+            "evidence_event_ids": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+fn applicability_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["languages", "frameworks", "tools", "databases", "platforms"],
+        "properties": {
+            "languages": {"type": "array", "items": {"type": "string"}},
+            "frameworks": {"type": "array", "items": {"type": "string"}},
+            "tools": {"type": "array", "items": {"type": "string"}},
+            "databases": {"type": "array", "items": {"type": "string"}},
+            "platforms": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+fn knowledge_operation_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "target_memory_ids", "knowledge_type", "title", "scope", "scope_confidence", "applies_to", "content", "evidence_event_ids", "contradicting_event_ids"],
+        "properties": {
+            "operation": {"type": "string", "enum": ["create", "reinforce", "merge", "supersede", "no-op"]},
+            "target_memory_ids": {"type": "array", "items": {"type": "string"}},
+            "knowledge_type": {"type": ["string", "null"], "enum": ["context", "playbook", null]},
+            "title": {"type": ["string", "null"], "maxLength": MAX_SUMMARY_TEXT_CHARS},
+            "scope": {"type": ["string", "null"], "enum": ["global", "project", null]},
+            "scope_confidence": {"type": ["number", "null"]},
+            "applies_to": applicability_schema(),
+            "content": {"anyOf": [{"type": "null"}, context_content_schema(), playbook_content_schema()]},
+            "evidence_event_ids": {"type": "array", "items": {"type": "string"}},
+            "contradicting_event_ids": {"type": "array", "items": {"type": "string"}}
+        }
+    })
+}
+
+fn context_content_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["context"],
+        "properties": {"context": {"type": "object", "additionalProperties": false, "required": ["body"], "properties": {"body": {"type": "string", "maxLength": MAX_KNOWLEDGE_BODY_CHARS}}}}
+    })
+}
+
+fn playbook_content_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["playbook"],
+        "properties": {"playbook": {"type": "object", "additionalProperties": false, "required": ["trigger", "applicability", "steps", "validation", "failure_handling"], "properties": {"trigger": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS}, "applicability": applicability_schema(), "steps": {"type": "array", "items": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS}}, "validation": {"type": "array", "items": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS}}, "failure_handling": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS}}}}
     })
 }
 
@@ -704,6 +846,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("every previous handoff item"));
+    }
+
+    #[test]
+    fn consolidation_schema_declares_items_for_operational_arrays() {
+        let schema = consolidation_result_schema();
+        assert!(schema["properties"]["summary"]["properties"]["continuity"]["items"].is_object());
+        assert!(schema["properties"]["handoff"]["items"].is_object());
+        assert!(schema["properties"]["knowledge"]["items"].is_object());
     }
 
     fn promotion_packet() -> ConsolidationPacket {
