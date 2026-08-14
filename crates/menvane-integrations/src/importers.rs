@@ -260,12 +260,13 @@ impl OpenCodeImporter {
             let cwd = find_string(&summary, &["directory", "cwd"]).map(str::to_owned);
             let session_timestamp = find_timestamp(&summary).unwrap_or_else(Utc::now);
             for (index, message) in messages.into_iter().enumerate() {
-                if let Some((kind, input, output, tool, success, origin, role)) =
-                    normalize_record(&message)
+                for (part_index, (kind, input, output, tool, success, origin, role)) in
+                    normalize_opencode_message(&message).into_iter().enumerate()
                 {
+                    let attributed_path = input.as_deref().and_then(imported_attributed_path);
                     events.push(NormalizedEvent {
                         event_id: hex::encode(Sha256::digest(
-                            format!("opencode:{id}:{index}").as_bytes(),
+                            format!("opencode:{id}:{index}:{part_index}").as_bytes(),
                         )),
                         kind,
                         origin,
@@ -278,7 +279,7 @@ impl OpenCodeImporter {
                         tool_family: tool,
                         bounded_input: input,
                         bounded_output: output,
-                        attributed_path: None,
+                        attributed_path,
                         success,
                         model: None,
                         harness_injected: false,
@@ -320,9 +321,67 @@ impl OpenCodeImporter {
     }
 }
 
+fn imported_attributed_path(input: &str) -> Option<String> {
+    let input: Value = serde_json::from_str(input).ok()?;
+    find_string(&input, &["filePath", "file_path", "path"]).map(str::to_owned)
+}
+
+fn normalize_opencode_message(record: &Value) -> Vec<ImportedEvent> {
+    let Some(parts) = record.get("parts").and_then(Value::as_array) else {
+        return normalize_record(record).into_iter().collect();
+    };
+    let Some(role) = record
+        .get("info")
+        .and_then(|info| info.get("role"))
+        .and_then(Value::as_str)
+    else {
+        return Vec::new();
+    };
+    if role.contains("user") {
+        return content_text(&Value::Array(parts.clone()))
+            .map(|content| {
+                vec![(
+                    NormalizedEventKind::UserPrompt,
+                    Some(content),
+                    None,
+                    None,
+                    None,
+                    NormalizedEventOrigin::User,
+                    NormalizedEventRole::UserPrompt,
+                )]
+            })
+            .unwrap_or_default();
+    }
+    if role.contains("assistant") {
+        return parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool"))
+            .map(|part| {
+                let state = part.get("state").unwrap_or(&Value::Null);
+                let status = state.get("status").and_then(Value::as_str);
+                (
+                    NormalizedEventKind::ToolCompleted,
+                    state.get("input").map(Value::to_string),
+                    state.get("output").map(value_text),
+                    part.get("tool").and_then(Value::as_str).map(str::to_owned),
+                    match status {
+                        Some("completed") => Some(true),
+                        Some("error" | "failed") => Some(false),
+                        _ => None,
+                    },
+                    NormalizedEventOrigin::Tool,
+                    NormalizedEventRole::ToolActivity,
+                )
+            })
+            .collect();
+    }
+    normalize_record(record).into_iter().collect()
+}
+
 fn normalize_record(record: &Value) -> Option<ImportedEvent> {
     let role = find_string(record, &["role", "type"])?;
-    let content = find_value(record, &["content", "message", "text"]).and_then(content_text);
+    let content =
+        find_value(record, &["content", "message", "text", "parts"]).and_then(content_text);
     let blocks = find_value(record, &["content"])
         .or_else(|| {
             record
@@ -425,16 +484,30 @@ fn content_text(value: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+fn value_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
 fn find_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
     find_value(value, keys)?.as_str()
 }
 
 fn find_timestamp(value: &Value) -> Option<DateTime<Utc>> {
-    let raw = find_value(value, &["timestamp", "created_at", "updated_at"]).or_else(|| {
-        value
-            .get("time")
-            .and_then(|time| find_value(time, &["created", "updated"]))
-    })?;
+    let raw = find_value(value, &["timestamp", "created_at", "updated_at"])
+        .or_else(|| {
+            value
+                .get("time")
+                .and_then(|time| find_value(time, &["created", "updated"]))
+        })
+        .or_else(|| {
+            value
+                .get("info")
+                .and_then(|info| info.get("time"))
+                .and_then(|time| find_value(time, &["created", "updated"]))
+        })?;
     if let Some(number) = raw.as_i64() {
         return DateTime::from_timestamp_millis(number);
     }
@@ -452,6 +525,9 @@ fn find_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
             return Some(found);
         }
         if let Some(found) = value.get("message").and_then(|message| message.get(key)) {
+            return Some(found);
+        }
+        if let Some(found) = value.get("info").and_then(|info| info.get(key)) {
             return Some(found);
         }
     }
@@ -574,6 +650,87 @@ mod tests {
     }
 
     #[test]
+    fn empty_skipped_import_can_be_repaired_once() {
+        let temporary = TempDir::new().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+        let timestamp = Utc::now();
+        let empty = NormalizedSession {
+            client: "opencode".to_owned(),
+            external_session_id: "repairable".to_owned(),
+            cwd: Some(project.to_string_lossy().into_owned()),
+            events: vec![
+                boundary_event(
+                    "opencode",
+                    "repairable",
+                    project.to_string_lossy().as_ref(),
+                    timestamp,
+                    NormalizedEventKind::SessionStarted,
+                    "import-start",
+                ),
+                boundary_event(
+                    "opencode",
+                    "repairable",
+                    project.to_string_lossy().as_ref(),
+                    timestamp,
+                    NormalizedEventKind::SessionEnded,
+                    "import-end",
+                ),
+            ],
+            estimated_bytes: 0,
+        };
+        assert_eq!(
+            menvane.import_session(empty.clone()).unwrap(),
+            ImportOutcome::Imported
+        );
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(menvane.process_next_job())
+            .unwrap();
+        let mut repaired = empty;
+        repaired.events.insert(
+            1,
+            NormalizedEvent {
+                event_id: "repaired-prompt".to_owned(),
+                kind: NormalizedEventKind::UserPrompt,
+                origin: NormalizedEventOrigin::User,
+                role: NormalizedEventRole::UserPrompt,
+                client: "opencode".to_owned(),
+                external_session_id: "repairable".to_owned(),
+                timestamp,
+                cwd: project.to_string_lossy().into_owned(),
+                project_id: None,
+                tool_family: None,
+                bounded_input: Some("recovered prompt".to_owned()),
+                bounded_output: None,
+                attributed_path: None,
+                success: None,
+                model: None,
+                harness_injected: false,
+            },
+        );
+
+        assert_eq!(
+            menvane.import_session(repaired.clone()).unwrap(),
+            ImportOutcome::Imported
+        );
+        assert_eq!(
+            menvane.import_session(repaired).unwrap(),
+            ImportOutcome::AlreadyImported
+        );
+        let latest = menvane.sessions(1).unwrap().remove(0);
+        assert_eq!(latest.generation, 2);
+        assert!(
+            menvane
+                .session_events(latest.id)
+                .unwrap()
+                .iter()
+                .any(|event| event.bounded_input.as_deref() == Some("recovered prompt"))
+        );
+    }
+
+    #[test]
     fn unknown_project_is_orphaned_without_guessing() {
         let temporary = TempDir::new().unwrap();
         let menvane = Menvane::new(temporary.path().join("home")).unwrap();
@@ -616,6 +773,59 @@ mod tests {
         assert_eq!(result.1.as_deref(), Some("{\"command\":\"cargo test\"}"));
         assert_eq!(result.5, NormalizedEventOrigin::Tool);
         assert_eq!(result.6, NormalizedEventRole::ToolActivity);
+    }
+
+    #[test]
+    fn current_opencode_message_shape_becomes_a_prompt() {
+        let message = serde_json::json!({
+            "info": {
+                "role": "user",
+                "time": {"created": 1_786_656_868_285_i64}
+            },
+            "parts": [{"type": "text", "text": "execute task 001"}]
+        });
+
+        let result = normalize_record(&message).unwrap();
+
+        assert_eq!(result.0, NormalizedEventKind::UserPrompt);
+        assert_eq!(result.1.as_deref(), Some("execute task 001"));
+        assert_eq!(
+            find_timestamp(&message),
+            DateTime::from_timestamp_millis(1_786_656_868_285)
+        );
+    }
+
+    #[test]
+    fn current_opencode_tool_parts_become_individual_events() {
+        let message = serde_json::json!({
+            "info": {"role": "assistant"},
+            "parts": [
+                {"type": "reasoning", "text": "private"},
+                {"type": "tool", "tool": "read", "state": {
+                    "status": "completed",
+                    "input": {"filePath": "/tmp/one"},
+                    "output": "first"
+                }},
+                {"type": "tool", "tool": "bash", "state": {
+                    "status": "failed",
+                    "input": {"command": "false"},
+                    "output": "failed"
+                }}
+            ]
+        });
+
+        let events = normalize_opencode_message(&message);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].3.as_deref(), Some("read"));
+        assert_eq!(events[0].4, Some(true));
+        assert_eq!(events[1].3.as_deref(), Some("bash"));
+        assert_eq!(events[1].4, Some(false));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.2.as_deref() != Some("private"))
+        );
     }
 
     #[test]

@@ -686,7 +686,20 @@ impl Menvane {
             .sessions
             .import_exists(&session.client, &session.external_session_id)?
         {
-            return Ok(ImportOutcome::AlreadyImported);
+            let existing = self
+                .sessions
+                .latest_session(&session.client, &session.external_session_id)?;
+            let retry_empty_import = if let Some(existing) = existing {
+                existing.imported
+                    && existing.summary_status == SummaryStatus::Skipped
+                    && !has_consolidation_content(&self.sessions.events(existing.id)?)
+                    && has_consolidation_content(&session.events)
+            } else {
+                false
+            };
+            if !retry_empty_import {
+                return Ok(ImportOutcome::AlreadyImported);
+            }
         }
         let Some(cwd) = session.cwd.as_deref() else {
             self.record_orphan(&session)?;
@@ -1670,6 +1683,20 @@ impl Menvane {
         }
         Ok(Some(project))
     }
+}
+
+fn has_consolidation_content(events: &[NormalizedEvent]) -> bool {
+    events.iter().any(|event| {
+        event.is_consolidation_eligible()
+            && (event
+                .bounded_input
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || event
+                    .bounded_output
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty()))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
