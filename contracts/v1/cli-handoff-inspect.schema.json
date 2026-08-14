@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["project_id", "text", "items"],
+  "properties": {
+    "project_id": { "type": ["string", "null"] },
+    "text": { "type": "string" },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "project_id", "kind", "state", "next_step", "blocker", "low_confidence", "last_confirmed_at", "sources", "created_at", "updated_at"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "project_id": { "type": ["string", "null"] },
+          "kind": { "enum": ["in-progress", "open-question", "parked", "blocked"] },
+          "state": { "type": "string" },
+          "next_step": { "type": ["string", "null"] },
+          "blocker": { "type": ["string", "null"] },
+          "low_confidence": { "type": "boolean" },
+          "last_confirmed_at": { "type": "string" },
+          "sources": { "type": "array" },
+          "created_at": { "type": "string" },
+          "updated_at": { "type": "string" }
+        }
+      }
+    }
+  }
+}

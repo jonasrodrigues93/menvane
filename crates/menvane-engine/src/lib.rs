@@ -18,11 +18,11 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use fs2::FileExt;
 use menvane_domain::{
-    Applicability, ConsolidationPacket, ConsolidationResult, HandoffItem, HandoffItemOperation,
-    HandoffItemSource, JsonSchema, KnowledgeContent, KnowledgeOperation, KnowledgeOperationKind,
-    KnowledgeType, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryStatus, NormalizedEvent,
-    NormalizedEventKind, NormalizedSession, Project, ProviderHealth, ReinforcementSignal, Scope,
-    SessionMetadata, SummaryStatus,
+    Applicability, ConsolidationPacket, ConsolidationResult, EpisodicSummary, HandoffItem,
+    HandoffItemOperation, HandoffItemSource, JsonSchema, KnowledgeContent, KnowledgeOperation,
+    KnowledgeOperationKind, KnowledgeType, LlmProvider, LlmRequest, Memory, MemoryMetadata,
+    MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProviderHealth,
+    ReinforcementSignal, Scope, SessionMetadata, SummaryStatus,
 };
 use menvane_store::{
     IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MAX_SUMMARY_SELECTION_BYTES,
@@ -471,6 +471,22 @@ impl Menvane {
 
     pub fn session_events(&self, id: Uuid) -> Result<Vec<NormalizedEvent>> {
         self.sessions.events(id)
+    }
+
+    pub fn sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
+        self.sessions.sessions(limit)
+    }
+
+    pub fn session(&self, id: Uuid) -> Result<Option<SessionRecord>> {
+        self.sessions.find_session(id)
+    }
+
+    pub fn session_summary(&self, id: Uuid) -> Result<Option<EpisodicSummary>> {
+        self.sessions.session_summary(id)
+    }
+
+    pub fn session_consolidation(&self, id: Uuid) -> Result<Option<ConsolidationMarker>> {
+        self.sessions.consolidation_result(id)
     }
 
     pub fn handoff_is_stale(&self, _project: &Project) -> Result<Option<bool>> {

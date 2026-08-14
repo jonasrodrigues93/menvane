@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["context", "diagnostics"],
+  "properties": {
+    "context": { "type": "string" },
+    "diagnostics": {
+      "type": ["object", "null"],
+      "properties": {
+        "query": { "type": "string" },
+        "result_count": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["query", "result_count"],
+      "additionalProperties": false
+    }
+  }
+}

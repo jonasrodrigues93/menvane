@@ -68,6 +68,7 @@ pub fn app(state: Arc<Menvane>) -> Router {
         .route("/api/v1/providers", get(api_providers))
         .route("/api/v1/search", get(api_search))
         .merge(ui::router())
+        .fallback(api_fallback)
         .with_state(state)
 }
 
@@ -168,17 +169,65 @@ async fn api_memories(
 }
 
 async fn api_sessions(
-    State(_menvane): State<Arc<Menvane>>,
+    State(menvane): State<Arc<Menvane>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    Ok(Json(json!([])))
+    let sessions = menvane.sessions(100).map_err(internal_server_error)?;
+    Ok(Json(Value::Array(
+        sessions.iter().map(session_json).collect(),
+    )))
+}
+
+fn session_json(session: &menvane_engine::SessionRecord) -> Value {
+    json!({
+        "id": session.id,
+        "client": session.client,
+        "external_session_id": session.external_session_id,
+        "project_id": session.project_id,
+        "generation": session.generation,
+        "state": session.state,
+        "started_at": session.started_at,
+        "ended_at": session.ended_at,
+        "last_event_at": session.last_event_at,
+        "imported": session.imported,
+        "summary_status": session.summary_status,
+    })
 }
 
 async fn api_session_detail(
     State(menvane): State<Arc<Menvane>>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let session = menvane
+        .session(id)
+        .map_err(internal_server_error)?
+        .ok_or_else(|| not_found(format!("session {id} not found")))?;
+    let summary = menvane.session_summary(id).map_err(internal_server_error)?;
+    let consolidation = menvane
+        .session_consolidation(id)
+        .map_err(internal_server_error)?;
     let events = menvane.session_events(id).map_err(internal_server_error)?;
-    Ok(Json(json!({ "id": id, "events": events })))
+    let mut detail = session_json(&session);
+    detail["summary"] = json!(summary);
+    detail["consolidation"] = consolidation.map_or(Value::Null, |marker| {
+        json!({
+            "provider": marker.execution.provider,
+            "model": marker.execution.model,
+            "latency_ms": marker.execution.latency_ms,
+            "attempts": marker.execution.attempts,
+            "input_bytes": marker.execution.input_bytes,
+            "output_bytes": marker.execution.output_bytes,
+            "input_tokens": marker.execution.input_tokens,
+            "output_tokens": marker.execution.output_tokens,
+            "credits": marker.execution.credits,
+            "applied_at": marker.applied_at,
+        })
+    });
+    detail["events"] = json!(events);
+    Ok(Json(detail))
+}
+
+async fn api_fallback() -> (StatusCode, Json<Value>) {
+    not_found("route not found".to_owned())
 }
 
 async fn api_handoffs(
@@ -422,8 +471,9 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use chrono::Utc;
+    use jsonschema::validator_for;
     use menvane_domain::NormalizedEventKind;
-    use menvane_domain::{Applicability, KnowledgeType, ProviderHealth, Scope};
+    use menvane_domain::{Applicability, KnowledgeType, Scope};
     use menvane_engine::WriteMemory;
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -495,6 +545,15 @@ mod tests {
             )
             .unwrap();
         let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;
+        menvane
+            .ingest_event(test_event(
+                &project,
+                "ui-session-event",
+                NormalizedEventKind::SessionStarted,
+                Some("ui smoke"),
+            ))
+            .unwrap();
+        let session_id = menvane.sessions(1).unwrap()[0].id;
         let router = app(Arc::new(menvane));
         let project_response = router
             .clone()
@@ -512,6 +571,7 @@ mod tests {
         let project_body = String::from_utf8(project_body.to_vec()).unwrap();
         assert!(project_body.contains("Current handoff"));
         assert!(project_body.contains("handoff-surface"));
+        assert!(!project_body.contains("Project Brief"));
         for path in [
             "/",
             "/projects",
@@ -519,6 +579,8 @@ mod tests {
             "/memories",
             &format!("/memories/{}", memory.metadata.id),
             "/sessions",
+            &format!("/sessions/{session_id}"),
+            &format!("/handoffs/{project_id}"),
             "/imports",
             "/integrations",
             "/providers",
@@ -530,7 +592,23 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert!(
+                !String::from_utf8_lossy(&body).contains("Project Brief"),
+                "{path}"
+            );
         }
+    }
+
+    #[test]
+    fn clean_home_can_be_reopened_after_install() {
+        let temporary = TempDir::new().unwrap();
+        let home = temporary.path().join("home");
+        let first = Menvane::new(&home).unwrap();
+        assert!(first.doctor().healthy());
+        drop(first);
+        let second = Menvane::new(&home).unwrap();
+        assert!(second.doctor().healthy());
     }
 
     #[tokio::test]
@@ -572,6 +650,116 @@ mod tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rest_contracts_validate_current_sessions_recall_and_absence_shapes() {
+        let temporary = TempDir::new().unwrap();
+        let state = Arc::new(Menvane::new(temporary.path().join("home")).unwrap());
+        state
+            .ingest_event(test_event(
+                temporary.path(),
+                "contract-session-event",
+                NormalizedEventKind::SessionStarted,
+                Some("contract"),
+            ))
+            .unwrap();
+        let session_id = state.sessions(1).unwrap()[0].id;
+        let router = app(state);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sessions: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let sessions_schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/v1/rest-sessions.schema.json"
+        ))
+        .unwrap();
+        assert!(validator_for(&sessions_schema).unwrap().is_valid(&sessions));
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let detail: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let detail_schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/v1/rest-session-detail.schema.json"
+        ))
+        .unwrap();
+        assert!(validator_for(&detail_schema).unwrap().is_valid(&detail));
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/handoffs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let handoff: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let handoff_schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/v1/rest-handoff.schema.json"
+        ))
+        .unwrap();
+        assert!(validator_for(&handoff_schema).unwrap().is_valid(&handoff));
+
+        let recall = post_recall(
+            router.clone(),
+            json!({
+                "client": "contract-test",
+                "cwd": temporary.path(),
+                "session_id": "contract-session",
+                "kind": "user-prompt",
+                "prompt": "unrelated"
+            }),
+        )
+        .await;
+        let recall_schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/v1/rest-recall.schema.json"
+        ))
+        .unwrap();
+        assert!(validator_for(&recall_schema).unwrap().is_valid(&recall));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/goals")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let error: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let error_schema: Value =
+            serde_json::from_str(include_str!("../../../contracts/v1/rest-error.schema.json"))
+                .unwrap();
+        assert!(validator_for(&error_schema).unwrap().is_valid(&error));
     }
 
     fn test_event(

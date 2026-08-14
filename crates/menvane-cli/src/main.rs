@@ -102,6 +102,8 @@ fn parse_days(value: &str) -> Result<i64, String> {
 mod tests {
     use super::{Cli, parse_days};
     use clap::Parser;
+    use jsonschema::validator_for;
+    use serde_json::Value;
 
     #[test]
     fn parses_only_positive_day_windows() {
@@ -114,6 +116,20 @@ mod tests {
     #[test]
     fn parses_handoff_inspection_diagnostics() {
         assert!(Cli::try_parse_from(["menvane", "handoff", "inspect"]).is_ok());
+    }
+
+    #[test]
+    fn handoff_inspect_contract_is_versioned() {
+        let value: Value = serde_json::json!({
+            "project_id": "project",
+            "text": "# Current Handoff\n",
+            "items": []
+        });
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/v1/cli-handoff-inspect.schema.json"
+        ))
+        .unwrap();
+        assert!(validator_for(&schema).unwrap().is_valid(&value));
     }
 }
 
@@ -647,15 +663,15 @@ async fn main() -> Result<()> {
             HandoffCommand::Inspect => {
                 let cwd = std::env::current_dir()?;
                 let project_id = menvane.ensure_project(&cwd)?.map(|project| project.id);
-                match menvane.current_project_handoff(project_id.as_deref())? {
-                    Some(handoff) => println!(
-                        "{}",
-                        serde_json::to_string_pretty(
-                            &serde_json::json!({ "project_id": handoff.project_id, "items": handoff.items })
-                        )?
-                    ),
-                    None => println!("no current handoff for this project"),
-                }
+                let items = menvane.current_handoff_items(project_id.as_deref())?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "project_id": project_id,
+                        "text": menvane.render_current_handoff(project_id.as_deref())?,
+                        "items": items,
+                    }))?
+                );
             }
         },
         Command::Mcp => {

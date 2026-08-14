@@ -5,8 +5,9 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use menvane_domain::{
-    ConsolidationExecution, ConsolidationResult, HandoffItem, HandoffItemKind, HandoffItemSource,
-    NormalizedEvent, NormalizedEventKind, ReinforcementSignal, SessionState, SummaryStatus,
+    ConsolidationExecution, ConsolidationResult, EpisodicSummary, HandoffItem, HandoffItemKind,
+    HandoffItemSource, NormalizedEvent, NormalizedEventKind, ReinforcementSignal, SessionState,
+    SummaryStatus,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -141,7 +142,7 @@ CREATE TABLE IF NOT EXISTS delivery_claims (
 );
 "#;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
     pub id: Uuid,
     pub client: String,
@@ -369,6 +370,36 @@ impl SessionRepository {
     pub fn session(&self, id: Uuid) -> Result<SessionRecord> {
         let connection = self.open()?;
         session_by_id(&connection, id)
+    }
+
+    pub fn find_session(&self, id: Uuid) -> Result<Option<SessionRecord>> {
+        let connection = self.open()?;
+        connection
+            .query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE id=?1", [id.to_string()], session_from_row)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions ORDER BY last_event_at DESC, id DESC LIMIT ?1")?;
+        let rows = statement.query_map([i64::try_from(limit)?], session_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn session_summary(&self, session_id: Uuid) -> Result<Option<EpisodicSummary>> {
+        let connection = self.open()?;
+        connection
+            .query_row(
+                "SELECT summary_json FROM sessions WHERE id=?1",
+                [session_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
     }
 
     pub fn latest_session(

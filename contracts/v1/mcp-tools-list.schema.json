@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["jsonrpc", "id", "result"],
+  "properties": {
+    "jsonrpc": { "const": "2.0" },
+    "id": {},
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "required": ["name", "description", "inputSchema"],
+            "properties": {
+              "name": { "enum": ["memory_search", "memory_read", "memory_write", "memory_forget"] },
+              "description": { "type": "string" },
+              "inputSchema": { "type": "object" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

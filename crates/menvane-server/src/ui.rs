@@ -173,32 +173,114 @@ async fn memory_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>
     page_result(&menvane, "memories", "Memory", content)
 }
 
-async fn sessions(State(_menvane): State<Arc<Menvane>>) -> Response {
-    let content = Ok(format!(
-        "{}<section class='panel'>{}</section>",
-        page_head(
-            "Sessions",
-            "Chronological evidence is read through the session API."
-        ),
-        empty_state("Use /api/v1/sessions/{id} to read a session by ID.")
-    ));
-    page_result(&_menvane, "sessions", "Sessions", content)
+async fn sessions(State(menvane): State<Arc<Menvane>>) -> Response {
+    let content = menvane.sessions(100).map(|sessions| {
+        let rows = sessions
+            .iter()
+            .map(|session| {
+                format!(
+                    "<a class='memory-row' href='/sessions/{}'><strong>{} · {}</strong><span>{:?} · summary {:?} · {}</span></a>",
+                    session.id,
+                    escape(&session.client),
+                    escape(&session.external_session_id),
+                    session.state,
+                    session.summary_status,
+                    session.last_event_at.format("%Y-%m-%d %H:%M:%S"),
+                )
+            })
+            .collect::<String>();
+        format!(
+            "{}<section class='panel'><h2>Sessions</h2>{}</section>",
+            page_head("Sessions", "Captured sessions and episodic summaries."),
+            if rows.is_empty() {
+                empty_state("No sessions recorded.")
+            } else {
+                rows
+            }
+        )
+    });
+    page_result(&menvane, "sessions", "Sessions", content)
 }
 
 async fn session_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>) -> Response {
-    let content = menvane.session_events(id).map(|events| {
+    let content = menvane.session(id).and_then(|session| {
+        let session = session.ok_or_else(|| anyhow::anyhow!("session not found"))?;
+        let summary = menvane.session_summary(id)?;
+        let consolidation = menvane.session_consolidation(id)?;
+        let events = menvane.session_events(id)?;
         let evidence = events.iter().map(session_evidence_row).collect::<String>();
-        format!(
-            "{}<section class='panel'><h2>Session evidence</h2>{}</section>",
-            page_head("Session", "Chronological sanitized evidence."),
+        let evidence_section = format!(
+            "<section class='panel'><h2>Session evidence</h2>{}</section>",
             if evidence.is_empty() {
                 empty_state("No events recorded.")
             } else {
                 evidence
             }
-        )
+        );
+        Ok(format!(
+            "{}<section class='panel'><dl><dt>Client</dt><dd>{}</dd><dt>External session</dt><dd>{}</dd><dt>State</dt><dd>{:?}</dd><dt>Summary</dt><dd>{:?}</dd><dt>Last event</dt><dd>{}</dd></dl></section>{}{}{}",
+            page_head("Session", "Episodic summary and chronological evidence."),
+            escape(&session.client),
+            escape(&session.external_session_id),
+            session.state,
+            session.summary_status,
+            session.last_event_at.format("%Y-%m-%d %H:%M:%S"),
+            summary_section(summary.as_ref()),
+            consolidation_section(consolidation.as_ref()),
+            evidence_section
+        ))
     });
     page_result(&menvane, "sessions", "Session", content)
+}
+
+fn summary_section(summary: Option<&menvane_domain::EpisodicSummary>) -> String {
+    let Some(summary) = summary else {
+        return format!(
+            "<section class='panel'><h2>Episodic summary</h2>{}</section>",
+            empty_state("No episodic summary.")
+        );
+    };
+    let items = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| format!("<li>{}</li>", escape(value)))
+            .collect::<String>()
+    };
+    let continuity = summary
+        .continuity
+        .iter()
+        .map(|item| format!("<li>{:?}: {}</li>", item.disposition, escape(&item.front)))
+        .collect::<String>();
+    format!(
+        "<section class='panel'><h2>Episodic summary</h2><dl><dt>Outcome</dt><dd>{:?}</dd><dt>Result</dt><dd>{}</dd></dl><h3>Intentions</h3><ul>{}</ul><h3>Actions</h3><ul>{}</ul><h3>Continuity</h3><ul>{}</ul><h3>Candidate learnings</h3><ul>{}</ul></section>",
+        summary.outcome,
+        escape(&summary.result),
+        items(&summary.intentions),
+        items(&summary.actions),
+        continuity,
+        items(&summary.candidate_learnings),
+    )
+}
+
+fn consolidation_section(consolidation: Option<&menvane_engine::ConsolidationMarker>) -> String {
+    let Some(marker) = consolidation else {
+        return String::new();
+    };
+    let execution = &marker.execution;
+    format!(
+        "<section class='panel'><h2>Consolidation</h2><dl><dt>Provider</dt><dd>{}</dd><dt>Model</dt><dd>{}</dd><dt>Latency</dt><dd>{} ms</dd><dt>Attempts</dt><dd>{}</dd><dt>Tokens</dt><dd>{}</dd><dt>Credits</dt><dd>{}</dd></dl></section>",
+        escape(&execution.provider),
+        escape(&execution.model),
+        execution.latency_ms,
+        execution.attempts,
+        match (execution.input_tokens, execution.output_tokens) {
+            (Some(input), Some(output)) => format!("{input} in / {output} out"),
+            _ => "not reported".to_owned(),
+        },
+        execution
+            .credits
+            .map_or_else(|| "not reported".to_owned(), |credits| credits.to_string()),
+    )
 }
 
 async fn handoff_detail(
@@ -372,7 +454,45 @@ fn handoff_items(items: &[HandoffItem]) -> String {
     if items.is_empty() {
         return empty_state("No current handoff items.");
     }
-    items.iter().map(|item| format!("<article class='handoff-item'><strong>{:?}</strong><p>{}</p><small>{}</small></article>", item.kind, escape(&item.state), escape(item.next_step.as_deref().unwrap_or("No next step recorded.")))).collect()
+    items
+        .iter()
+        .map(|item| {
+            let provenance = item
+                .sources
+                .iter()
+                .map(|source| {
+                    format!(
+                        "session {} ({} events)",
+                        source.session_id,
+                        source.event_ids.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "<article class='handoff-item'><strong>{:?}{}</strong><p>{}</p><small>{}</small><small>{}</small><small>Sources: {} · confirmed {}</small></article>",
+                item.kind,
+                if item.low_confidence { " · low confidence" } else { "" },
+                escape(&item.state),
+                escape(
+                    &item
+                        .next_step
+                        .as_deref()
+                        .map(|step| format!("Next: {step}"))
+                        .unwrap_or_else(|| "No next step recorded.".to_owned())
+                ),
+                escape(
+                    &item
+                        .blocker
+                        .as_deref()
+                        .map(|blocker| format!("Blocked by: {blocker}"))
+                        .unwrap_or_default()
+                ),
+                escape(&provenance),
+                item.last_confirmed_at.format("%Y-%m-%d"),
+            )
+        })
+        .collect()
 }
 
 fn session_evidence_row(event: &NormalizedEvent) -> String {

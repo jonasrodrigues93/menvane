@@ -555,6 +555,17 @@ mod tests {
         let session_id = finalized.dedupe_key.parse().unwrap();
         let events = menvane.session_events(session_id).unwrap();
         assert_eq!(events.len(), scan.sessions[0].events.len());
+        let sessions_before = menvane.sessions(100).unwrap();
+        let handoff_before = menvane.current_handoff_items(None).unwrap();
+        let memories_before = menvane.all_memories().unwrap();
+        assert_eq!(
+            menvane.import_session(scan.sessions[0].clone()).unwrap(),
+            ImportOutcome::AlreadyImported
+        );
+        assert_eq!(menvane.sessions(100).unwrap(), sessions_before);
+        assert_eq!(menvane.current_handoff_items(None).unwrap(), handoff_before);
+        assert_eq!(menvane.all_memories().unwrap(), memories_before);
+        assert_eq!(menvane.session_summary(session_id).unwrap(), None);
         assert!(
             events
                 .iter()

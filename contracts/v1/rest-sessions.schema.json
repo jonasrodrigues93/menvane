@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["id", "client", "external_session_id", "project_id", "generation", "state", "started_at", "ended_at", "last_event_at", "imported", "summary_status"],
+    "properties": {
+      "id": { "type": "string", "format": "uuid" },
+      "client": { "type": "string" },
+      "external_session_id": { "type": "string" },
+      "project_id": { "type": ["string", "null"] },
+      "generation": { "type": "integer", "minimum": 0 },
+      "state": { "enum": ["open", "idle", "finalized"] },
+      "started_at": { "type": "string" },
+      "ended_at": { "type": ["string", "null"] },
+      "last_event_at": { "type": "string" },
+      "imported": { "type": "boolean" },
+      "summary_status": { "enum": ["pending", "ready", "skipped"] }
+    }
+  }
+}

@@ -40,3 +40,4 @@ tower = { version = "0.5", features = ["util"] }
 url = "2.5"
 webbrowser = "1.0"
 uuid = { version = "1.18", features = ["serde", "v7"] }
+jsonschema = { version = "0.49", default-features = false }

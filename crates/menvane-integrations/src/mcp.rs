@@ -518,6 +518,7 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 mod tests {
     use std::io::Cursor;
 
+    use jsonschema::validator_for;
     use tempfile::TempDir;
 
     use super::*;
@@ -590,6 +591,30 @@ mod tests {
             read_schema["x-max-provenance-items"],
             MAX_MCP_METADATA_ITEMS
         );
+    }
+
+    #[test]
+    fn tools_list_matches_the_versioned_contract() {
+        let temporary = TempDir::new().unwrap();
+        let project = temporary.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n"
+        );
+        let mut output = Vec::new();
+        McpServer::new(&menvane, project)
+            .serve(Cursor::new(input), &mut output)
+            .unwrap();
+        let responses = String::from_utf8(output).unwrap();
+        let response: Value = serde_json::from_str(responses.lines().nth(1).unwrap()).unwrap();
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../contracts/v1/mcp-tools-list.schema.json"
+        ))
+        .unwrap();
+        assert!(validator_for(&schema).unwrap().is_valid(&response));
     }
 
     #[test]
