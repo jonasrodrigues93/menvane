@@ -52,9 +52,15 @@ Phase 10 validation notes:
 - Isolated recall returned HTTP 200 with zero results after the resolved handoff, and isolated reindex, doctor, and daemon restart all passed.
 - Direct current-release hook validation completed for Claude Code, Codex, and OpenCode in a temporary home. Each client produced session-start and prompt recall responses, captured tool/session-end events, finalized a session, and reached summary status `ready`. The original daemon was restored and reports healthy on `47831`.
 
+Operational reset:
+
+- On user request, the live home was reinstalled without backup. Only the provider-only `[llm]` configuration and `oauth/openai.json` were retained; all sessions, memories, indexes, projects, logs, jobs, locks, and spool data are removed.
+- The installed binary matches `target/release/menvane` by SHA-256. The user service is disabled and the daemon is intentionally stopped so active integrations cannot repopulate the home before a fresh import.
+- The OpenCode integration was disconnected to prevent its active process from restarting the daemon during the reset. OAuth permissions remain `0600`.
+
 ## Resume Next
 
-1. Start the new Menvane instance after reviewing the Phase 10 smoke artifacts. No implementation phase remains in `plan.md`; future work is operational observation of real sessions and provider output.
+1. Import the historical sessions from zero. Re-enable the daemon and integrations only when ready to begin fresh capture.
 2. Keep `memory-model-analysis.md` untracked and untouched; it predates this handoff and is not part of the refactor commits.
 
 ## Constraints
