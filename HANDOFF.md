@@ -2,7 +2,7 @@
 
 ## Current State
 
-The continuity-first refactor is in progress. Phases 0 through 8 are committed and the workspace passes `cargo fmt --all -- --check`, locked workspace tests with all targets/features, and clippy with no Phase 8 warnings. Pre-existing warnings remain, targeted by Phase 9.
+The continuity-first refactor is in progress. Phases 0 through 9 are committed and the workspace passes formatting, strict locked Clippy, locked workspace tests with all targets/features, and a locked release build.
 
 Completed commits:
 
@@ -14,6 +14,7 @@ Completed commits:
 - `14ed82c feat: replace typed memories with context and playbooks`
 - `cca15bc refactor: make recall handoff and intent oriented`
 - `0fb11bf refactor!: replace legacy api and cli surfaces`
+- `e23e5ff refactor: remove legacy episode and goal infrastructure`
 
 Phase 3 was an operational home reset, not a repository commit. The old `~/.menvane` data was deleted after approval. Only the OpenAI provider configuration and `~/.menvane/oauth/openai.json` were preserved. The new home passed `provider status`, `doctor`, SQLite integrity checks, and foreign-key checks. OAuth permissions are `0600`.
 
@@ -34,14 +35,22 @@ Phase 8 notes:
 - Versioned JSON contracts under `contracts/v1` cover CLI handoff inspection, REST sessions/detail/handoff/recall/errors, and MCP tools. Contract tests validate live REST and MCP responses; CLI shape is validated against the same checked-in schema.
 - Import re-ingestion tests verify session, summary, handoff, and knowledge state remains unchanged. Clean-home reopen coverage complements the existing per-integration connect/disconnect tests.
 
+Phase 9 notes:
+
+- Removed the orphaned Phase 0 baseline/corpus fixtures and the unused session packet/compiler-era renderer helper.
+- Renamed the remaining session-start delivery API from `session_briefing` to `session_start_context`; no typed briefing API remains.
+- Removed the remaining legacy vocabulary from executable tests and tightened the daemon lock/open-option and session-status code to satisfy strict Clippy.
+- Legacy infrastructure grep is clear except for deliberate absence coverage for `/api/v1/goals` and a normal handoff test phrase containing “in progress”.
+- `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`, `cargo test --locked --workspace --all-targets --all-features`, and `cargo build --release --locked` pass.
+
 ## Resume Next
 
-1. Phase 9: remove legacy infrastructure and harden invariants (`refactor: remove legacy episode and goal infrastructure`). Scope per `plan.md` lines 318-337:
-   - remove legacy episode/goal tables, types, methods, tests, documentation, versioned handoffs, cards, typed briefing, and compiler infrastructure;
-   - split large modules only where needed by responsibility;
-   - remove incompatible decay/multiplier configuration;
-   - ensure `product.md` documents only final current behavior;
-   - checkpoint with legacy-vocabulary grep, locked clippy/tests/build, and a clean-home end-to-end capture/finalization/consolidation/resume/recall/reindex/restart flow.
+1. Phase 10: validate development with real sessions and the preserved provider. Scope per `plan.md` lines 339-346:
+   - confirm the preserved provider is configured and `provider status` returns `Ready`;
+   - run consolidation smoke sessions covering summary-only, new handoff, handoff closure, and zero promotion;
+   - correct schema, reference, or contamination failures before proceeding;
+   - manually exercise Claude Code, Codex, and OpenCode sessions in temporary homes;
+   - inspect summaries, handoff transitions, knowledge promotion, and continuation context before starting the new Menvane instance.
 2. Keep `memory-model-analysis.md` untracked and untouched; it predates this handoff and is not part of the refactor commits.
 
 ## Constraints
