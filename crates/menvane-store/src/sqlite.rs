@@ -37,7 +37,11 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     source_sessions_json TEXT NOT NULL DEFAULT '[]',
-    supersedes_json TEXT NOT NULL DEFAULT '[]'
+    supersedes_json TEXT NOT NULL DEFAULT '[]',
+    last_verified_at TEXT,
+    successes INTEGER,
+    failures INTEGER,
+    source_project_ids_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS memories_scope_project ON memories(scope, project_id);
 CREATE INDEX IF NOT EXISTS memories_status ON memories(status);
@@ -115,6 +119,7 @@ impl IndexStore {
         connection.execute_batch("PRAGMA journal_mode = WAL;")?;
         reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        ensure_memory_columns(&connection)?;
         connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         Ok(())
     }
@@ -491,6 +496,7 @@ impl IndexStore {
         configure_connection(&connection, false)?;
         reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        ensure_memory_columns(&connection)?;
         connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         let project_files = markdown.project_files()?;
         for path in &project_files {
@@ -622,9 +628,9 @@ fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Resul
         [metadata.id.to_string()],
     )?;
     connection.execute(
-            "INSERT INTO memories(id, type, scope, project_id, title, status, path, body, applicability_json, tags_json, created_at, updated_at, source_sessions_json, supersedes_json)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-          ON CONFLICT(id) DO UPDATE SET type=excluded.type, scope=excluded.scope, project_id=excluded.project_id, title=excluded.title, status=excluded.status, path=excluded.path, body=excluded.body, applicability_json=excluded.applicability_json, tags_json=excluded.tags_json, updated_at=excluded.updated_at, source_sessions_json=excluded.source_sessions_json, supersedes_json=excluded.supersedes_json",
+            "INSERT INTO memories(id, type, scope, project_id, title, status, path, body, applicability_json, tags_json, created_at, updated_at, source_sessions_json, supersedes_json, last_verified_at, successes, failures, source_project_ids_json)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+           ON CONFLICT(id) DO UPDATE SET type=excluded.type, scope=excluded.scope, project_id=excluded.project_id, title=excluded.title, status=excluded.status, path=excluded.path, body=excluded.body, applicability_json=excluded.applicability_json, tags_json=excluded.tags_json, updated_at=excluded.updated_at, source_sessions_json=excluded.source_sessions_json, supersedes_json=excluded.supersedes_json, last_verified_at=excluded.last_verified_at, successes=excluded.successes, failures=excluded.failures, source_project_ids_json=excluded.source_project_ids_json",
         params![
             metadata.id.to_string(),
             metadata.knowledge_type.to_string(),
@@ -640,6 +646,10 @@ fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Resul
             metadata.updated_at.to_rfc3339(),
             serde_json::to_string(&metadata.source_sessions)?,
             serde_json::to_string(&metadata.supersedes)?,
+            metadata.last_verified_at.map(|value| value.to_rfc3339()),
+            metadata.successes,
+            metadata.failures,
+            serde_json::to_string(&metadata.source_project_ids)?,
         ],
     )?;
     connection.execute(
@@ -659,6 +669,27 @@ fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Resul
             .join(" "),
         ],
     )?;
+    Ok(())
+}
+
+fn ensure_memory_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(memories)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, definition) in [
+        ("last_verified_at", "TEXT"),
+        ("successes", "INTEGER"),
+        ("failures", "INTEGER"),
+        ("source_project_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            connection.execute(
+                &format!("ALTER TABLE memories ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 

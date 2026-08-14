@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use chrono::{TimeZone, Utc};
 use menvane_domain::{
     Applicability, HandoffItem, HandoffItemKind, HandoffItemSource, JsonSchema, KnowledgeType,
-    LlmError, LlmErrorKind, LlmProvider, LlmRequest, NormalizedEvent, NormalizedEventKind,
-    ProviderCapabilities, ProviderHealth, ResponseUsage, Scope, StructuredResponse,
+    LlmError, LlmErrorKind, LlmProvider, LlmRequest, MemoryStatus, NormalizedEvent,
+    NormalizedEventKind, ProviderCapabilities, ProviderHealth, ResponseUsage, Scope,
+    StructuredResponse,
 };
 use menvane_engine::{CaptureOutcome, Menvane, ScopeSelection, WriteMemory};
 use menvane_store::{MarkdownStore, SessionRepository};
@@ -130,6 +131,145 @@ fn context_and_playbook_round_trip_through_markdown_and_search() {
 }
 
 #[test]
+fn inferred_context_and_playbook_cross_the_promotion_barrier() {
+    let (_temporary, project, _provider, menvane) =
+        setup_provider(vec![Ok(promotion_result()), Ok(promotion_result())]);
+    let timestamp = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+    menvane
+        .ingest_event(event(
+            &project,
+            "prompt",
+            NormalizedEventKind::UserPrompt,
+            timestamp,
+            Some("deploy through the remote runner"),
+            None,
+        ))
+        .unwrap();
+    let mut tool = event(
+        &project,
+        "tool",
+        NormalizedEventKind::ToolCompleted,
+        timestamp + chrono::Duration::seconds(1),
+        Some("deploy"),
+        Some("deployment verified through the remote runner"),
+    );
+    tool.success = Some(true);
+    menvane.ingest_event(tool).unwrap();
+    menvane
+        .ingest_event(event(
+            &project,
+            "end",
+            NormalizedEventKind::SessionEnded,
+            timestamp + chrono::Duration::seconds(2),
+            None,
+            None,
+        ))
+        .unwrap();
+    process_next_job(&menvane);
+    process_next_job(&menvane);
+
+    let memories = menvane.all_memories().unwrap();
+    assert_eq!(memories.len(), 2);
+    assert_eq!(
+        memories
+            .iter()
+            .find(|memory| memory.metadata.knowledge_type == KnowledgeType::Context)
+            .unwrap()
+            .metadata
+            .status,
+        MemoryStatus::Active
+    );
+    assert_eq!(
+        memories
+            .iter()
+            .find(|memory| memory.metadata.knowledge_type == KnowledgeType::Playbook)
+            .unwrap()
+            .metadata
+            .status,
+        MemoryStatus::Candidate
+    );
+}
+
+#[test]
+fn playbook_application_is_independent_and_idempotent() {
+    let (_temporary, project, provider, menvane) =
+        setup_provider(vec![Ok(promotion_result()), Ok(promotion_result())]);
+    ingest_promotion_session(&menvane, &project);
+    process_next_job(&menvane);
+    process_next_job(&menvane);
+    assert_eq!(provider.call_count(), 1);
+    let playbook = menvane
+        .all_memories()
+        .unwrap()
+        .into_iter()
+        .find(|memory| memory.metadata.knowledge_type == KnowledgeType::Playbook)
+        .unwrap();
+
+    assert!(
+        menvane
+            .apply_playbook(playbook.metadata.id, Uuid::from_u128(1), true)
+            .unwrap()
+    );
+    assert!(
+        !menvane
+            .apply_playbook(playbook.metadata.id, Uuid::from_u128(1), true)
+            .unwrap()
+    );
+    assert!(
+        menvane
+            .apply_playbook(playbook.metadata.id, Uuid::from_u128(2), false)
+            .unwrap()
+    );
+    assert!(
+        menvane
+            .apply_playbook(playbook.metadata.id, Uuid::from_u128(3), true)
+            .unwrap()
+    );
+
+    let applied = menvane
+        .read_without_recording(playbook.metadata.id)
+        .unwrap();
+    assert_eq!(applied.metadata.status, MemoryStatus::Active);
+    assert_eq!(applied.metadata.successes, Some(2));
+    assert_eq!(applied.metadata.failures, Some(1));
+}
+
+#[test]
+fn forgotten_memory_is_not_recreated_by_an_explicit_duplicate_write() {
+    let (_temporary, project, menvane) = setup_project();
+    let memory = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "External deployment constraint".to_owned(),
+                body: "The deployment requires an external approval window.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    menvane.forget(memory.metadata.id).unwrap();
+    assert!(
+        menvane
+            .write(
+                &project,
+                WriteMemory {
+                    title: memory.title,
+                    body: memory.body,
+                    knowledge_type: KnowledgeType::Context,
+                    scope: Scope::Project,
+                    tags: Vec::new(),
+                    applies_to: Applicability::default(),
+                },
+            )
+            .is_err()
+    );
+    assert_eq!(menvane.all_memories().unwrap().len(), 1);
+}
+
+#[test]
 fn normalized_session_capture_is_sanitized_ordered_and_provider_independent() {
     let (_temporary, project, menvane) = setup_project();
     let timestamp = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
@@ -234,6 +374,7 @@ fn consolidation_preserves_chronology_and_records_execution() {
         repository.session(session.id).unwrap().summary_status,
         menvane_domain::SummaryStatus::Ready
     );
+    assert!(menvane.all_memories().unwrap().is_empty());
 }
 
 #[test]
@@ -264,6 +405,95 @@ fn unavailable_provider_keeps_pending_session_and_retryable_job() {
     assert_eq!(consolidation_job.status, "pending");
     assert!(consolidation_job.last_error.unwrap().contains("offline"));
     assert_eq!(provider.call_count(), 1);
+    assert!(menvane.all_memories().unwrap().is_empty());
+}
+
+#[test]
+fn consolidation_merge_and_supersede_apply_lifecycle_operations() {
+    let (_temporary, project, provider, menvane) = setup_provider(Vec::new());
+    let first = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Export path".to_owned(),
+                body: "The export path uses the remote runner.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    let second = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Export verification".to_owned(),
+                body: "Export verification uses the remote runner output.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    let third = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Old export rule".to_owned(),
+                body: "The old export rule uses a local runner.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    provider
+        .responses
+        .lock()
+        .unwrap()
+        .push(Ok(merge_and_supersede_result(
+            first.metadata.id,
+            second.metadata.id,
+            third.metadata.id,
+        )));
+    ingest_promotion_session(&menvane, &project);
+    process_next_job(&menvane);
+    process_next_job(&menvane);
+
+    let memories = menvane.all_memories().unwrap();
+    assert_eq!(
+        memories
+            .iter()
+            .find(|memory| memory.metadata.id == first.metadata.id)
+            .unwrap()
+            .body,
+        "Merged export guidance"
+    );
+    assert_eq!(
+        memories
+            .iter()
+            .find(|memory| memory.metadata.id == second.metadata.id)
+            .unwrap()
+            .metadata
+            .status,
+        MemoryStatus::Superseded
+    );
+    assert_eq!(
+        memories
+            .iter()
+            .find(|memory| memory.metadata.id == third.metadata.id)
+            .unwrap()
+            .metadata
+            .status,
+        MemoryStatus::Superseded
+    );
+    assert!(memories.iter().any(|memory| {
+        memory.title == "Replacement export rule"
+            && memory.metadata.supersedes == vec![third.metadata.id]
+    }));
 }
 
 #[test]
@@ -510,6 +740,25 @@ fn reindex_rebuilds_knowledge_without_touching_session_state() {
             },
         )
         .unwrap();
+    let playbook = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Reindex playbook marker".to_owned(),
+                body: "Use the marker and verify the result after reindex.".to_owned(),
+                knowledge_type: KnowledgeType::Playbook,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    menvane
+        .apply_playbook(playbook.metadata.id, Uuid::from_u128(100), true)
+        .unwrap();
+    let before_reindex = menvane
+        .read_without_recording(playbook.metadata.id)
+        .unwrap();
     menvane
         .ingest_event(event(
             &project,
@@ -533,6 +782,12 @@ fn reindex_rebuilds_knowledge_without_touching_session_state() {
         menvane_domain::SessionState::Open
     );
     assert_eq!(menvane.read(memory.metadata.id).unwrap(), memory);
+    assert_eq!(
+        menvane
+            .read_without_recording(playbook.metadata.id)
+            .unwrap(),
+        before_reindex
+    );
     assert_eq!(
         menvane
             .search(&project, "canonical context", ScopeSelection::Project, 10)
@@ -596,6 +851,40 @@ fn ingest_meaningful_session(menvane: &Menvane, project: &Path) {
         .unwrap();
 }
 
+fn ingest_promotion_session(menvane: &Menvane, project: &Path) {
+    let timestamp = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+    menvane
+        .ingest_event(event(
+            project,
+            "prompt",
+            NormalizedEventKind::UserPrompt,
+            timestamp,
+            Some("continue the export"),
+            None,
+        ))
+        .unwrap();
+    let mut tool = event(
+        project,
+        "tool",
+        NormalizedEventKind::ToolCompleted,
+        timestamp + chrono::Duration::seconds(1),
+        Some("deploy"),
+        Some("deployment verified"),
+    );
+    tool.success = Some(true);
+    menvane.ingest_event(tool).unwrap();
+    menvane
+        .ingest_event(event(
+            project,
+            "end",
+            NormalizedEventKind::SessionEnded,
+            timestamp + chrono::Duration::seconds(2),
+            None,
+            None,
+        ))
+        .unwrap();
+}
+
 fn valid_result() -> serde_json::Value {
     serde_json::json!({
         "summary": {
@@ -609,6 +898,68 @@ fn valid_result() -> serde_json::Value {
         "handoff": [],
         "knowledge": []
     })
+}
+
+fn promotion_result() -> serde_json::Value {
+    let mut result = valid_result();
+    result["knowledge"] = serde_json::json!([
+        {
+            "operation": "create",
+            "target_memory_ids": [],
+            "knowledge_type": "context",
+            "title": "Remote deployment approval",
+            "scope": "project",
+            "scope_confidence": 0.95,
+            "applies_to": {},
+            "content": {"context": {"body": "Remote deployments require an external approval window before verification."}},
+            "evidence_event_ids": ["tool"],
+            "contradicting_event_ids": []
+        },
+        {
+            "operation": "create",
+            "target_memory_ids": [],
+            "knowledge_type": "playbook",
+            "title": "Verify remote deployment",
+            "scope": "project",
+            "scope_confidence": 0.95,
+            "applies_to": {},
+            "content": {"playbook": {"trigger": "When deploying remotely", "applicability": {}, "steps": ["Request approval", "Deploy remotely"], "validation": ["Confirm deployment output"], "failure_handling": "Stop and request approval again."}},
+            "evidence_event_ids": ["tool"],
+            "contradicting_event_ids": []
+        }
+    ]);
+    result
+}
+
+fn merge_and_supersede_result(first: Uuid, second: Uuid, third: Uuid) -> serde_json::Value {
+    let mut result = valid_result();
+    result["knowledge"] = serde_json::json!([
+        {
+            "operation": "merge",
+            "target_memory_ids": [first, second],
+            "knowledge_type": "context",
+            "title": "Merged export guidance",
+            "scope": "project",
+            "scope_confidence": 0.95,
+            "applies_to": {},
+            "content": {"context": {"body": "Merged export guidance"}},
+            "evidence_event_ids": ["tool"],
+            "contradicting_event_ids": []
+        },
+        {
+            "operation": "supersede",
+            "target_memory_ids": [third],
+            "knowledge_type": "context",
+            "title": "Replacement export rule",
+            "scope": "project",
+            "scope_confidence": 0.95,
+            "applies_to": {},
+            "content": {"context": {"body": "The replacement export rule uses the remote runner."}},
+            "evidence_event_ids": ["tool"],
+            "contradicting_event_ids": []
+        }
+    ]);
+    result
 }
 
 fn transition_result(operation: &str, item_id: Uuid) -> serde_json::Value {

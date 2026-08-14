@@ -267,6 +267,9 @@ impl Menvane {
         if request.title.trim().is_empty() {
             bail!("memory title cannot be empty");
         }
+        if request.body.trim().is_empty() {
+            bail!("memory body cannot be empty");
+        }
         let project = match request.scope {
             Scope::Project => self.ensure_project(cwd)?,
             Scope::Global => None,
@@ -285,6 +288,9 @@ impl Menvane {
             title: request.title.trim().to_owned(),
             body: request.body.trim().to_owned(),
         };
+        if self.duplicate_memory(&memory.metadata, &memory.title, &memory.body)? {
+            bail!("equivalent memory already exists");
+        }
         let path = self.markdown.write_memory(&memory, project.as_ref())?;
         self.index.upsert_memory(&memory, &path)?;
         self.markdown
@@ -457,6 +463,50 @@ impl Menvane {
         memory_id: Uuid,
     ) -> Result<(u64, Option<chrono::DateTime<Utc>>)> {
         self.sessions.meaningful_access(memory_id)
+    }
+
+    pub fn apply_playbook(
+        &self,
+        memory_id: Uuid,
+        session_id: Uuid,
+        successful: bool,
+    ) -> Result<bool> {
+        let (mut memory, path) = self.index.read_memory(&self.markdown, memory_id)?;
+        if memory.metadata.knowledge_type != KnowledgeType::Playbook {
+            bail!("memory is not a playbook");
+        }
+        if memory.metadata.status == MemoryStatus::Forgotten {
+            return Ok(false);
+        }
+        if !self
+            .sessions
+            .record_application(memory_id, session_id, successful)?
+        {
+            return Ok(false);
+        }
+        self.sessions.record_access(
+            memory_id,
+            if successful {
+                ReinforcementSignal::SuccessfullyApplied
+            } else {
+                ReinforcementSignal::FailedApplication
+            },
+        )?;
+        if successful {
+            let successes = memory.metadata.successes.get_or_insert(0);
+            *successes = successes.saturating_add(1);
+            if memory.metadata.status == MemoryStatus::Candidate && *successes >= 2 {
+                memory.metadata.status = MemoryStatus::Active;
+            }
+            memory.metadata.last_verified_at = Some(Utc::now());
+        } else {
+            let failures = memory.metadata.failures.get_or_insert(0);
+            *failures = failures.saturating_add(1);
+        }
+        memory.metadata.updated_at = Utc::now();
+        self.markdown.update_memory(&path, &memory)?;
+        self.index.upsert_memory(&memory, &path)?;
+        Ok(true)
     }
 
     pub fn session_briefing(&self, cwd: &Path, session_key: &str) -> Result<String> {
@@ -1184,6 +1234,9 @@ impl Menvane {
             KnowledgeOperationKind::Reinforce => {
                 if let Some(id) = operation.target_memory_ids.first() {
                     let (mut memory, path) = self.index.read_memory(&self.markdown, *id)?;
+                    if memory.metadata.status == MemoryStatus::Forgotten {
+                        return Ok(());
+                    }
                     if memory.metadata.source_sessions.contains(&session_id) {
                         return Ok(());
                     }
@@ -1224,14 +1277,14 @@ impl Menvane {
                 metadata.id =
                     deterministic_uuid(session_id, &[index.to_string()], title.as_bytes());
                 metadata.source_sessions.push(session_id);
-                if self.index.read_memory(&self.markdown, metadata.id).is_ok() {
-                    return Ok(());
-                }
                 let body = operation
                     .content
                     .as_ref()
                     .map(content_markdown)
                     .context("create operation has no content")?;
+                if self.duplicate_memory(&metadata, &title, &body)? {
+                    return Ok(());
+                }
                 let memory = Memory {
                     metadata,
                     title,
@@ -1243,9 +1296,41 @@ impl Menvane {
                     .commit(&format!("feat(memory): consolidate {session_id}:{index}"));
                 Ok(())
             }
-            KnowledgeOperationKind::Merge | KnowledgeOperationKind::Supersede => {
-                for id in &operation.target_memory_ids {
-                    let (mut memory, path) = self.index.read_memory(&self.markdown, *id)?;
+            KnowledgeOperationKind::Merge => {
+                let mut targets = operation
+                    .target_memory_ids
+                    .iter()
+                    .filter_map(|id| self.index.read_memory(&self.markdown, *id).ok())
+                    .filter(|(memory, _)| memory.metadata.status != MemoryStatus::Forgotten)
+                    .collect::<Vec<_>>();
+                let Some((mut survivor, survivor_path)) = targets.first().cloned() else {
+                    return Ok(());
+                };
+                let body = operation
+                    .content
+                    .as_ref()
+                    .map(content_markdown)
+                    .context("merge operation has no content")?;
+                survivor.title = operation.title.clone().unwrap_or(survivor.title);
+                survivor.body = body;
+                if !survivor.metadata.source_sessions.contains(&session_id) {
+                    survivor.metadata.source_sessions.push(session_id);
+                }
+                survivor.metadata.applies_to = operation.applies_to.clone();
+                survivor.metadata.updated_at = Utc::now();
+                for (memory, _) in targets.iter().skip(1) {
+                    for source_session in &memory.metadata.source_sessions {
+                        if !survivor.metadata.source_sessions.contains(source_session) {
+                            survivor.metadata.source_sessions.push(*source_session);
+                        }
+                    }
+                    if !survivor.metadata.supersedes.contains(&memory.metadata.id) {
+                        survivor.metadata.supersedes.push(memory.metadata.id);
+                    }
+                }
+                self.markdown.update_memory(&survivor_path, &survivor)?;
+                self.index.upsert_memory(&survivor, &survivor_path)?;
+                for (mut memory, path) in targets.drain(1..) {
                     if memory.metadata.status == MemoryStatus::Superseded {
                         continue;
                     }
@@ -1256,7 +1341,85 @@ impl Menvane {
                 }
                 Ok(())
             }
+            KnowledgeOperationKind::Supersede => {
+                let mut superseded = Vec::new();
+                for id in &operation.target_memory_ids {
+                    let Ok((mut memory, path)) = self.index.read_memory(&self.markdown, *id) else {
+                        continue;
+                    };
+                    if memory.metadata.status == MemoryStatus::Forgotten {
+                        continue;
+                    }
+                    superseded.push(memory.metadata.id);
+                    if memory.metadata.status != MemoryStatus::Superseded {
+                        memory.metadata.status = MemoryStatus::Superseded;
+                        memory.metadata.updated_at = Utc::now();
+                        self.markdown.update_memory(&path, &memory)?;
+                        self.index.upsert_memory(&memory, &path)?;
+                    }
+                }
+                if superseded.is_empty() {
+                    return Ok(());
+                }
+                let knowledge_type = operation
+                    .knowledge_type
+                    .context("supersede operation has no knowledge type")?;
+                let title = operation
+                    .title
+                    .clone()
+                    .context("supersede operation has no title")?;
+                let body = operation
+                    .content
+                    .as_ref()
+                    .map(content_markdown)
+                    .context("supersede operation has no content")?;
+                let project = if operation.scope == Some(Scope::Project) {
+                    self.project_for_id(project_id)?
+                } else {
+                    None
+                };
+                let scope = project
+                    .as_ref()
+                    .map_or(Scope::Global, |_| operation.scope.unwrap_or(Scope::Project));
+                let mut metadata = MemoryMetadata::new(
+                    knowledge_type,
+                    scope,
+                    project.as_ref().map(|value| value.id.clone()),
+                    Vec::new(),
+                    operation.applies_to.clone(),
+                    if knowledge_type == KnowledgeType::Playbook {
+                        MemoryStatus::Candidate
+                    } else {
+                        MemoryStatus::Active
+                    },
+                );
+                metadata.id =
+                    deterministic_uuid(session_id, &[index.to_string()], title.as_bytes());
+                metadata.source_sessions.push(session_id);
+                metadata.supersedes = superseded;
+                if self.index.read_memory(&self.markdown, metadata.id).is_ok() {
+                    return Ok(());
+                }
+                let memory = Memory {
+                    metadata,
+                    title,
+                    body,
+                };
+                let path = self.markdown.write_memory(&memory, project.as_ref())?;
+                self.index.upsert_memory(&memory, &path)?;
+                Ok(())
+            }
         }
+    }
+
+    fn duplicate_memory(&self, metadata: &MemoryMetadata, title: &str, body: &str) -> Result<bool> {
+        let title = normalize_memory_text(title);
+        let body = normalize_memory_text(body);
+        Ok(self.all_memories()?.into_iter().any(|memory| {
+            memory.metadata.knowledge_type == metadata.knowledge_type
+                && normalize_memory_text(&memory.title) == title
+                && normalize_memory_text(&memory.body) == body
+        }))
     }
 
     fn related_memories(
@@ -1544,6 +1707,15 @@ fn lexical_tokens(value: &str) -> HashSet<String> {
         .filter(|token| token.len() >= 3)
         .collect()
 }
+
+fn normalize_memory_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn content_identifier(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }

@@ -234,8 +234,114 @@ pub fn validate_consolidation_result(
             ));
         }
         validate_knowledge_operation(operation)?;
+        validate_knowledge_promotion(packet, operation)?;
     }
     Ok(())
+}
+
+pub fn validate_knowledge_promotion(
+    packet: &ConsolidationPacket,
+    operation: &KnowledgeOperation,
+) -> Result<(), ConsolidationValidationError> {
+    if matches!(
+        operation.operation,
+        KnowledgeOperationKind::NoOp | KnowledgeOperationKind::Reinforce
+    ) {
+        return Ok(());
+    }
+    if operation.evidence_event_ids.is_empty() {
+        return Err(ConsolidationValidationError(
+            "knowledge promotion needs observable evidence".into(),
+        ));
+    }
+    let observable = packet.events.iter().any(|event| {
+        operation
+            .evidence_event_ids
+            .iter()
+            .any(|id| id == &event.event_id)
+            && (event.success == Some(true)
+                || event
+                    .bounded_output
+                    .as_deref()
+                    .is_some_and(|output| !output.trim().is_empty()))
+    });
+    if !observable {
+        return Err(ConsolidationValidationError(
+            "knowledge promotion needs observable evidence".into(),
+        ));
+    }
+    if operation
+        .title
+        .as_deref()
+        .is_none_or(|title| title.split_whitespace().count() < 1)
+    {
+        return Err(ConsolidationValidationError(
+            "knowledge promotion needs a retrieval title".into(),
+        ));
+    }
+    let text = knowledge_text(operation);
+    if text.trim().is_empty() || text.split_whitespace().count() < 3 {
+        return Err(ConsolidationValidationError(
+            "knowledge promotion needs retrievable content".into(),
+        ));
+    }
+    let lower = text.to_ascii_lowercase();
+    let task_state = ["in progress", "current task", "implemented behavior"]
+        .iter()
+        .any(|term| lower.contains(term))
+        || lower
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|word| matches!(word, "pending" | "todo"));
+    if task_state {
+        return Err(ConsolidationValidationError(
+            "task state or evident behavior cannot become knowledge".into(),
+        ));
+    }
+    if operation.target_memory_ids.iter().any(|id| {
+        packet
+            .related_memories
+            .iter()
+            .any(|memory| memory.id == *id && memory.status == MemoryStatus::Forgotten)
+    }) {
+        return Err(ConsolidationValidationError(
+            "forgotten knowledge cannot be promoted".into(),
+        ));
+    }
+    if packet.related_memories.iter().any(|memory| {
+        memory.status != MemoryStatus::Forgotten
+            && memory.knowledge_type == operation.knowledge_type.unwrap_or(memory.knowledge_type)
+            && normalize_knowledge_text(&memory.title)
+                == normalize_knowledge_text(operation.title.as_deref().unwrap_or_default())
+            && normalize_knowledge_text(&memory.body) == normalize_knowledge_text(&text)
+    }) {
+        return Err(ConsolidationValidationError(
+            "duplicate knowledge cannot be promoted".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn knowledge_text(operation: &KnowledgeOperation) -> String {
+    match operation.content.as_ref() {
+        Some(KnowledgeContent::Context(value)) => value.body.clone(),
+        Some(KnowledgeContent::Playbook(value)) => format!(
+            "{} {} {} {} {}",
+            value.trigger,
+            value.steps.join(" "),
+            value.validation.join(" "),
+            value.failure_handling,
+            serde_json::to_string(&value.applicability).unwrap_or_default()
+        ),
+        None => String::new(),
+    }
+}
+
+fn normalize_knowledge_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn preserve_handoff_transitions(
@@ -598,5 +704,73 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("every previous handoff item"));
+    }
+
+    fn promotion_packet() -> ConsolidationPacket {
+        let timestamp = Utc.timestamp_opt(1, 0).single().unwrap();
+        ConsolidationPacket {
+            session_id: Uuid::from_u128(2),
+            events: vec![NormalizedEvent {
+                event_id: "tool".to_owned(),
+                kind: crate::session::NormalizedEventKind::ToolCompleted,
+                origin: crate::session::NormalizedEventOrigin::Tool,
+                role: crate::session::NormalizedEventRole::ToolActivity,
+                client: "test".to_owned(),
+                external_session_id: "session".to_owned(),
+                timestamp,
+                cwd: "/project".to_owned(),
+                project_id: None,
+                tool_family: None,
+                bounded_input: None,
+                bounded_output: Some("deployment verified".to_owned()),
+                attributed_path: None,
+                success: Some(true),
+                model: None,
+                harness_injected: false,
+            }],
+            handoff_items: Vec::new(),
+            related_summaries: Vec::new(),
+            related_memories: Vec::new(),
+        }
+    }
+
+    fn promotion_operation(body: &str) -> KnowledgeOperation {
+        KnowledgeOperation {
+            operation: KnowledgeOperationKind::Create,
+            target_memory_ids: Vec::new(),
+            knowledge_type: Some(KnowledgeType::Context),
+            title: Some("External deployment constraint".to_owned()),
+            scope: Some(Scope::Project),
+            scope_confidence: Some(0.95),
+            applies_to: Applicability::default(),
+            content: Some(KnowledgeContent::Context(ContextContent {
+                body: body.to_owned(),
+            })),
+            evidence_event_ids: vec!["tool".to_owned()],
+            contradicting_event_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn promotion_barrier_accepts_reusable_content_without_task_state_words() {
+        let packet = promotion_packet();
+        let operation = promotion_operation(
+            "When appending to the deployment log, keep entries single line to limit spending.",
+        );
+        validate_knowledge_promotion(&packet, &operation).unwrap();
+    }
+
+    #[test]
+    fn promotion_barrier_rejects_temporary_task_state() {
+        let packet = promotion_packet();
+        for body in [
+            "The export fix is pending review tomorrow.",
+            "The remaining todo is wiring the exporter.",
+            "The exporter refactor is in progress.",
+            "The current task blocks the exporter release.",
+            "The implemented behavior lives in the exporter module.",
+        ] {
+            assert!(validate_knowledge_promotion(&packet, &promotion_operation(body)).is_err());
+        }
     }
 }

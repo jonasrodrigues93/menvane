@@ -10,7 +10,7 @@ pub use consolidation::{
     ConsolidationExecution, ConsolidationPacket, ConsolidationResult, ConsolidationValidationError,
     ContextContent, KnowledgeContent, KnowledgeOperation, KnowledgeOperationKind, PlaybookContent,
     RelatedMemory, RelatedSummary, consolidation_result_schema, preserve_handoff_transitions,
-    validate_consolidation_result,
+    validate_consolidation_result, validate_knowledge_promotion,
 };
 pub use handoff::{
     HandoffCreation, HandoffItem, HandoffItemKind, HandoffItemOperation, HandoffItemSource,
