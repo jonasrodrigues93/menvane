@@ -15,6 +15,7 @@ Completed commits:
 - `cca15bc refactor: make recall handoff and intent oriented`
 - `0fb11bf refactor!: replace legacy api and cli surfaces`
 - `e23e5ff refactor: remove legacy episode and goal infrastructure`
+- `2008fc9 fix: validate consolidation response schema`
 
 Phase 3 was an operational home reset, not a repository commit. The old `~/.menvane` data was deleted after approval. Only the OpenAI provider configuration and `~/.menvane/oauth/openai.json` were preserved. The new home passed `provider status`, `doctor`, SQLite integrity checks, and foreign-key checks. OAuth permissions are `0600`.
 
@@ -43,14 +44,17 @@ Phase 9 notes:
 - Legacy infrastructure grep is clear except for deliberate absence coverage for `/api/v1/goals` and a normal handoff test phrase containing “in progress”.
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`, `cargo test --locked --workspace --all-targets --all-features`, and `cargo build --release --locked` pass.
 
+Phase 10 validation notes:
+
+- The preserved OpenAI provider reports `Ready`, `provider test` returns `{ "ok": true }`, and the current home doctor check passes.
+- An isolated temporary home using the preserved configuration completed real-provider smoke sessions: operational-only session skipped consolidation; summary-only session produced a completed summary with zero promotion; an unresolved export session produced a blocked summary and continuing handoff; a follow-up session produced a completed summary and resolved the handoff.
+- The first real request exposed that the consolidation response schema omitted `items` for `handoff`, `knowledge`, and summary continuity arrays. OpenAI rejected the strict schema before generation. Commit `2008fc9` adds complete strict schemas and a regression test; the smoke suite then passed with one provider attempt per meaningful session.
+- Isolated recall returned HTTP 200 with zero results after the resolved handoff, and isolated reindex, doctor, and daemon restart all passed.
+- Direct Claude/Codex/OpenCode hook sessions remain pending. The hook wrapper uses fixed port `47831`, which is occupied by the existing daemon; it was not interrupted during validation. Existing deterministic integration connect/disconnect and normalization tests pass.
+
 ## Resume Next
 
-1. Phase 10: validate development with real sessions and the preserved provider. Scope per `plan.md` lines 339-346:
-   - confirm the preserved provider is configured and `provider status` returns `Ready`;
-   - run consolidation smoke sessions covering summary-only, new handoff, handoff closure, and zero promotion;
-   - correct schema, reference, or contamination failures before proceeding;
-   - manually exercise Claude Code, Codex, and OpenCode sessions in temporary homes;
-   - inspect summaries, handoff transitions, knowledge promotion, and continuation context before starting the new Menvane instance.
+1. Finish Phase 10 manual integration validation in a temporary home by exercising Claude Code, Codex, and OpenCode hook sessions without interrupting the existing daemon, then inspect each captured session, recall context, and any handoff/knowledge output.
 2. Keep `memory-model-analysis.md` untracked and untouched; it predates this handoff and is not part of the refactor commits.
 
 ## Constraints
