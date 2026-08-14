@@ -50,11 +50,11 @@ Phase 10 validation notes:
 - An isolated temporary home using the preserved configuration completed real-provider smoke sessions: operational-only session skipped consolidation; summary-only session produced a completed summary with zero promotion; an unresolved export session produced a blocked summary and continuing handoff; a follow-up session produced a completed summary and resolved the handoff.
 - The first real request exposed that the consolidation response schema omitted `items` for `handoff`, `knowledge`, and summary continuity arrays. OpenAI rejected the strict schema before generation. Commit `2008fc9` adds complete strict schemas and a regression test; the smoke suite then passed with one provider attempt per meaningful session.
 - Isolated recall returned HTTP 200 with zero results after the resolved handoff, and isolated reindex, doctor, and daemon restart all passed.
-- Direct Claude/Codex/OpenCode hook sessions remain pending. The hook wrapper uses fixed port `47831`, which is occupied by the existing daemon; it was not interrupted during validation. Existing deterministic integration connect/disconnect and normalization tests pass.
+- Direct current-release hook validation completed for Claude Code, Codex, and OpenCode in a temporary home. Each client produced session-start and prompt recall responses, captured tool/session-end events, finalized a session, and reached summary status `ready`. The original daemon was restored and reports healthy on `47831`.
 
 ## Resume Next
 
-1. Finish Phase 10 manual integration validation in a temporary home by exercising Claude Code, Codex, and OpenCode hook sessions without interrupting the existing daemon, then inspect each captured session, recall context, and any handoff/knowledge output.
+1. Start the new Menvane instance after reviewing the Phase 10 smoke artifacts. No implementation phase remains in `plan.md`; future work is operational observation of real sessions and provider output.
 2. Keep `memory-model-analysis.md` untracked and untouched; it predates this handoff and is not part of the refactor commits.
 
 ## Constraints
