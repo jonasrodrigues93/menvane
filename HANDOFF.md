@@ -2,7 +2,7 @@
 
 ## Current State
 
-The continuity-first refactor is in progress. Phases 0 through 7 are committed and the workspace passes `cargo fmt --all -- --check`, `cargo test --workspace`, and clippy with no new warnings (12 pre-existing warnings remain, targeted by Phase 9).
+The continuity-first refactor is in progress. Phases 0 through 8 are committed and the workspace passes `cargo fmt --all -- --check`, locked workspace tests with all targets/features, and clippy with no Phase 8 warnings. Pre-existing warnings remain, targeted by Phase 9.
 
 Completed commits:
 
@@ -13,6 +13,7 @@ Completed commits:
 - `f716345 feat: derive current handoff from live work items`
 - `14ed82c feat: replace typed memories with context and playbooks`
 - `cca15bc refactor: make recall handoff and intent oriented`
+- `0fb11bf refactor!: replace legacy api and cli surfaces`
 
 Phase 3 was an operational home reset, not a repository commit. The old `~/.menvane` data was deleted after approval. Only the OpenAI provider configuration and `~/.menvane/oauth/openai.json` were preserved. The new home passed `provider status`, `doctor`, SQLite integrity checks, and foreign-key checks. OAuth permissions are `0600`.
 
@@ -25,16 +26,22 @@ Phase 7 notes: most of the delivery flow (lexical handoff selection, three-card 
 - Stopword filtering in `lexical_tokens`, and automatic recall now queries FTS with sorted content tokens instead of the raw prompt, so prompts like "water the balcony garden" no longer match through "the".
 - Checkpoint tests: unrelated/related prompts, bounded cards without full bodies, project isolation, global eligibility, explicit-search escape hatch, superseded exclusion, no provider on the hot path, and p95 under 300 ms with 1,000 memories and 100 handoff items.
 
+Phase 8 notes:
+
+- `handoff inspect` always returns versioned JSON containing the current rendered text, structured items, and provenance; empty handoffs are explicit JSON absence rather than plain text.
+- REST now lists sessions and returns session metadata, chronological events, episodic summaries, and consolidation execution diagnostics. Unknown routes return explicit JSON 404 responses.
+- UI sessions now list and render summary/evidence/diagnostics; project and handoff views render blockers, confidence, confirmation dates, and provenance. Smoke tests reject Project Brief text.
+- Versioned JSON contracts under `contracts/v1` cover CLI handoff inspection, REST sessions/detail/handoff/recall/errors, and MCP tools. Contract tests validate live REST and MCP responses; CLI shape is validated against the same checked-in schema.
+- Import re-ingestion tests verify session, summary, handoff, and knowledge state remains unchanged. Clean-home reopen coverage complements the existing per-integration connect/disconnect tests.
+
 ## Resume Next
 
-1. Phase 8: external interfaces and operation (`refactor!: replace legacy api and cli surfaces`). Scope per `plan.md` lines 294-316:
-   - CLI: `handoff inspect` (current text, items, provenance); `search`/`read`/`write`/`forget` accept only context/playbook.
-   - REST: sessions, summaries, current handoff, recall, and new knowledge; legacy selectors and handoff endpoints return explicit absence.
-   - UI: project shows current handoff and sources; session shows summary and chronological evidence; memory shows context/playbook; diagnostics show consolidation cost and quality. No backlog transformation.
-   - MCP: keep the four operations, accepting context and playbook types.
-   - Imports only through normalized sessions and the normal pipeline.
-   - Backup/restore stay independent capabilities adapted to the new schema; no backup of old data for this break.
-   - Checkpoint: contract tests for CLI/REST/MCP JSON against versioned schemas; double import is idempotent; UI smoke without Project Brief text; clean install plus connect/disconnect per integration and daemon restart in a temporary home.
+1. Phase 9: remove legacy infrastructure and harden invariants (`refactor: remove legacy episode and goal infrastructure`). Scope per `plan.md` lines 318-337:
+   - remove legacy episode/goal tables, types, methods, tests, documentation, versioned handoffs, cards, typed briefing, and compiler infrastructure;
+   - split large modules only where needed by responsibility;
+   - remove incompatible decay/multiplier configuration;
+   - ensure `product.md` documents only final current behavior;
+   - checkpoint with legacy-vocabulary grep, locked clippy/tests/build, and a clean-home end-to-end capture/finalization/consolidation/resume/recall/reindex/restart flow.
 2. Keep `memory-model-analysis.md` untracked and untouched; it predates this handoff and is not part of the refactor commits.
 
 ## Constraints
