@@ -834,6 +834,64 @@ fn unrelated_prompt_receives_no_handoff_items_or_cards() {
 }
 
 #[test]
+fn portuguese_stopwords_do_not_trigger_an_unrelated_global_memory() {
+    let (_temporary, project, menvane) = setup_project();
+    menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Preferência para downloads longos".to_owned(),
+                body: "Inicie downloads em background para que continuem com retomada automática."
+                    .to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Global,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    let context = menvane
+        .prompt_context(
+            &project,
+            "Verifique o que está errado com o Menvane que está rodando.",
+            "session",
+        )
+        .unwrap();
+
+    assert!(context.is_empty());
+}
+
+#[test]
+fn english_stopwords_do_not_trigger_an_unrelated_global_memory() {
+    let (_temporary, project, menvane) = setup_project();
+    menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Long download preference".to_owned(),
+                body: "Keep downloads running in the background so they continue after shutdown."
+                    .to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Global,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    let context = menvane
+        .prompt_context(
+            &project,
+            "Check what is wrong with the running Menvane service.",
+            "session",
+        )
+        .unwrap();
+
+    assert!(context.is_empty());
+}
+
+#[test]
 fn related_prompt_receives_matching_items_and_bounded_cards() {
     let (_temporary, project, menvane) = setup_project();
     let project_id = menvane.ensure_project(&project).unwrap().unwrap().id;

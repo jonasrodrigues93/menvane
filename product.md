@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 2.0.0
+Version: 2.1.0
 
 Menvane is a local persistent memory system for agents. Its central product is operational continuity between agents, sessions, and different days. It preserves four distinct layers:
 
@@ -95,11 +95,11 @@ Applying the complete result is idempotent and uses a single transactional marke
 
 Session start delivers only minimal project identity, the current handoff, and an indication that additional memory is available. It never delivers technologies, architecture, or a typed-memory briefing. The full handoff is delivered at most once per session identity and content; unchanged content is not redelivered, and new content may be delivered again.
 
-Each new prompt selects locally, with deterministic lexical matching, the handoff items related to the current intent plus zero to three relevant contexts or playbooks, presented as bounded cards. Unrelated prompts receive no handoff items. Full bodies remain available only through explicit reads. The hot path never calls a language-model provider.
+Each new prompt selects the handoff items related to the current intent plus zero to three relevant contexts or playbooks, presented as bounded cards. Automatic recall removes recognized English and Portuguese stopwords, preserves technical identifiers, requires meaningful lexical coverage, and may return no result. Unrelated prompts receive no handoff items. Full bodies remain available only through explicit reads. The hot path never calls a language-model provider.
 
 Automatic recall searches only the current project and global memory. Global universal memories are eligible everywhere. Global contextual memories are eligible only when every populated applicability dimension overlaps the current project's detected technologies. Explicit search retains its lexical behavior and may inspect an otherwise incompatible contextual memory when the query names one of its technologies.
 
-Embedding providers are independent from language-model providers. Embedding storage is derived and reconstructible; retrieval remains fully functional with FTS5 when no embedding provider is configured.
+Embedding providers are independent from language-model providers. When an embedding provider is configured and healthy, automatic recall combines FTS5 and embedding rankings without exposing a separate tool or agent choice. Embedding storage is derived and reconstructible. When embeddings are unavailable or incomplete, retrieval falls back transparently to FTS5 and remains fully functional.
 
 Retrieval and injection are recorded as separate signals, alongside explicit reads and successful or failed applications. Retrieval and injection never validate a memory; popularity is never treated as validation. A successful playbook application is the strongest positive verification, and a second independent success activates a candidate playbook.
 

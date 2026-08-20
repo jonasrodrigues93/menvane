@@ -5,6 +5,7 @@ mod sanitizer;
 mod session_consolidator;
 mod session_engine;
 mod session_rendering;
+mod stopwords;
 mod technology_detector;
 
 use std::collections::{BTreeMap, HashSet};
@@ -378,17 +379,27 @@ impl Menvane {
                 identity,
             });
         }
-        let results = self.search_inner(
+        let candidates = self.search_inner(
             cwd,
             &query,
             ScopeSelection::Auto,
-            limit.saturating_mul(4).max(limit),
+            limit.saturating_mul(16).max(64),
         )?;
-        let results = results
-            .into_iter()
-            .filter(|result| automatically_eligible(result, project.as_ref()))
-            .take(limit)
-            .collect::<Vec<_>>();
+        let prompt_tokens = terms.into_iter().collect::<HashSet<_>>();
+        let mut results = Vec::new();
+        for result in candidates {
+            if !automatically_eligible(&result, project.as_ref()) {
+                continue;
+            }
+            let memory = self.read_without_recording(result.id)?;
+            let memory_tokens = lexical_tokens(&format!("{} {}", memory.title, memory.body));
+            if meaningful_lexical_overlap(&prompt_tokens, &memory_tokens) {
+                results.push(result);
+            }
+            if results.len() == limit {
+                break;
+            }
+        }
         for result in &results {
             self.sessions
                 .record_access(result.id, ReinforcementSignal::Retrieved)?;
@@ -1767,17 +1778,20 @@ fn bullets(values: &[String]) -> String {
 }
 
 fn lexical_tokens(value: &str) -> HashSet<String> {
-    const STOPWORDS: &[&str] = &[
-        "all", "and", "any", "are", "but", "can", "could", "each", "for", "from", "has", "have",
-        "how", "its", "more", "not", "should", "some", "such", "than", "that", "the", "their",
-        "them", "then", "there", "these", "they", "this", "those", "was", "were", "what", "when",
-        "where", "which", "while", "who", "why", "will", "with", "would", "you", "your",
-    ];
     value
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .map(str::to_ascii_lowercase)
-        .filter(|token| token.len() >= 3 && !STOPWORDS.contains(&token.as_str()))
+        .split(|character: char| !character.is_alphanumeric())
+        .map(stopwords::normalize)
+        .filter(|token| token.chars().count() >= 3 && !stopwords::contains(token))
         .collect()
+}
+
+fn meaningful_lexical_overlap(
+    prompt_tokens: &HashSet<String>,
+    memory_tokens: &HashSet<String>,
+) -> bool {
+    let overlap = prompt_tokens.intersection(memory_tokens).count();
+    let required = prompt_tokens.len().div_ceil(3).clamp(1, 3);
+    overlap >= required
 }
 
 fn normalize_memory_text(value: &str) -> String {
