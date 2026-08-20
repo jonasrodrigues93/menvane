@@ -1,3 +1,4 @@
+mod embeddings;
 mod oauth_provider;
 mod project_resolver;
 mod providers;
@@ -8,7 +9,7 @@ mod session_rendering;
 mod stopwords;
 mod technology_detector;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -19,11 +20,11 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use fs2::FileExt;
 use menvane_domain::{
-    Applicability, ConsolidationPacket, ConsolidationResult, EpisodicSummary, HandoffItem,
-    HandoffItemOperation, HandoffItemSource, JsonSchema, KnowledgeContent, KnowledgeOperation,
-    KnowledgeOperationKind, KnowledgeType, LlmProvider, LlmRequest, Memory, MemoryMetadata,
-    MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProviderHealth,
-    ReinforcementSignal, Scope, SessionMetadata, SummaryStatus,
+    Applicability, ConsolidationPacket, ConsolidationResult, EmbeddingProvider, EpisodicSummary,
+    HandoffItem, HandoffItemOperation, HandoffItemSource, JsonSchema, KnowledgeContent,
+    KnowledgeOperation, KnowledgeOperationKind, KnowledgeType, LlmProvider, LlmRequest, Memory,
+    MemoryMetadata, MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project,
+    ProviderHealth, ReinforcementSignal, Scope, SessionMetadata, SummaryStatus,
 };
 use menvane_store::{
     IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MAX_SUMMARY_SELECTION_BYTES,
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+pub use embeddings::OpenAICompatibleEmbeddingProvider;
 pub use menvane_store::{
     ConsolidationMarker, IngestResult, JobRecord as StoreJobRecord, MAX_HANDOFF_ITEM_BYTES,
     MAX_HANDOFF_LIST_LIMIT, RecallContext, SessionEvent, SessionRecord, conversation_key,
@@ -70,6 +72,12 @@ pub struct PromptRecall {
     pub results: Vec<SearchResult>,
     pub diagnostics: RecallDiagnostics,
     pub identity: InjectionIdentity,
+}
+
+struct HybridRecallCandidate {
+    result: SearchResult,
+    lexical_rank: Option<usize>,
+    embedding_rank: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +121,33 @@ struct MenvaneConfig {
     jobs: JobConfiguration,
     #[serde(default)]
     llm: LlmConfiguration,
+    #[serde(default)]
+    embeddings: EmbeddingConfiguration,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EmbeddingConfiguration {
+    provider: Option<String>,
+    #[serde(default)]
+    model: String,
+    #[serde(default = "default_api_url")]
+    base_url: String,
+    #[serde(default = "default_api_key_env")]
+    api_key_env: String,
+    #[serde(default = "default_embedding_min_similarity")]
+    min_similarity: f64,
+}
+
+impl Default for EmbeddingConfiguration {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            model: String::new(),
+            base_url: default_api_url(),
+            api_key_env: default_api_key_env(),
+            min_similarity: default_embedding_min_similarity(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +241,10 @@ fn default_oauth_endpoint() -> String {
     "https://chatgpt.com/backend-api/codex/responses".to_owned()
 }
 
+fn default_embedding_min_similarity() -> f64 {
+    0.78
+}
+
 pub struct Menvane {
     home: PathBuf,
     pub(crate) markdown: MarkdownStore,
@@ -214,6 +253,7 @@ pub struct Menvane {
     pub(crate) config: MenvaneConfig,
     worker_owner: String,
     provider_override: Option<Arc<dyn LlmProvider>>,
+    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl DoctorReport {
@@ -236,6 +276,7 @@ impl Menvane {
         let markdown = MarkdownStore::new(&home);
         markdown.initialize()?;
         let config: MenvaneConfig = toml::from_str(&fs::read_to_string(home.join("config.toml"))?)?;
+        let embedding_provider = configured_embedding_provider(&config.embeddings)?;
         let index = IndexStore::new(home.join("index.sqlite"));
         index.initialize()?;
         let sessions = SessionRepository::new(home.join("state.sqlite"));
@@ -248,6 +289,7 @@ impl Menvane {
             config,
             worker_owner: Uuid::now_v7().to_string(),
             provider_override: None,
+            embedding_provider,
         })
     }
 
@@ -257,6 +299,15 @@ impl Menvane {
     ) -> Result<Self> {
         let mut menvane = Self::new(home)?;
         menvane.provider_override = Some(provider);
+        Ok(menvane)
+    }
+
+    pub fn new_with_embedding_provider(
+        home: impl Into<PathBuf>,
+        provider: Arc<dyn EmbeddingProvider>,
+    ) -> Result<Self> {
+        let mut menvane = Self::new(home)?;
+        menvane.embedding_provider = Some(provider);
         Ok(menvane)
     }
 
@@ -294,6 +345,7 @@ impl Menvane {
         }
         let path = self.markdown.write_memory(&memory, project.as_ref())?;
         self.index.upsert_memory(&memory, &path)?;
+        self.refresh_memory_embedding(&memory)?;
         self.markdown
             .commit(&format!("feat(memory): write {}", memory.metadata.id));
         Ok(memory)
@@ -379,27 +431,79 @@ impl Menvane {
                 identity,
             });
         }
-        let candidates = self.search_inner(
+        let lexical_candidates = self.search_inner(
             cwd,
             &query,
             ScopeSelection::Auto,
             limit.saturating_mul(16).max(64),
         )?;
         let prompt_tokens = terms.into_iter().collect::<HashSet<_>>();
-        let mut results = Vec::new();
-        for result in candidates {
+        let mut candidates = HashMap::<Uuid, HybridRecallCandidate>::new();
+        for (index, result) in lexical_candidates.into_iter().enumerate() {
             if !automatically_eligible(&result, project.as_ref()) {
                 continue;
             }
             let memory = self.read_without_recording(result.id)?;
             let memory_tokens = lexical_tokens(&format!("{} {}", memory.title, memory.body));
             if meaningful_lexical_overlap(&prompt_tokens, &memory_tokens) {
-                results.push(result);
-            }
-            if results.len() == limit {
-                break;
+                candidates.insert(
+                    result.id,
+                    HybridRecallCandidate {
+                        result,
+                        lexical_rank: Some(index + 1),
+                        embedding_rank: None,
+                    },
+                );
             }
         }
+        if let Some(provider) = &self.embedding_provider
+            && let Ok(embedding) = provider.embed(&prompt)
+            && embeddings::validate_embedding(&embedding).is_ok()
+        {
+            let project_id = project
+                .as_ref()
+                .map(|project| project.id.as_str())
+                .unwrap_or_default();
+            if let Ok(embedding_candidates) = self.index.search_embeddings(
+                &embedding,
+                provider.name(),
+                provider.model(),
+                SearchScope::Auto(project_id),
+                limit.saturating_mul(16).max(64),
+            ) {
+                for (index, result) in embedding_candidates.into_iter().enumerate() {
+                    if result.score < self.config.embeddings.min_similarity
+                        || !automatically_eligible(&result, project.as_ref())
+                    {
+                        continue;
+                    }
+                    candidates
+                        .entry(result.id)
+                        .and_modify(|candidate| candidate.embedding_rank = Some(index + 1))
+                        .or_insert(HybridRecallCandidate {
+                            result,
+                            lexical_rank: None,
+                            embedding_rank: Some(index + 1),
+                        });
+                }
+            }
+        }
+        let mut results = candidates
+            .into_values()
+            .map(|mut candidate| {
+                candidate.result.score =
+                    reciprocal_rank_fusion(candidate.lexical_rank, candidate.embedding_rank);
+                candidate.result.fts_rank = candidate.lexical_rank.unwrap_or_default();
+                candidate.result
+            })
+            .collect::<Vec<_>>();
+        results.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        results.truncate(limit);
         for result in &results {
             self.sessions
                 .record_access(result.id, ReinforcementSignal::Retrieved)?;
@@ -436,7 +540,34 @@ impl Menvane {
 
     pub fn reindex(&self) -> Result<(usize, usize)> {
         let _lock = acquire_daemon_lock(&self.home)?;
-        self.index.reindex(&self.markdown)
+        let counts = self.index.reindex(&self.markdown)?;
+        if self.embedding_provider.is_some() {
+            for path in self.markdown.memory_files()? {
+                let memory = self.markdown.parse_memory(&path)?;
+                self.refresh_memory_embedding(&memory)?;
+            }
+        }
+        Ok(counts)
+    }
+
+    fn refresh_memory_embedding(&self, memory: &Memory) -> Result<()> {
+        let Some(provider) = &self.embedding_provider else {
+            return Ok(());
+        };
+        let text = format!("{}\n\n{}", memory.title, memory.body);
+        let Ok(embedding) = provider.embed(&text) else {
+            return Ok(());
+        };
+        if embeddings::validate_embedding(&embedding).is_err() {
+            return Ok(());
+        }
+        let _ = self.index.upsert_memory_embedding(
+            memory.metadata.id,
+            provider.name(),
+            provider.model(),
+            &embedding,
+        );
+        Ok(())
     }
 
     pub fn ingest_event(&self, event: NormalizedEvent) -> Result<CaptureOutcome> {
@@ -805,6 +936,7 @@ impl Menvane {
         memory.metadata.updated_at = Utc::now();
         self.markdown.update_memory(&path, &memory)?;
         self.index.upsert_memory(&memory, &path)?;
+        self.refresh_memory_embedding(&memory)?;
         self.markdown.commit(&format!("docs(memory): edit {id}"));
         Ok(memory)
     }
@@ -1355,6 +1487,7 @@ impl Menvane {
                 };
                 let path = self.markdown.write_memory(&memory, project.as_ref())?;
                 self.index.upsert_memory(&memory, &path)?;
+                self.refresh_memory_embedding(&memory)?;
                 self.markdown
                     .commit(&format!("feat(memory): consolidate {session_id}:{index}"));
                 Ok(())
@@ -1393,6 +1526,7 @@ impl Menvane {
                 }
                 self.markdown.update_memory(&survivor_path, &survivor)?;
                 self.index.upsert_memory(&survivor, &survivor_path)?;
+                self.refresh_memory_embedding(&survivor)?;
                 for (mut memory, path) in targets.drain(1..) {
                     if memory.metadata.status == MemoryStatus::Superseded {
                         continue;
@@ -1470,6 +1604,7 @@ impl Menvane {
                 };
                 let path = self.markdown.write_memory(&memory, project.as_ref())?;
                 self.index.upsert_memory(&memory, &path)?;
+                self.refresh_memory_embedding(&memory)?;
                 Ok(())
             }
         }
@@ -1780,8 +1915,17 @@ fn bullets(values: &[String]) -> String {
 fn lexical_tokens(value: &str) -> HashSet<String> {
     value
         .split(|character: char| !character.is_alphanumeric())
-        .map(stopwords::normalize)
-        .filter(|token| token.chars().count() >= 3 && !stopwords::contains(token))
+        .filter_map(|raw| {
+            let technical = raw.chars().any(|character| character.is_ascii_digit())
+                || (raw.chars().count() >= 2
+                    && raw
+                        .chars()
+                        .filter(|character| character.is_alphabetic())
+                        .all(|character| character.is_uppercase()));
+            let token = stopwords::normalize(raw);
+            (token.chars().count() >= 3 && (technical || !stopwords::contains(&token)))
+                .then_some(token)
+        })
         .collect()
 }
 
@@ -1790,8 +1934,18 @@ fn meaningful_lexical_overlap(
     memory_tokens: &HashSet<String>,
 ) -> bool {
     let overlap = prompt_tokens.intersection(memory_tokens).count();
-    let required = prompt_tokens.len().div_ceil(3).clamp(1, 3);
+    let required = if prompt_tokens.len() == 1 {
+        1
+    } else {
+        prompt_tokens.len().div_ceil(3).clamp(2, 3)
+    };
     overlap >= required
+}
+
+fn reciprocal_rank_fusion(lexical_rank: Option<usize>, embedding_rank: Option<usize>) -> f64 {
+    let lexical = lexical_rank.map_or(0.0, |rank| 0.65 / (60.0 + rank as f64));
+    let embedding = embedding_rank.map_or(0.0, |rank| 0.35 / (60.0 + rank as f64));
+    lexical + embedding
 }
 
 fn normalize_memory_text(value: &str) -> String {
@@ -1865,6 +2019,29 @@ fn provider_from_configuration(
             )))
         }
         provider => bail!("unsupported LLM provider: {provider}"),
+    }
+}
+
+fn configured_embedding_provider(
+    configuration: &EmbeddingConfiguration,
+) -> Result<Option<Arc<dyn EmbeddingProvider>>> {
+    let Some(provider) = configuration.provider.as_deref() else {
+        return Ok(None);
+    };
+    if configuration.model.trim().is_empty() {
+        bail!("embedding provider requires an explicit model")
+    }
+    if !(0.0..=1.0).contains(&configuration.min_similarity) {
+        bail!("embedding minimum similarity must be between zero and one")
+    }
+    match provider {
+        "openai-api" => Ok(Some(Arc::new(OpenAICompatibleEmbeddingProvider::new(
+            provider,
+            &configuration.model,
+            &configuration.base_url,
+            &configuration.api_key_env,
+        )))),
+        provider => bail!("unsupported embedding provider: {provider}"),
     }
 }
 

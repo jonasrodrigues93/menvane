@@ -15,6 +15,8 @@ pub struct ProviderCapabilities {
 pub trait EmbeddingProvider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
     fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
+    fn name(&self) -> &str;
+    fn model(&self) -> &str;
 }
 
 #[derive(Debug, Error)]

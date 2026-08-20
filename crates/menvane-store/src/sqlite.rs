@@ -137,6 +137,148 @@ impl IndexStore {
         Ok(())
     }
 
+    pub fn upsert_memory_embedding(
+        &self,
+        memory_id: Uuid,
+        provider: &str,
+        model: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
+        if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+            bail!("embedding must contain finite values")
+        }
+        let dimensions = i64::try_from(embedding.len())?;
+        let bytes = embedding
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let connection = self.open_initialized()?;
+        connection.execute(
+            "INSERT INTO memory_embeddings(memory_id, provider, model, dimensions, embedding, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(memory_id, provider, model) DO UPDATE SET dimensions=excluded.dimensions, embedding=excluded.embedding, updated_at=excluded.updated_at",
+            params![
+                memory_id.to_string(),
+                provider,
+                model,
+                dimensions,
+                bytes,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn search_embeddings(
+        &self,
+        embedding: &[f32],
+        provider: &str,
+        model: &str,
+        scope: SearchScope<'_>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        if embedding.is_empty() || embedding.iter().any(|value| !value.is_finite()) {
+            bail!("query embedding must contain finite values")
+        }
+        let connection = self.open_initialized()?;
+        let (scope_sql, project_id) = match scope {
+            SearchScope::Auto(project_id) => {
+                ("(m.scope = 'global' OR m.project_id = ?3)", project_id)
+            }
+            SearchScope::Project(project_id) => ("m.project_id = ?3", project_id),
+            SearchScope::Global => ("m.scope = 'global'", ""),
+        };
+        let sql = format!(
+            "WITH query_parameters(provider, model, project_id) AS (VALUES (?1, ?2, ?3))
+             SELECT m.id, m.type, m.scope, m.title, m.status, m.applicability_json, m.source_sessions_json, m.supersedes_json, substr(m.body, 1, 500), e.dimensions, e.embedding, MAX(0, julianday('now') - julianday(m.updated_at))
+             FROM memory_embeddings e
+             JOIN memories m ON m.id=e.memory_id
+             CROSS JOIN query_parameters q
+             WHERE e.provider=q.provider AND e.model=q.model AND {scope_sql} AND m.status IN ('active', 'candidate')"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(params![provider, model, project_id], |row| {
+            let id: String = row.get(0)?;
+            let dimensions: i64 = row.get(9)?;
+            let bytes: Vec<u8> = row.get(10)?;
+            Ok((
+                SearchResult {
+                    id: Uuid::parse_str(&id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            id.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    knowledge_type: row.get::<_, String>(1)?.parse().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    scope: row.get(2)?,
+                    title: row.get(3)?,
+                    status: row.get(4)?,
+                    applicability: serde_json::from_str(&row.get::<_, String>(5)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                5,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    source_session_count: json_array_count(&row.get::<_, String>(6)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    supersession_count: json_array_count(&row.get::<_, String>(7)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
+                    excerpt: row.get(8)?,
+                    score: 0.0,
+                    fts_rank: 0,
+                    age_days: row.get(11)?,
+                },
+                dimensions,
+                bytes,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            let (mut result, dimensions, bytes) = row?;
+            let stored = decode_embedding(&bytes, dimensions)?;
+            if stored.len() != embedding.len() {
+                continue;
+            }
+            result.score = cosine_similarity(embedding, &stored)?;
+            results.push(result);
+        }
+        results.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        results.truncate(limit);
+        for (index, result) in results.iter_mut().enumerate() {
+            result.fts_rank = index + 1;
+        }
+        Ok(results)
+    }
+
     pub fn upsert_session_summary(
         &self,
         session_id: Uuid,
@@ -569,6 +711,42 @@ fn configure_connection(connection: &Connection, wal: bool) -> Result<()> {
     Ok(())
 }
 
+fn decode_embedding(bytes: &[u8], dimensions: i64) -> Result<Vec<f32>> {
+    let dimensions = usize::try_from(dimensions)?;
+    if bytes.len() != dimensions.saturating_mul(std::mem::size_of::<f32>()) {
+        bail!("stored embedding dimensions do not match its byte length")
+    }
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .collect())
+}
+
+fn cosine_similarity(left: &[f32], right: &[f32]) -> Result<f64> {
+    if left.len() != right.len() || left.is_empty() {
+        bail!("embedding dimensions do not match")
+    }
+    let dot = left
+        .iter()
+        .zip(right)
+        .map(|(left, right)| f64::from(*left) * f64::from(*right))
+        .sum::<f64>();
+    let left_norm = left
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let right_norm = right
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if left_norm == 0.0 || right_norm == 0.0 {
+        bail!("embedding has zero magnitude")
+    }
+    Ok(dot / (left_norm * right_norm))
+}
+
 fn reject_unversioned_database(connection: &Connection) -> Result<()> {
     let has_schema_meta = connection
         .query_row(
@@ -850,6 +1028,48 @@ mod tests {
             .unwrap();
         assert_eq!(result.source_session_count, 2);
         assert_eq!(result.supersession_count, 1);
+    }
+
+    #[test]
+    fn embedding_search_orders_cosine_similarity() {
+        let temporary = TempDir::new().unwrap();
+        let markdown = MarkdownStore::new(temporary.path());
+        markdown.initialize().unwrap();
+        let index = IndexStore::new(temporary.path().join("index.sqlite"));
+        index.initialize().unwrap();
+        let memories = [
+            ("Database recovery", [1.0, 0.0]),
+            ("Background downloads", [0.0, 1.0]),
+        ]
+        .into_iter()
+        .map(|(title, embedding)| {
+            let memory = Memory {
+                metadata: MemoryMetadata::new(
+                    KnowledgeType::Context,
+                    Scope::Global,
+                    None,
+                    Vec::new(),
+                    Applicability::default(),
+                    MemoryStatus::Active,
+                ),
+                title: title.to_owned(),
+                body: title.to_owned(),
+            };
+            let path = markdown.write_memory(&memory, None).unwrap();
+            index.upsert_memory(&memory, &path).unwrap();
+            index
+                .upsert_memory_embedding(memory.metadata.id, "fake", "multilingual", &embedding)
+                .unwrap();
+            memory
+        })
+        .collect::<Vec<_>>();
+
+        let results = index
+            .search_embeddings(&[0.9, 0.1], "fake", "multilingual", SearchScope::Global, 10)
+            .unwrap();
+
+        assert_eq!(results[0].id, memories[0].metadata.id);
+        assert!(results[0].score > results[1].score);
     }
 
     #[test]

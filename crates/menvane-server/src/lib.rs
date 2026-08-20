@@ -369,14 +369,17 @@ async fn recall(
             None,
         ),
         "user-prompt" => {
-            let (context, diagnostics) = menvane
-                .prompt_context_for_client(
-                    cwd,
-                    &request.client,
-                    &request.session_id,
-                    &request.prompt,
-                )
-                .map_err(internal_server_error)?;
+            let menvane = Arc::clone(&menvane);
+            let cwd = cwd.to_path_buf();
+            let client = request.client.clone();
+            let session_id = request.session_id.clone();
+            let prompt = request.prompt.clone();
+            let (context, diagnostics) = tokio::task::spawn_blocking(move || {
+                menvane.prompt_context_for_client(&cwd, &client, &session_id, &prompt)
+            })
+            .await
+            .map_err(|error| internal_server_error(anyhow::anyhow!(error)))?
+            .map_err(internal_server_error)?;
             (context, Some(diagnostics))
         }
         _ => {

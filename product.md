@@ -101,6 +101,8 @@ Automatic recall searches only the current project and global memory. Global uni
 
 Embedding providers are independent from language-model providers. When an embedding provider is configured and healthy, automatic recall combines FTS5 and embedding rankings without exposing a separate tool or agent choice. Embedding storage is derived and reconstructible. When embeddings are unavailable or incomplete, retrieval falls back transparently to FTS5 and remains fully functional.
 
+The initial embedding provider is `openai-api`, using an explicit model, an OpenAI-compatible `/embeddings` endpoint, and an API key read only from the configured environment variable. It is disabled by default because enabling an external provider sends sanitized recall prompts and durable memory titles and bodies to that endpoint. Embedding configuration includes a conservative cosine-similarity threshold. Enabling or changing the embedding provider requires `menvane reindex` to reconstruct vectors for existing memories and a daemon restart to activate the configuration.
+
 Retrieval and injection are recorded as separate signals, alongside explicit reads and successful or failed applications. Retrieval and injection never validate a memory; popularity is never treated as validation. A successful playbook application is the strongest positive verification, and a second independent success activates a candidate playbook.
 
 ## MCP

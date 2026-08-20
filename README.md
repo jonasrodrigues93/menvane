@@ -117,9 +117,23 @@ menvane forget <memory-id>
 menvane handoff inspect
 ```
 
-Session start delivers only minimal project identity and the current handoff. Each prompt then receives only the handoff items related to its intent plus up to three context or playbook cards, selected locally; the hot path never calls a language-model provider. Full memory bodies stay available through explicit reads.
+Session start delivers only minimal project identity and the current handoff. Each prompt then receives only the handoff items related to its intent plus up to three context or playbook cards; the hot path never calls a language-model provider. Full memory bodies stay available through explicit reads.
 
 Explicit search uses the query provided by the caller. Full Markdown and bounded provenance remain available through `menvane read` and the local UI.
+
+Automatic recall uses conservative English and Portuguese lexical matching. It combines FTS5 with embeddings whenever an independent embedding provider is configured and healthy, and falls back to FTS5 when embeddings are unavailable. Configure an OpenAI-compatible embedding endpoint in `~/.menvane/config.toml`:
+
+```toml
+[embeddings]
+provider = "openai-api"
+model = "text-embedding-3-small"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+min_similarity = 0.78
+```
+
+Restart the daemon and run `menvane reindex` after enabling or changing the embedding model.
+External embeddings are disabled by default. Enabling them sends sanitized recall prompts and durable memory titles and bodies to the configured endpoint.
 
 ## Privacy And Trust
 

@@ -4,19 +4,75 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{TimeZone, Utc};
 use menvane_domain::{
-    Applicability, HandoffItem, HandoffItemKind, HandoffItemSource, JsonSchema, KnowledgeType,
-    LlmError, LlmErrorKind, LlmProvider, LlmRequest, Memory, MemoryMetadata, MemoryStatus,
-    NormalizedEvent, NormalizedEventKind, ProviderCapabilities, ProviderHealth, ResponseUsage,
-    Scope, StructuredResponse,
+    Applicability, EmbeddingError, EmbeddingProvider, HandoffItem, HandoffItemKind,
+    HandoffItemSource, JsonSchema, KnowledgeType, LlmError, LlmErrorKind, LlmProvider, LlmRequest,
+    Memory, MemoryMetadata, MemoryStatus, NormalizedEvent, NormalizedEventKind,
+    ProviderCapabilities, ProviderHealth, ResponseUsage, Scope, StructuredResponse,
 };
 use menvane_engine::{CaptureOutcome, Menvane, ScopeSelection, WriteMemory};
-use menvane_store::{IndexStore, MarkdownStore, SessionRepository};
+use menvane_store::{IndexStore, MarkdownStore, SearchScope, SessionRepository};
 use tempfile::TempDir;
 use uuid::Uuid;
 
 struct FakeLlmProvider {
     responses: Mutex<Vec<Result<serde_json::Value, LlmError>>>,
     calls: Mutex<Vec<LlmRequest>>,
+}
+
+struct FakeEmbeddingProvider;
+
+struct UnavailableEmbeddingProvider;
+
+impl EmbeddingProvider for FakeEmbeddingProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            structured_output: false,
+            json_schema: false,
+            embeddings: true,
+        }
+    }
+
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let text = text.to_ascii_lowercase();
+        if ["recover", "deleted", "pitr", "wal", "snapshot"]
+            .iter()
+            .any(|term| text.contains(term))
+        {
+            Ok(vec![1.0, 0.0])
+        } else {
+            Ok(vec![0.0, 1.0])
+        }
+    }
+
+    fn name(&self) -> &str {
+        "fake"
+    }
+
+    fn model(&self) -> &str {
+        "multilingual"
+    }
+}
+
+impl EmbeddingProvider for UnavailableEmbeddingProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            structured_output: false,
+            json_schema: false,
+            embeddings: true,
+        }
+    }
+
+    fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Err(EmbeddingError::Unavailable("offline".to_owned()))
+    }
+
+    fn name(&self) -> &str {
+        "unavailable"
+    }
+
+    fn model(&self) -> &str {
+        "offline"
+    }
 }
 
 impl FakeLlmProvider {
@@ -889,6 +945,156 @@ fn english_stopwords_do_not_trigger_an_unrelated_global_memory() {
         .unwrap();
 
     assert!(context.is_empty());
+}
+
+#[test]
+fn hybrid_recall_finds_a_semantic_match_without_lexical_overlap() {
+    let temporary = TempDir::new().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let status = std::process::Command::new("git")
+        .args(["-C", project.to_str().unwrap(), "init", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let menvane = Menvane::new_with_embedding_provider(
+        temporary.path().join("home"),
+        Arc::new(FakeEmbeddingProvider),
+    )
+    .unwrap();
+    let memory = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "PITR procedure".to_owned(),
+                body: "Apply archived WAL segments after the base snapshot.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    let recall = menvane
+        .prompt_recall(
+            &project,
+            "test",
+            "hybrid",
+            "Recover accidentally deleted database rows",
+            3,
+        )
+        .unwrap();
+
+    assert_eq!(recall.results.len(), 1);
+    assert_eq!(recall.results[0].id, memory.metadata.id);
+}
+
+#[test]
+fn reindex_reconstructs_memory_embeddings() {
+    let temporary = TempDir::new().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let status = std::process::Command::new("git")
+        .args(["-C", project.to_str().unwrap(), "init", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let menvane = Menvane::new_with_embedding_provider(
+        temporary.path().join("home"),
+        Arc::new(FakeEmbeddingProvider),
+    )
+    .unwrap();
+    let memory = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "PITR procedure".to_owned(),
+                body: "Apply archived WAL segments after the base snapshot.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Global,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    menvane.reindex().unwrap();
+
+    let index = IndexStore::new(menvane.home().join("index.sqlite"));
+    let results = index
+        .search_embeddings(&[1.0, 0.0], "fake", "multilingual", SearchScope::Global, 3)
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, memory.metadata.id);
+}
+
+#[test]
+fn automatic_recall_falls_back_to_fts_when_embeddings_are_unavailable() {
+    let temporary = TempDir::new().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let status = std::process::Command::new("git")
+        .args(["-C", project.to_str().unwrap(), "init", "--quiet"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let menvane = Menvane::new_with_embedding_provider(
+        temporary.path().join("home"),
+        Arc::new(UnavailableEmbeddingProvider),
+    )
+    .unwrap();
+    let memory = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Export schema procedure".to_owned(),
+                body: "Validate the export schema before publication.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    let recall = menvane
+        .prompt_recall(
+            &project,
+            "test",
+            "fallback",
+            "Continue export schema work",
+            3,
+        )
+        .unwrap();
+
+    assert_eq!(recall.results.len(), 1);
+    assert_eq!(recall.results[0].id, memory.metadata.id);
+}
+
+#[test]
+fn automatic_recall_preserves_uppercase_technical_identifiers() {
+    let (_temporary, project, menvane) = setup_project();
+    let memory = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "CAN bus diagnostics".to_owned(),
+                body: "Inspect CAN bus frames before replacing the controller.".to_owned(),
+                knowledge_type: KnowledgeType::Context,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    let recall = menvane
+        .prompt_recall(&project, "test", "technical", "Inspect CAN bus traffic", 3)
+        .unwrap();
+
+    assert_eq!(recall.results.len(), 1);
+    assert_eq!(recall.results[0].id, memory.metadata.id);
 }
 
 #[test]
