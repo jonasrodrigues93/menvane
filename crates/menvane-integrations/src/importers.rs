@@ -323,7 +323,20 @@ impl OpenCodeImporter {
 
 fn imported_attributed_path(input: &str) -> Option<String> {
     let input: Value = serde_json::from_str(input).ok()?;
-    find_string(&input, &["filePath", "file_path", "path"]).map(str::to_owned)
+    find_string(&input, &["filePath", "file_path", "path"])
+        .map(str::to_owned)
+        .or_else(|| {
+            input
+                .get("patchText")
+                .and_then(Value::as_str)
+                .and_then(|patch| {
+                    patch.lines().find_map(|line| {
+                        ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
+                            .into_iter()
+                            .find_map(|prefix| line.strip_prefix(prefix).map(str::to_owned))
+                    })
+                })
+        })
 }
 
 fn normalize_opencode_message(record: &Value) -> Vec<ImportedEvent> {
@@ -721,6 +734,7 @@ mod tests {
         );
         let latest = menvane.sessions(1).unwrap().remove(0);
         assert_eq!(latest.generation, 2);
+        assert_eq!(latest.state, menvane_domain::SessionState::Finalized);
         assert!(
             menvane
                 .session_events(latest.id)
@@ -728,6 +742,77 @@ mod tests {
                 .iter()
                 .any(|event| event.bounded_input.as_deref() == Some("recovered prompt"))
         );
+    }
+
+    #[test]
+    fn successful_mutation_attributes_global_opencode_session_to_project() {
+        let temporary = TempDir::new().unwrap();
+        let project = temporary.path().join("subwitcher");
+        fs::create_dir_all(&project).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(project.join("project.md"), "# Subwitcher\n").unwrap();
+        let timestamp = Utc::now();
+        let mut session = NormalizedSession {
+            client: "opencode".to_owned(),
+            external_session_id: "global-project-work".to_owned(),
+            cwd: Some(temporary.path().to_string_lossy().into_owned()),
+            events: vec![
+                boundary_event(
+                    "opencode",
+                    "global-project-work",
+                    temporary.path().to_string_lossy().as_ref(),
+                    timestamp,
+                    NormalizedEventKind::SessionStarted,
+                    "import-start",
+                ),
+                boundary_event(
+                    "opencode",
+                    "global-project-work",
+                    temporary.path().to_string_lossy().as_ref(),
+                    timestamp,
+                    NormalizedEventKind::SessionEnded,
+                    "import-end",
+                ),
+            ],
+            estimated_bytes: 0,
+        };
+        session.events.insert(
+            1,
+            NormalizedEvent {
+                event_id: "project-write".to_owned(),
+                kind: NormalizedEventKind::ToolCompleted,
+                origin: NormalizedEventOrigin::Tool,
+                role: NormalizedEventRole::ToolActivity,
+                client: "opencode".to_owned(),
+                external_session_id: "global-project-work".to_owned(),
+                timestamp,
+                cwd: temporary.path().to_string_lossy().into_owned(),
+                project_id: None,
+                tool_family: Some("apply_patch".to_owned()),
+                bounded_input: Some("updated project.md".to_owned()),
+                bounded_output: Some("success".to_owned()),
+                attributed_path: Some(project.join("project.md").to_string_lossy().into_owned()),
+                success: Some(true),
+                model: None,
+                harness_injected: false,
+            },
+        );
+        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+        assert_eq!(
+            menvane.import_session(session).unwrap(),
+            ImportOutcome::Imported
+        );
+        let imported = menvane.sessions(1).unwrap().remove(0);
+        assert_eq!(imported.state, menvane_domain::SessionState::Finalized);
+        assert!(imported.project_id.is_some());
     }
 
     #[test]
@@ -825,6 +910,17 @@ mod tests {
             events
                 .iter()
                 .all(|event| event.2.as_deref() != Some("private"))
+        );
+    }
+
+    #[test]
+    fn opencode_apply_patch_exposes_its_attributed_path() {
+        let input = serde_json::json!({
+            "patchText": "*** Begin Patch\n*** Update File: /home/user/project/project.md\n@@\n-old\n+new\n*** End Patch"
+        });
+        assert_eq!(
+            imported_attributed_path(&input.to_string()).as_deref(),
+            Some("/home/user/project/project.md")
         );
     }
 

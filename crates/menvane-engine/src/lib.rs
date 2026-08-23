@@ -24,7 +24,7 @@ use menvane_domain::{
     HandoffItem, HandoffItemOperation, HandoffItemSource, JsonSchema, KnowledgeContent,
     KnowledgeOperation, KnowledgeOperationKind, KnowledgeType, LlmProvider, LlmRequest, Memory,
     MemoryMetadata, MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project,
-    ProviderHealth, ReinforcementSignal, Scope, SessionMetadata, SummaryStatus,
+    ProviderHealth, ReinforcementSignal, Scope, SessionMetadata, SessionState, SummaryStatus,
 };
 use menvane_store::{
     IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MAX_SUMMARY_SELECTION_BYTES,
@@ -824,6 +824,25 @@ impl Menvane {
     }
 
     pub fn import_session(&self, mut session: NormalizedSession) -> Result<ImportOutcome> {
+        if let Some(cwd) = reliable_import_cwd(&session)? {
+            let cwd = cwd.to_string_lossy().into_owned();
+            session.cwd = Some(cwd.clone());
+            for event in &mut session.events {
+                event.cwd.clone_from(&cwd);
+            }
+        }
+        let resolved_project_id = session
+            .cwd
+            .as_deref()
+            .map(Path::new)
+            .filter(|cwd| cwd.exists())
+            .map(ProjectResolver::resolve)
+            .transpose()?
+            .flatten()
+            .map(|resolution| resolution.id);
+        let mut retry_import = false;
+        let mut reattribute_import = false;
+        let mut reconsolidate_import = false;
         if self
             .sessions
             .import_exists(&session.client, &session.external_session_id)?
@@ -831,15 +850,27 @@ impl Menvane {
             let existing = self
                 .sessions
                 .latest_session(&session.client, &session.external_session_id)?;
-            let retry_empty_import = if let Some(existing) = existing {
+            retry_import = if let Some(existing) = existing {
+                let incoming_has_content = has_consolidation_content(&session.events);
+                reattribute_import = existing.imported
+                    && existing.project_id.is_none()
+                    && resolved_project_id.is_some();
+                reconsolidate_import = existing.imported
+                    && self
+                        .sessions
+                        .consolidation_result(existing.id)?
+                        .is_some_and(|marker| has_unmaterialized_continuity(&marker.result));
                 existing.imported
-                    && existing.summary_status == SummaryStatus::Skipped
-                    && !has_consolidation_content(&self.sessions.events(existing.id)?)
-                    && has_consolidation_content(&session.events)
+                    && incoming_has_content
+                    && (reattribute_import
+                        || reconsolidate_import
+                        || existing.state != SessionState::Finalized
+                        || (existing.summary_status == SummaryStatus::Skipped
+                            && !has_consolidation_content(&self.sessions.events(existing.id)?)))
             } else {
                 false
             };
-            if !retry_empty_import {
+            if !retry_import {
                 return Ok(ImportOutcome::AlreadyImported);
             }
         }
@@ -851,6 +882,25 @@ impl Menvane {
             session.cwd = None;
             self.record_orphan(&session)?;
             return Ok(ImportOutcome::Orphan);
+        }
+        if retry_import {
+            for event in &mut session.events {
+                if reattribute_import
+                    || reconsolidate_import
+                    || matches!(
+                        event.kind,
+                        NormalizedEventKind::SessionStarted | NormalizedEventKind::SessionEnded
+                    )
+                {
+                    event.event_id.push_str(if reattribute_import {
+                        ":project-retry"
+                    } else if reconsolidate_import {
+                        ":continuity-retry"
+                    } else {
+                        ":retry"
+                    });
+                }
+            }
         }
         let mut ended = None;
         for event in session.events {
@@ -1843,6 +1893,60 @@ fn has_consolidation_content(events: &[NormalizedEvent]) -> bool {
                     .as_ref()
                     .is_some_and(|value| !value.trim().is_empty()))
     })
+}
+
+fn has_unmaterialized_continuity(result: &ConsolidationResult) -> bool {
+    let new_continuations = result
+        .summary
+        .continuity
+        .iter()
+        .filter(|item| {
+            item.disposition == menvane_domain::ContinuityDisposition::Continues
+                && item.item_id.is_none()
+        })
+        .count();
+    let creations = result
+        .handoff
+        .iter()
+        .filter(|operation| matches!(operation, HandoffItemOperation::Create(_)))
+        .count();
+    creations < new_continuations
+}
+
+fn reliable_import_cwd(session: &NormalizedSession) -> Result<Option<PathBuf>> {
+    if let Some(cwd) = session.cwd.as_deref()
+        && Path::new(cwd).exists()
+        && let Some(resolution) = ProjectResolver::resolve(Path::new(cwd))?
+    {
+        return Ok(Some(resolution.root));
+    }
+    let mut projects = BTreeMap::new();
+    for event in session.events.iter().filter(|event| {
+        event.success == Some(true)
+            && matches!(
+                event.tool_family.as_deref(),
+                Some("apply_patch" | "edit" | "write")
+            )
+    }) {
+        let Some(path) = event.attributed_path.as_deref() else {
+            continue;
+        };
+        let path = Path::new(path);
+        if !path.exists() {
+            continue;
+        }
+        let probe = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        if let Some(resolution) = ProjectResolver::resolve(probe)? {
+            projects.insert(resolution.id, resolution.root);
+        }
+    }
+    Ok((projects.len() == 1)
+        .then(|| projects.into_values().next())
+        .flatten())
 }
 
 #[derive(Debug, Clone, Copy)]

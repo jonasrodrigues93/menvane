@@ -213,6 +213,37 @@ pub fn validate_consolidation_result(
             "summary references an item outside the packet".into(),
         ));
     }
+    let new_continuations = result
+        .summary
+        .continuity
+        .iter()
+        .filter(|item| {
+            item.disposition == ContinuityDisposition::Continues && item.item_id.is_none()
+        })
+        .count();
+    let creations = result
+        .handoff
+        .iter()
+        .filter(|operation| matches!(operation, HandoffItemOperation::Create(_)))
+        .count();
+    if creations < new_continuations {
+        return Err(ConsolidationValidationError(
+            "every new continuing front needs a handoff creation".into(),
+        ));
+    }
+    for continuity in result.summary.continuity.iter().filter(|item| {
+        item.disposition == ContinuityDisposition::Continues && item.item_id.is_some()
+    }) {
+        let item_id = continuity.item_id.expect("filtered item id");
+        if !result.handoff.iter().any(|operation| {
+            matches!(operation, HandoffItemOperation::Keep { item_id: id } | HandoffItemOperation::Uncertain { item_id: id } if *id == item_id)
+                || matches!(operation, HandoffItemOperation::Update(value) if value.item_id == item_id)
+        }) {
+            return Err(ConsolidationValidationError(
+                "every continuing handoff item needs a keep, update, or uncertain operation".into(),
+            ));
+        }
+    }
     for operation in &result.knowledge {
         if operation
             .target_memory_ids
@@ -846,6 +877,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("every previous handoff item"));
+    }
+
+    #[test]
+    fn every_new_continuing_front_requires_handoff_creation() {
+        let mut episodic = summary();
+        episodic.continuity.push(ContinuityItem {
+            item_id: None,
+            front: "Implement the pending provider integration".to_owned(),
+            disposition: ContinuityDisposition::Continues,
+        });
+        let error = validate_consolidation_result(
+            &ConsolidationPacket {
+                session_id: Uuid::from_u128(2),
+                events: Vec::new(),
+                handoff_items: Vec::new(),
+                related_summaries: Vec::new(),
+                related_memories: Vec::new(),
+            },
+            &ConsolidationResult {
+                summary: episodic,
+                handoff: Vec::new(),
+                knowledge: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("handoff creation"));
     }
 
     #[test]

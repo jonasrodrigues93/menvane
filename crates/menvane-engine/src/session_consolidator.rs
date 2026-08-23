@@ -58,7 +58,7 @@ impl SessionConsolidator {
                 self.prompt.clone()
             } else {
                 format!(
-                    "{} Repair the previous response: {}",
+                    "{} Repair the previous response instead of repeating it. If a knowledge operation is unsupported, remove it and return no operation for that candidate. Validation error: {}",
                     self.prompt,
                     last_error
                         .as_ref()
@@ -143,7 +143,7 @@ fn execution(
     }
 }
 
-pub const CONSOLIDATION_SYSTEM_PROMPT: &str = "Summarize the chronological session into intentions, actions, outcome, result, continuity, and candidate learnings. Apply an explicit operation to every supplied handoff item. Create only reusable context or playbook knowledge supported by supplied evidence. Return structured JSON only.";
+pub const CONSOLIDATION_SYSTEM_PROMPT: &str = "Summarize the chronological session into intentions, actions, outcome, result, continuity, and candidate learnings. Apply an explicit operation to every supplied handoff item. Every new continuity entry marked continues must omit item_id and have a corresponding handoff create operation. Only copy item_id from a supplied handoff item; never invent one. Every existing continuing item must be kept, updated, or marked uncertain. Never report live pending work only in the summary. Zero knowledge operations is the expected result unless the packet contains non-obvious reusable knowledge. Every create, merge, or supersede knowledge operation must cite an evidence event from the packet whose successful tool result or non-empty tool output directly supports the knowledge. If no such event exists, omit the knowledge operation instead of inventing or citing weaker evidence. Return structured JSON only.";
 
 fn invalid_schema(message: impl ToString) -> LlmError {
     LlmError {

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, Query, State};
-use axum::response::{Html, IntoResponse, Response};
+use axum::extract::{Form, Path, Query, State};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use menvane_domain::{
     HandoffItem, KnowledgeType, Memory, NormalizedEvent, Project, ProviderHealth,
@@ -25,7 +25,7 @@ pub fn router() -> Router<Arc<Menvane>> {
         .route("/imports", get(imports))
         .route("/integrations", get(integrations))
         .route("/providers", get(providers))
-        .route("/settings", get(settings))
+        .route("/settings", get(settings).post(update_settings))
         .route("/assets/menvane.css", get(styles))
         .route("/assets/menvane.js", get(script))
 }
@@ -36,6 +36,7 @@ async fn dashboard(State(menvane): State<Arc<Menvane>>) -> Response {
         let memories = knowledge_memories(menvane.all_memories()?);
         let sessions = menvane.sessions(100)?;
         let jobs = menvane.jobs()?;
+        let integrations = menvane.integrations()?;
         let provider = menvane.provider_health().await.ok();
         let ready = provider.is_some_and(|(_, _, health)| health == ProviderHealth::Ready);
         let context_count = memories
@@ -51,21 +52,31 @@ async fn dashboard(State(menvane): State<Arc<Menvane>>) -> Response {
             .take(4)
             .map(session_row)
             .collect::<String>();
+        let connections = [("CC", "Claude Code", "claude-code"), ("CX", "Codex", "codex"), ("OC", "OpenCode", "opencode")]
+            .into_iter()
+            .map(|(icon, name, key)| {
+                let state = integrations.iter().find(|state| state.client == key);
+                let connected = state.is_some_and(|state| state.connected);
+                let detail = state.map_or("not installed".to_owned(), |state| {
+                    format!("{} · {}", if state.mcp_registered { "MCP registered" } else { "MCP missing" }, state.hook_status)
+                });
+                format!("<article class='connection'><span class='connection-icon'>{icon}</span><div><strong>{name}</strong><small>{}</small></div><span class='connection-state{}'>{}</span></article>", escape(&detail), if connected { "" } else { " off" }, if connected { "Connected" } else { "Disconnected" })
+            })
+            .collect::<String>();
+        let connections =
+            format!("<section class='connections' aria-label='Connections'>{connections}</section>");
         Ok(format!(
-            "{}<section class='metrics'>{}{}{}{}{}{}</section><div class='dashboard-grid'><section class='panel'><header class='panel-head'><div><h2>Durable knowledge</h2><p>Recent context and playbooks</p></div><a class='panel-link' href='/memories'>All knowledge →</a></header><div class='memory-list'>{}</div></section><aside class='right-stack'><section class='panel'><header class='panel-head'><div><h2>Recent sessions</h2><p>Chronological evidence</p></div><a class='panel-link' href='/sessions'>All sessions →</a></header><div class='session-list'>{}</div></section><section class='panel'><header class='panel-head'><div><h2>System</h2><p>Local runtime</p></div></header><div class='system-list'><div class='system-row'><span>Provider</span><strong class='{}'>{}</strong></div><div class='system-row'><span>Queue</span><strong>{} pending</strong></div><div class='system-row'><span>Storage</span><strong>Markdown + SQLite</strong></div></div></section></aside></div><div class='section-title'><div><h2>Projects</h2><p>Stable identities and live work fronts</p></div><a href='/projects'>All projects →</a></div><section class='panel'><table class='project-table'><thead><tr><th>Project</th><th>Technologies</th><th>Knowledge</th></tr></thead><tbody>{}</tbody></table></section>",
-            page_head("Overview", "Operational continuity, not a backlog."),
-            metric("01", "Context", context_count, "durable records"),
-            metric("02", "Playbooks", playbook_count, "reusable procedures"),
-            metric("03", "Sessions", sessions.len(), "captured journeys"),
-            metric("04", "Projects", projects.len(), "known identities"),
-            metric("05", "Queue", pending, "pending jobs"),
-            metric("06", "Provider", usize::from(ready), if ready { "ready" } else { "attention" }),
-            memory_list(&recent_memories, &names),
-            if recent_sessions.is_empty() { empty_state("No sessions captured yet.") } else { recent_sessions },
+            "{}<section class='metrics'>{}{}</section><div class='dashboard-grid'><section><div class='section-title compact'><div><h2>Projects</h2><p>Known identities and durable knowledge</p></div><a href='/projects'>All projects →</a></div><section class='panel'><table class='project-table'><thead><tr><th>Project</th><th>Technologies</th><th>Knowledge</th></tr></thead><tbody>{}</tbody></table></section></section><aside class='right-stack'><section class='panel'><header class='panel-head'><div><h2>System</h2><p>Local runtime</p></div></header><div class='system-list'><div class='system-row'><span>Provider</span><strong class='{}'>{}</strong></div><div class='system-row'><span>Queue</span><strong>{} pending</strong></div><div class='system-row'><span>Storage</span><strong>Markdown + SQLite</strong></div></div></section><section class='panel'><header class='panel-head'><div><h2>Recent sessions</h2><p>Chronological evidence</p></div><a class='panel-link' href='/sessions'>All sessions →</a></header><div class='session-list'>{}</div></section></aside></div><section class='panel overview-memory'><header class='panel-head'><div><h2>Recent durable knowledge</h2><p>Context and playbooks</p></div><a class='panel-link' href='/memories'>All memories →</a></header><div class='memory-list'>{}</div></section>{}",
+            page_head("Overview", "Projects first, then operational health and durable knowledge."),
+            metric("", "Context", context_count, "durable records"),
+            metric("", "Playbooks", playbook_count, "reusable procedures"),
+            project_rows(&projects, &memories),
             if ready { "ready" } else { "attention" },
             if ready { "Ready" } else { "Attention" },
             pending,
-            project_rows(&projects, &memories),
+            if recent_sessions.is_empty() { empty_state("No sessions captured yet.") } else { recent_sessions },
+            memory_list(&recent_memories, &names),
+            connections,
         ))
     }
     .await;
@@ -380,13 +391,138 @@ async fn providers(State(menvane): State<Arc<Menvane>>) -> Response {
 
 async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
     let content = menvane.configuration_text().map(|configuration| {
+        let parsed = toml::from_str::<toml::Value>(&configuration)
+            .unwrap_or_else(|_| toml::Value::Table(toml::Table::new()));
+        let get = |section: &str, key: &str, fallback: &str| {
+            parsed
+                .get(section)
+                .and_then(|value| value.get(key))
+                .map(ToString::to_string)
+                .map(|value| value.trim_matches('"').to_owned())
+                .unwrap_or_else(|| fallback.to_owned())
+        };
         format!(
-            "{}<section class='panel'><pre>{}</pre></section>",
-            page_head("Settings", "Current non-secret runtime configuration."),
-            escape(&configuration)
+            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
+            page_head("Settings", "Observable runtime configuration."),
+            get("capture", "max_prompt_bytes", "16384"),
+            get("capture", "max_tool_input_bytes", "4096"),
+            get("capture", "max_tool_output_bytes", "4096"),
+            get("sessions", "idle_finalize_seconds", "120"),
+            get("jobs", "lease_timeout_seconds", "300"),
+            get("llm", "provider", "openai"),
+            get("llm", "model", "gpt-5.6-luna"),
+            reasoning_options(&get("llm", "reasoning_effort", "medium")),
+            escape_attribute(&get("llm", "base_url", "https://api.openai.com/v1")),
+            escape_attribute(&get("llm", "api_key_env", "OPENAI_API_KEY")),
+            escape(&get("llm", "consolidation_prompt", "")),
         )
     });
     page_result(&menvane, "settings", "Settings", content)
+}
+
+fn reasoning_options(current: &str) -> String {
+    ["minimal", "low", "medium", "high", "xhigh"]
+        .into_iter()
+        .map(|value| {
+            format!(
+                "<option value='{value}'{}>{value}</option>",
+                if value == current { " selected" } else { "" }
+            )
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct SettingsEdit {
+    max_prompt_bytes: u64,
+    max_tool_input_bytes: u64,
+    max_tool_output_bytes: u64,
+    idle_finalize_seconds: u64,
+    lease_timeout_seconds: u64,
+    provider: String,
+    model: String,
+    reasoning_effort: String,
+    base_url: String,
+    api_key_env: String,
+    consolidation_prompt: String,
+}
+
+async fn update_settings(
+    State(menvane): State<Arc<Menvane>>,
+    Form(edit): Form<SettingsEdit>,
+) -> Response {
+    let result = (|| -> anyhow::Result<()> {
+        let mut configuration: toml::Table = toml::from_str(&menvane.configuration_text()?)?;
+        for (section, key, value) in [
+            (
+                "capture",
+                "max_prompt_bytes",
+                toml::Value::Integer(edit.max_prompt_bytes as i64),
+            ),
+            (
+                "capture",
+                "max_tool_input_bytes",
+                toml::Value::Integer(edit.max_tool_input_bytes as i64),
+            ),
+            (
+                "capture",
+                "max_tool_output_bytes",
+                toml::Value::Integer(edit.max_tool_output_bytes as i64),
+            ),
+            (
+                "sessions",
+                "idle_finalize_seconds",
+                toml::Value::Integer(edit.idle_finalize_seconds as i64),
+            ),
+            (
+                "jobs",
+                "lease_timeout_seconds",
+                toml::Value::Integer(edit.lease_timeout_seconds as i64),
+            ),
+            (
+                "llm",
+                "provider",
+                toml::Value::String(edit.provider.trim().to_owned()),
+            ),
+            (
+                "llm",
+                "model",
+                toml::Value::String(edit.model.trim().to_owned()),
+            ),
+            (
+                "llm",
+                "reasoning_effort",
+                toml::Value::String(edit.reasoning_effort),
+            ),
+            (
+                "llm",
+                "base_url",
+                toml::Value::String(edit.base_url.trim().to_owned()),
+            ),
+            (
+                "llm",
+                "api_key_env",
+                toml::Value::String(edit.api_key_env.trim().to_owned()),
+            ),
+            (
+                "llm",
+                "consolidation_prompt",
+                toml::Value::String(edit.consolidation_prompt),
+            ),
+        ] {
+            configuration
+                .entry(section)
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| anyhow::anyhow!("{section} configuration must be a table"))?
+                .insert(key.to_owned(), value);
+        }
+        menvane.update_configuration_text(&toml::to_string_pretty(&configuration)?)
+    })();
+    match result {
+        Ok(()) => Redirect::to("/settings?saved=1").into_response(),
+        Err(error) => error_page(&menvane, error),
+    }
 }
 
 fn knowledge_memories(memories: Vec<Memory>) -> Vec<Memory> {
@@ -436,7 +572,12 @@ fn project_rows(projects: &[Project], memories: &[Memory]) -> String {
 
 fn metric(index: &str, label: &str, value: usize, detail: &str) -> String {
     format!(
-        "<article class='metric'><span class='metric-label'><b>{index}</b>{}</span><strong>{value:02}</strong><small>{}</small></article>",
+        "<article class='metric'><span class='metric-label'>{}{}</span><strong>{value:02}</strong><small>{}</small></article>",
+        if index.is_empty() {
+            String::new()
+        } else {
+            format!("<b>{index}</b>")
+        },
         escape(label),
         escape(detail)
     )
@@ -611,33 +752,28 @@ fn page_result(
 }
 
 fn page(menvane: &Menvane, active: &str, title: &str, content: String) -> Response {
-    let project_count = menvane.all_projects().map_or(0, |items| items.len());
-    let memory_count = menvane.all_memories().map_or(0, |items| items.len());
-    let session_count = menvane.sessions(100).map_or(0, |items| items.len());
-    let nav_item = |key: &str, number: &str, label: &str, href: &str, count: Option<usize>| {
+    let nav_item = |key: &str, label: &str, href: &str| {
         format!(
-            "<a{} href='{href}'><span class='nav-icon'>{number}</span><span>{label}</span>{}</a>",
+            "<a{} href='{href}'>{label}</a>",
             if active == key {
                 " class='active' aria-current='page'"
             } else {
                 ""
-            },
-            count
-                .map(|value| format!("<span class='nav-count'>{value:02}</span>"))
-                .unwrap_or_default()
+            }
         )
     };
     Html(format!(
-        "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Menvane — {}</title><link rel='stylesheet' href='/assets/menvane.css'><script defer src='/assets/menvane.js'></script></head><body><div class='app'><aside class='sidebar' id='sidebar'><a class='brand' href='/'><span class='brand-mark'></span><span class='brand-copy'><strong>MENVANE</strong><small>LOCAL MEMORY</small></span></a><div class='nav-label'>Workspace</div><nav class='nav'>{}{}{}{}</nav><div class='nav-label'>System</div><nav class='nav'>{}{}{}{}</nav><div class='sidebar-foot'><div class='daemon'><i></i>Local runtime</div><div class='storage'>{}</div></div></aside><main class='main'><header class='topbar'><button class='mobile-menu' id='mobile-menu' type='button' aria-label='Toggle navigation'>≡</button><div class='breadcrumb'>Menvane / <strong>{}</strong></div><a class='command-trigger' href='/memories'><span>⌕</span>Search durable knowledge<kbd>/</kbd></a><div class='local-label'>Local only</div></header><div class='workspace'>{content}</div></main></div></body></html>",
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Menvane — {}</title><link rel='stylesheet' href='/assets/menvane.css'><script defer src='/assets/menvane.js'></script></head><body><div class='app'><aside class='sidebar' id='sidebar'><a class='brand' href='/' aria-label='Menvane overview'><span class='brand-mark' aria-hidden='true'></span><span class='brand-copy'><strong>MENVANE</strong><small>LOCAL MEMORY</small></span></a><div class='nav-label'>Workspace</div><nav class='nav' aria-label='Workspace'>{}{}{}{}{}</nav><div class='nav-label'>System</div><nav class='nav' aria-label='System'>{}{}{}{}</nav><div class='sidebar-foot'><div class='daemon'><i></i>Daemon ready</div><div class='storage'>{}</div></div></aside><main class='main'><header class='topbar'><button class='mobile-menu' id='mobile-menu' type='button' aria-label='Open navigation' aria-expanded='false' aria-controls='sidebar'>≡</button><div class='breadcrumb'>Menvane / <strong>{}</strong></div></header><div class='workspace'>{content}</div></main></div><div class='toast' id='toast' role='status'></div></body></html>",
         escape(title),
-        nav_item("overview", "01", "Overview", "/", None),
-        nav_item("projects", "02", "Projects", "/projects", Some(project_count)),
-        nav_item("memories", "03", "Knowledge", "/memories", Some(memory_count)),
-        nav_item("sessions", "04", "Sessions", "/sessions", Some(session_count)),
-        nav_item("imports", "05", "Imports", "/imports", None),
-        nav_item("integrations", "06", "Connections", "/integrations", None),
-        nav_item("providers", "07", "Providers", "/providers", None),
-        nav_item("settings", "08", "Settings", "/settings", None),
+        nav_item("overview", "Overview", "/"),
+        nav_item("projects", "Projects", "/projects"),
+        nav_item("memories", "Memories", "/memories"),
+        nav_item("playbooks", "Playbooks", "/memories?type=playbook"),
+        nav_item("sessions", "Sessions", "/sessions"),
+        nav_item("imports", "Imports", "/imports"),
+        nav_item("integrations", "Connections", "/integrations"),
+        nav_item("providers", "Providers", "/providers"),
+        nav_item("settings", "Settings", "/settings"),
         escape(&menvane.home().display().to_string()),
         escape(title),
     )).into_response()
@@ -712,7 +848,7 @@ async fn script() -> impl IntoResponse {
     ([("content-type", "text/javascript; charset=utf-8")], JS)
 }
 
-const JS: &str = r"const menu=document.querySelector('#mobile-menu');const sidebar=document.querySelector('#sidebar');menu?.addEventListener('click',()=>sidebar.classList.toggle('open'));document.addEventListener('keydown',event=>{if(event.key==='Escape')sidebar?.classList.remove('open');if(event.key==='/'&&document.activeElement?.tagName!=='INPUT'){event.preventDefault();window.location='/memories'}});";
+const JS: &str = r"const menu=document.querySelector('#mobile-menu');const sidebar=document.querySelector('#sidebar');const toast=document.querySelector('#toast');menu?.addEventListener('click',()=>{const open=sidebar.classList.toggle('open');menu.setAttribute('aria-expanded',String(open))});document.addEventListener('keydown',event=>{if(event.key==='Escape'){sidebar?.classList.remove('open');menu?.setAttribute('aria-expanded','false')}if(event.key==='/'&&!['INPUT','SELECT','TEXTAREA'].includes(document.activeElement?.tagName)){event.preventDefault();window.location='/memories'}});const params=new URLSearchParams(window.location.search);if(params.get('saved')==='1'){toast.textContent='Changes saved';toast.classList.add('show');window.setTimeout(()=>toast.classList.remove('show'),2600);params.delete('saved');history.replaceState(null,'',location.pathname+(params.size?'?'+params:''))}";
 
 const CSS: &str = r#"
 :root{color-scheme:light;--canvas:#efeee8;--surface:#faf9f5;--raised:#fff;--muted-surface:#e7e6df;--ink:#1d1e1b;--text:#3e403a;--muted:#777970;--quiet:#a3a59b;--line:#d0d1c9;--strong:#a9aba1;--accent:#315cf4;--accent-soft:#e7ebff;--signal:#b9e936;--signal-soft:#eff8d4;--warn:#d88614;--warn-soft:#fff0d9;--danger:#d8523f;--rail:224px;--mono:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;--sans:"Aptos","Segoe UI",sans-serif}
@@ -721,4 +857,8 @@ const CSS: &str = r#"
 @media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.metric{border-bottom:1px solid var(--line)}.metric:nth-child(2n){border-right:0}.page-head h1{font-size:25px}.memory-row{grid-template-columns:34px 1fr}.memory-tail{display:none}.memory-copy p{white-space:normal}.project-table th:nth-child(2),.project-table td:nth-child(2),.project-table th:nth-child(3),.project-table td:nth-child(3){display:none}.handoff-grid,.summary-grid{grid-template-columns:1fr}.summary-grid section{border-right:0}.session-overview{align-items:flex-start;flex-direction:column}.evidence-row{grid-template-columns:1fr}.evidence-row p{grid-column:1}.filters{display:grid}.filters>*{width:100%}.search-field input{width:100%}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 @media(prefers-color-scheme:dark){:root{color-scheme:dark;--canvas:#171a19;--surface:#202523;--raised:#282e2b;--muted-surface:#303834;--ink:#f2f4ed;--text:#d4d9d0;--muted:#a1aaa0;--quiet:#7f8b80;--line:#3d4740;--strong:#657166;--accent:#8ea8ff;--accent-soft:#29334f;--signal:#b9e936;--signal-soft:#34421b;--warn:#f0ad4e;--warn-soft:#49351d}.sidebar{background:#1d221f}.topbar{background:rgba(23,26,25,.94)}}
+
+body{zoom:1.5}.nav a{grid-template-columns:1fr}.section-title.compact{margin-top:0}.overview-memory{margin-top:18px}.connections{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin-top:18px;border:1px solid var(--strong);background:var(--surface)}.connection{display:grid;grid-template-columns:30px 1fr auto;align-items:center;gap:10px;min-height:61px;padding:0 13px;border-right:1px solid var(--line)}.connection:last-child{border-right:0}.connection-icon{width:28px;height:28px;display:grid;place-items:center;border:1px solid var(--strong);background:var(--raised);font:8px var(--mono)}.connection strong{display:block;font-size:10px}.connection small{display:block;margin-top:4px;color:var(--quiet);font:7px var(--mono)}.connection-state{display:flex;align-items:center;gap:5px;color:var(--muted);font:7px var(--mono);text-transform:uppercase}.connection-state:before{content:"";width:5px;height:5px;background:var(--signal);border:1px solid #769b0a}.connection-state.off:before{background:var(--danger);border-color:#a33627}.callout{margin-bottom:18px;padding:14px}.callout p{margin:0;color:var(--muted);font:8px/1.6 var(--mono)}.settings-form{display:grid;gap:16px;padding:16px}.settings-form fieldset{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 12px;margin:0;padding:12px;border:1px solid var(--line)}.settings-form legend{padding:0 5px;color:var(--ink);font:9px var(--mono);text-transform:uppercase}.settings-form label{display:grid;gap:5px;color:var(--muted);font:7px var(--mono)}.settings-form input,.settings-form select,.settings-form textarea{width:100%;padding:7px;border:1px solid var(--strong);background:var(--raised);color:var(--ink);font:9px/1.4 var(--mono)}.settings-form textarea{grid-column:1/-1;min-height:93px;resize:vertical}.editor-actions{display:flex;align-items:center;gap:12px}.editor-actions button{height:32px;padding:0 12px;border:1px solid var(--ink);background:var(--signal);box-shadow:2px 2px 0 var(--ink);cursor:pointer;font:8px var(--mono);text-transform:uppercase}.quiet-link{display:inline-flex;align-items:center;min-height:32px;color:var(--muted);font:8px var(--mono);text-decoration:none;text-transform:uppercase}.toast{position:fixed;right:20px;bottom:20px;z-index:120;padding:11px 13px;border:1px solid var(--ink);background:var(--signal);box-shadow:4px 4px 0 var(--ink);font:8px var(--mono);opacity:0;transform:translateY(7px);pointer-events:none;transition:opacity .14s ease,transform .14s ease}.toast.show{opacity:1;transform:translateY(0)}
+@media(max-width:1770px){.dashboard-grid{grid-template-columns:1fr}.connections{grid-template-columns:1fr}.connection{border-right:0;border-bottom:1px solid var(--line)}.connection:last-child{border-bottom:0}}
+@media(max-width:760px){.settings-form fieldset{grid-template-columns:1fr}}
 "#;

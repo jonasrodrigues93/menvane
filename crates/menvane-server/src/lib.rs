@@ -574,6 +574,7 @@ mod tests {
         let project_body = String::from_utf8(project_body.to_vec()).unwrap();
         assert!(project_body.contains("Current handoff"));
         assert!(project_body.contains("handoff-surface"));
+        assert!(!project_body.contains("nav-icon"));
         assert!(!project_body.contains("Project Brief"));
         for path in [
             "/",
@@ -601,6 +602,52 @@ mod tests {
                 "{path}"
             );
         }
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/settings")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("settings-form"));
+        assert!(body.contains("name='max_prompt_bytes'"));
+        assert!(body.contains("name='reasoning_effort'"));
+        assert!(!body.contains("<pre>[llm]"));
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("max_prompt_bytes=12000&max_tool_input_bytes=3000&max_tool_output_bytes=3500&idle_finalize_seconds=90&lease_timeout_seconds=240&provider=openai&model=gpt-test&reasoning_effort=high&base_url=https%3A%2F%2Fapi.openai.com%2Fv1&api_key_env=OPENAI_API_KEY&consolidation_prompt="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let configuration = fs::read_to_string(temporary.path().join("home/config.toml")).unwrap();
+        assert!(configuration.contains("max_prompt_bytes = 12000"));
+        assert!(configuration.contains("model = \"gpt-test\""));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/menvane.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("body{zoom:1.5}"));
     }
 
     #[test]
