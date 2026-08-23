@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 2.1.0
+Version: 2.2.0
 
 Menvane is a local persistent memory system for agents. Its central product is operational continuity between agents, sessions, and different days. It preserves four distinct layers:
 
@@ -57,7 +57,7 @@ Technology detection is deterministic and inspects known project files and depen
 
 ## Commands
 
-`menvane write` creates a durable context or playbook. `menvane search` searches current-project and global memory by default. `menvane read` displays a memory. `menvane forget` marks one forgotten. `menvane handoff inspect` displays the current project handoff text, its structured items, and their provenance for diagnostics; normal continuation remains automatic. `menvane reindex` reconstructs the derived index from Markdown. `menvane doctor` checks the home, index database, state database, FTS5, Git availability, and Markdown/index consistency independently.
+`menvane write` creates a durable context or playbook. `menvane search` searches current-project and global memory by default. `menvane read` displays a memory. `menvane forget` marks one forgotten. `menvane jobs retry` requeues failed consolidation jobs. `menvane handoff inspect` displays the current project handoff text, its structured items, and their provenance for diagnostics; normal continuation remains automatic. `menvane reindex` reconstructs the derived index from Markdown. `menvane doctor` checks the home, index database, state database, FTS5, Git availability, and Markdown/index consistency independently.
 
 ## Sessions And Episodic Summaries
 
@@ -115,7 +115,7 @@ MCP search returns identifiers, type, scope, title, score, status, applicability
 
 `menvane serve` runs the Axum daemon on `127.0.0.1:47831` by default. A per-home process lock prevents duplicate daemons. `menvane daemon start`, `stop`, `restart`, and `status` manage the background process.
 
-The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture, consolidation, and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, error fields, an owner, and a configurable 300-second lease timeout by default. The daemon worker claims finalization and consolidation jobs, recovers expired leases after restart, and retries all paths idempotently. Graceful shutdown flushes dirty state when feasible, and capture does not wait for background work.
+The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture, consolidation, and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, error fields, an owner, and a configurable 300-second lease timeout by default. The daemon worker claims finalization and consolidation jobs, recovers expired leases after restart, and retries all paths idempotently. Provider availability, authentication, rate, network, and capability failures remain pending with bounded exponential backoff until the provider recovers; invalid input, invalid schemas, and internal failures become failed after the normal retry limit. `menvane jobs retry` explicitly requeues failed consolidation jobs. Graceful shutdown flushes dirty state when feasible, and capture does not wait for background work.
 
 REST covers sessions with their episodic summaries, the current handoff with items and provenance, recall, and context and playbook knowledge. Removed legacy selectors and endpoints return explicit absence, not partial behavior. Session reads by ID return the chronological capture and, when present, the episodic summary.
 

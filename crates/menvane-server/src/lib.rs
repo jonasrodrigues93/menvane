@@ -36,6 +36,7 @@ pub async fn serve(menvane: Menvane, address: &str, port: u16) -> Result<()> {
         loop {
             interval.tick().await;
             let _ = worker.finalize_idle_sessions();
+            let _ = worker.retry_failed_provider_consolidations().await;
             let _ = worker.process_next_job().await;
         }
     });

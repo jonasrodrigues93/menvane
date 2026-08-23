@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     owner TEXT,
     lease_started_at TEXT,
     lease_until TEXT,
+    retryable INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(job_type, dedupe_key)
@@ -238,6 +239,7 @@ impl SessionRepository {
         let connection = self.open()?;
         reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        ensure_retryable_job_column(&connection)?;
         connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         Ok(())
     }
@@ -499,6 +501,7 @@ impl SessionRepository {
         owner: &str,
         provider: Option<&str>,
         error: Option<&str>,
+        retryable: bool,
     ) -> Result<()> {
         let connection = self.open()?;
         let attempt: Option<u32> = connection
@@ -514,14 +517,38 @@ impl SessionRepository {
         let now = Utc::now();
         let (status, retry) = match error {
             None => ("completed", now),
+            Some(_) if retryable => (
+                "pending",
+                now + chrono::Duration::seconds(2_i64.pow(attempt.min(10))),
+            ),
             Some(_) if attempt < 5 => (
                 "pending",
                 now + chrono::Duration::seconds(2_i64.pow(attempt.min(10))),
             ),
             Some(_) => ("failed", now),
         };
-        connection.execute("UPDATE jobs SET status=?1, next_retry_at=?2, last_error=?3, provider=?4, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?5 WHERE id=?6 AND owner=?7", params![status, retry.to_rfc3339(), error, provider, now.to_rfc3339(), id.to_string(), owner])?;
+        connection.execute("UPDATE jobs SET status=?1, next_retry_at=?2, last_error=?3, provider=?4, retryable=?5, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?6 WHERE id=?7 AND owner=?8", params![status, retry.to_rfc3339(), error, provider, retryable, now.to_rfc3339(), id.to_string(), owner])?;
         Ok(())
+    }
+
+    pub fn retry_failed_provider_consolidations(&self) -> Result<usize> {
+        let connection = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        let updated = connection.execute(
+            "UPDATE jobs SET status='pending', attempt_count=0, next_retry_at=?1, last_error=NULL, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE job_type='consolidate_session' AND status='failed' AND retryable=1",
+            [&now],
+        )?;
+        Ok(updated)
+    }
+
+    pub fn retry_failed_consolidations(&self) -> Result<usize> {
+        let connection = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        let updated = connection.execute(
+            "UPDATE jobs SET status='pending', attempt_count=0, next_retry_at=?1, last_error=NULL, owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE job_type='consolidate_session' AND status='failed'",
+            [&now],
+        )?;
+        Ok(updated)
     }
 
     pub fn set_session_summary(
@@ -937,6 +964,20 @@ fn enqueue_job_connection(
         |row| row.get::<_, String>(0),
     )?;
     Ok(Uuid::parse_str(&value)?)
+}
+
+fn ensure_retryable_job_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(jobs)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "retryable") {
+        connection.execute(
+            "ALTER TABLE jobs ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {

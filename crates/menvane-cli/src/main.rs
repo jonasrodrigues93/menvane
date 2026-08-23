@@ -36,6 +36,7 @@ enum Command {
     Hook(HookArgs),
     Provider(ProviderArgs),
     Import(ImportArgs),
+    Jobs(JobsArgs),
     Backup(BackupArgs),
     Restore(RestoreArgs),
     Write(WriteArgs),
@@ -82,6 +83,17 @@ struct ImportArgs {
     dry_run: bool,
     #[arg(long, default_value = "http://127.0.0.1:4096")]
     url: String,
+}
+
+#[derive(Args)]
+struct JobsArgs {
+    #[command(subcommand)]
+    command: JobsCommand,
+}
+
+#[derive(Subcommand)]
+enum JobsCommand {
+    Retry,
 }
 
 fn parse_days(value: &str) -> Result<i64, String> {
@@ -554,6 +566,12 @@ async fn main() -> Result<()> {
                 println!("invalid\t{}", scan.invalid_records);
             }
         }
+        Command::Jobs(arguments) => match arguments.command {
+            JobsCommand::Retry => {
+                let count = menvane.retry_failed_consolidations()?;
+                println!("requeued {count} failed consolidation jobs");
+            }
+        },
         Command::Backup(arguments) => {
             menvane.backup(&arguments.output)?;
             println!("backup created at {}", arguments.output.display());

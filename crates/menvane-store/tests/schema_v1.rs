@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use chrono::{Duration, Utc};
 use menvane_store::{IndexStore, MarkdownStore, SessionRepository};
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -79,6 +80,66 @@ fn repeated_initialization_preserves_rows_and_integrity() {
     assert_eq!(state.jobs().unwrap().len(), 1);
     assert_integrity(&home.path().join("index.sqlite"));
     assert_integrity(&home.path().join("state.sqlite"));
+}
+
+#[test]
+fn retryable_jobs_remain_pending_and_failed_consolidations_can_be_requeued() {
+    let home = TempDir::new().unwrap();
+    let state = SessionRepository::new(home.path().join("state.sqlite"));
+    state.initialize().unwrap();
+    state
+        .enqueue_job("consolidate_session", "session-retryable", "{}")
+        .unwrap();
+
+    let mut now = Utc::now();
+    for _ in 0..6 {
+        let job = state.claim_job_at("test-owner", 300, now).unwrap().unwrap();
+        state
+            .finish_job(job.id, "test-owner", None, Some("offline"), true)
+            .unwrap();
+        now = state.jobs().unwrap()[0].next_retry_at + Duration::seconds(1);
+    }
+    let job = state.jobs().unwrap().pop().unwrap();
+    assert_eq!(job.status, "pending");
+    assert_eq!(job.attempt_count, 6);
+
+    state
+        .enqueue_job("consolidate_session", "session-failed", "{}")
+        .unwrap();
+    now = Utc::now();
+    for _ in 0..5 {
+        let job = state.claim_job_at("test-owner", 300, now).unwrap().unwrap();
+        state
+            .finish_job(job.id, "test-owner", None, Some("invalid"), false)
+            .unwrap();
+        now = state
+            .jobs()
+            .unwrap()
+            .into_iter()
+            .find(|value| value.dedupe_key == "session-failed")
+            .unwrap()
+            .next_retry_at
+            + Duration::seconds(1);
+    }
+    assert_eq!(
+        state
+            .jobs()
+            .unwrap()
+            .into_iter()
+            .find(|value| value.dedupe_key == "session-failed")
+            .unwrap()
+            .status,
+        "failed"
+    );
+    assert_eq!(state.retry_failed_consolidations().unwrap(), 1);
+    let requeued = state
+        .jobs()
+        .unwrap()
+        .into_iter()
+        .find(|value| value.dedupe_key == "session-failed")
+        .unwrap();
+    assert_eq!(requeued.status, "pending");
+    assert_eq!(requeued.attempt_count, 0);
 }
 
 #[test]

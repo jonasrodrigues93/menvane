@@ -22,9 +22,10 @@ use fs2::FileExt;
 use menvane_domain::{
     Applicability, ConsolidationPacket, ConsolidationResult, EmbeddingProvider, EpisodicSummary,
     HandoffItem, HandoffItemOperation, HandoffItemSource, JsonSchema, KnowledgeContent,
-    KnowledgeOperation, KnowledgeOperationKind, KnowledgeType, LlmProvider, LlmRequest, Memory,
-    MemoryMetadata, MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project,
-    ProviderHealth, ReinforcementSignal, Scope, SessionMetadata, SessionState, SummaryStatus,
+    KnowledgeOperation, KnowledgeOperationKind, KnowledgeType, LlmError, LlmProvider, LlmRequest,
+    Memory, MemoryMetadata, MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession,
+    Project, ProviderHealth, ReinforcementSignal, Scope, SessionMetadata, SessionState,
+    SummaryStatus,
 };
 use menvane_store::{
     IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MAX_SUMMARY_SELECTION_BYTES,
@@ -589,6 +590,19 @@ impl Menvane {
         self.sessions.jobs()
     }
 
+    pub fn retry_failed_consolidations(&self) -> Result<usize> {
+        self.sessions.retry_failed_consolidations()
+    }
+
+    pub async fn retry_failed_provider_consolidations(&self) -> Result<usize> {
+        let provider = self.configured_provider()?;
+        if provider.health().await == ProviderHealth::Ready {
+            self.sessions.retry_failed_provider_consolidations()
+        } else {
+            Ok(0)
+        }
+    }
+
     pub fn current_handoff_items(&self, project_id: Option<&str>) -> Result<Vec<HandoffItem>> {
         self.sessions.current_handoff(project_id)
     }
@@ -1125,13 +1139,20 @@ impl Menvane {
                 job.owner.as_deref().unwrap_or_default(),
                 provider.as_deref(),
                 None,
+                false,
             )?,
-            Err(error) => self.sessions.finish_job(
-                job.id,
-                job.owner.as_deref().unwrap_or_default(),
-                None,
-                Some(&error.to_string()),
-            )?,
+            Err(error) => {
+                let retryable = error
+                    .downcast_ref::<LlmError>()
+                    .is_some_and(|error| error.fallback_allowed());
+                self.sessions.finish_job(
+                    job.id,
+                    job.owner.as_deref().unwrap_or_default(),
+                    None,
+                    Some(&error.to_string()),
+                    retryable,
+                )?;
+            }
         }
         Ok(true)
     }
