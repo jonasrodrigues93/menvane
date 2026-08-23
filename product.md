@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 2.2.0
+Version: 2.3.0
 
 Menvane is a local persistent memory system for agents. Its central product is operational continuity between agents, sessions, and different days. It preserves four distinct layers:
 
@@ -93,9 +93,9 @@ Applying the complete result is idempotent and uses a single transactional marke
 
 ## Retrieval And Delivery
 
-Session start delivers only minimal project identity, the current handoff, and an indication that additional memory is available. It never delivers technologies, architecture, or a typed-memory briefing. The full handoff is delivered at most once per session identity and content; unchanged content is not redelivered, and new content may be delivered again.
+Session start inside a resolved project delivers only minimal project identity, the current project handoff, and an indication that additional memory is available. Outside a resolved project it injects nothing; global handoff and memory retrieval wait for the first user prompt so intent can constrain selection. Session-start and prompt-time handoff delivery share the same content claim, so identical rendered handoff content is delivered at most once per session identity. Unchanged content is not redelivered, and new content may be delivered again.
 
-Each new prompt selects the handoff items related to the current intent plus zero to three relevant contexts or playbooks, presented as bounded cards. Automatic recall removes recognized English and Portuguese stopwords, preserves technical identifiers, requires meaningful lexical coverage, and may return no result. Unrelated prompts receive no handoff items. Full bodies remain available only through explicit reads. The hot path never calls a language-model provider.
+Each new prompt selects the handoff items related to the current intent plus zero to three relevant contexts or playbooks, presented as bounded cards. Automatic recall removes recognized English and Portuguese stopwords, excludes path fragments from generated recall queries, preserves technical identifiers, requires meaningful lexical coverage, and may return no result. Handoff selection additionally ignores generic file, configuration, error, path, and system terms and requires two or three meaningful shared terms according to prompt size. Unrelated prompts receive no handoff items. Recall diagnostics report the generated query, handoff scope, coincident terms, required match count, and delivery reason. Full bodies remain available only through explicit reads. The hot path never calls a language-model provider.
 
 Automatic recall searches only the current project and global memory. Global universal memories are eligible everywhere. Global contextual memories are eligible only when every populated applicability dimension overlaps the current project's detected technologies. Explicit search retains its lexical behavior and may inspect an otherwise incompatible contextual memory when the query names one of its technologies.
 
@@ -125,7 +125,7 @@ REST covers sessions with their episodic summaries, the current handoff with ite
 
 Claude hooks normalize client payloads before domain ingestion and ensure the daemon is running. Hooks originating from `MENVANE_INTERNAL=1` are ignored. Reliably attributed ignored paths are dropped and all capture is sanitized before local daemon transport.
 
-Session start injects only minimal project identity and the current handoff, at most once per session identity and content. User prompts receive only the handoff items related to the current intent plus up to three context or playbook cards. Full bodies are never injected automatically. Recall prompts are sanitized and bounded before search; oversized client, session, and working-directory identifiers are rejected by the daemon. No external language-model request occurs on this path.
+Session start injects only minimal project identity and the current handoff when the working directory resolves to a project, at most once per session identity and content. Global session start injects nothing. User prompts receive only handoff items that meet the meaningful-overlap threshold plus up to three context or playbook cards. Full bodies are never injected automatically. Recall prompts are sanitized and bounded before search; oversized client, session, and working-directory identifiers are rejected by the daemon. No external language-model request occurs on this path.
 
 Injected memory is delimited as historical context and explicitly states that current user instructions and repository state are authoritative. Hook capture and recall require no memory instruction from the user.
 
@@ -155,9 +155,9 @@ Playbook content contains trigger, applicability, ordered steps, validation, and
 
 ## Codex Agent Integration
 
-`menvane connect codex` merges a user-level MCP server and supported lifecycle hooks into `CODEX_HOME/config.toml`, defaulting to `~/.codex/config.toml`. It preserves unrelated models, servers, hooks, and settings, creates a backup before changes, enables supported hooks, and is idempotent. Disconnect removes only the matching Menvane MCP and hook commands. It never modifies `AGENTS.md`.
+`menvane connect codex` merges a user-level MCP server and supported lifecycle hooks into `CODEX_HOME/config.toml`, defaulting to `~/.codex/config.toml`. It preserves unrelated models, servers, hooks, and settings, creates a backup before changes, enables supported hooks, and is idempotent. Only hook events that can return model-visible additional context receive an `additionalContextLimit`; reconnect removes that setting from owned handlers for incompatible events. Disconnect removes only the matching Menvane MCP and hook commands. It never modifies `AGENTS.md`.
 
-Codex session start, user prompt, completed tool, pre- and post-compaction, stop, and session end payloads normalize into the shared event vocabulary. Capture is sanitized before daemon transport. Session start and user prompt hooks use the same bounded automatic recall and trust boundary as Claude Code. `MENVANE_INTERNAL=1` prevents provider inference from recursively creating Codex agent sessions.
+Codex session start, user prompt, completed tool, pre- and post-compaction, stop, and session end payloads normalize into the shared event vocabulary. Capture is sanitized before daemon transport. Project-scoped session start and user prompt hooks use the same bounded automatic recall, relevance, deduplication, and trust boundary as Claude Code; global session start injects nothing. `MENVANE_INTERNAL=1` prevents provider inference from recursively creating Codex agent sessions.
 
 ## OpenCode Integration
 

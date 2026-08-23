@@ -9,9 +9,41 @@
       "type": ["object", "null"],
       "properties": {
         "query": { "type": "string" },
-        "result_count": { "type": "integer", "minimum": 0 }
+        "result_count": { "type": "integer", "minimum": 0 },
+        "handoff_scope": {
+          "type": "string",
+          "enum": ["project", "global", "not-evaluated"]
+        },
+        "handoff_match_terms": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "handoff_required_match_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "handoff_reason": {
+          "type": "string",
+          "enum": [
+            "not-evaluated",
+            "no-meaningful-prompt-terms",
+            "no-current-handoff",
+            "insufficient-overlap",
+            "delivered",
+            "already-delivered"
+          ]
+        }
       },
-      "required": ["query", "result_count"],
+      "required": [
+        "query",
+        "result_count",
+        "handoff_scope",
+        "handoff_match_terms",
+        "handoff_required_match_count",
+        "handoff_reason"
+      ],
       "additionalProperties": false
     }
   }

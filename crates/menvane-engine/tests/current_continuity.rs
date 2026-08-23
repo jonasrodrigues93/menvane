@@ -694,6 +694,16 @@ fn handoff_delivery_is_claimed_by_session_and_rendered_content() {
         .session_start_context_for_client(&project, "test-client", "session")
         .unwrap();
     assert!(!first.is_empty());
+    let (duplicate, diagnostics) = menvane
+        .prompt_context_for_client(
+            &project,
+            "test-client",
+            "session",
+            "continue export remains open",
+        )
+        .unwrap();
+    assert!(duplicate.is_empty());
+    assert_eq!(diagnostics.handoff_reason, "already-delivered");
     assert!(
         menvane
             .session_start_context_for_client(&project, "test-client", "session")
@@ -709,6 +719,65 @@ fn handoff_delivery_is_claimed_by_session_and_rendered_content() {
         .unwrap();
     assert!(!second.is_empty());
     assert!(second.contains("Export is blocked"));
+}
+
+#[test]
+fn global_session_start_waits_for_a_relevant_prompt() {
+    let temporary = TempDir::new().unwrap();
+    let cwd = temporary.path().join("outside-project");
+    fs::create_dir_all(&cwd).unwrap();
+    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    let mut item = handoff_item(
+        Uuid::from_u128(90),
+        "unused-project",
+        HandoffItemKind::Blocked,
+        "A compilação ALSA está bloqueada",
+        Some("instalar o pacote ALSA".to_owned()),
+        Some("configuração de sistema ausente em PKG_CONFIG_PATH".to_owned()),
+        Uuid::from_u128(91),
+    );
+    item.project_id = None;
+    repository.upsert_handoff_item(&item).unwrap();
+
+    assert!(
+        menvane
+            .session_start_context_for_client(&cwd, "test-client", "global-session")
+            .unwrap()
+            .is_empty()
+    );
+
+    let (unrelated, diagnostics) = menvane
+        .prompt_context_for_client(
+            &cwd,
+            "test-client",
+            "global-session",
+            "warning in /home/jonas/.codex/config.toml",
+        )
+        .unwrap();
+    assert!(unrelated.is_empty());
+    assert_eq!(diagnostics.query, "warning");
+    assert_eq!(diagnostics.handoff_scope, "global");
+    assert!(diagnostics.handoff_match_terms.is_empty());
+    assert_eq!(diagnostics.handoff_required_match_count, 2);
+    assert_eq!(diagnostics.handoff_reason, "insufficient-overlap");
+
+    let (related, diagnostics) = menvane
+        .prompt_context_for_client(
+            &cwd,
+            "test-client",
+            "global-session",
+            "instalar pacote ALSA",
+        )
+        .unwrap();
+    assert!(related.contains("[CURRENT HANDOFF]"));
+    assert!(related.contains("A compilação ALSA está bloqueada"));
+    assert_eq!(
+        diagnostics.handoff_match_terms,
+        ["alsa", "instalar", "pacote"]
+    );
+    assert_eq!(diagnostics.handoff_required_match_count, 2);
+    assert_eq!(diagnostics.handoff_reason, "delivered");
 }
 
 #[test]
@@ -1367,7 +1436,18 @@ fn hot_path_never_calls_the_provider() {
     let (context, _) = menvane
         .prompt_context_for_client(&project, "test", "hot-path", "continue the export schema")
         .unwrap();
+    assert!(!context.contains("[CURRENT HANDOFF]"));
+    let (context, diagnostics) = menvane
+        .prompt_context_for_client(
+            &project,
+            "test",
+            "hot-path-prompt-only",
+            "continue the export schema",
+        )
+        .unwrap();
     assert!(context.contains("[CURRENT HANDOFF]"));
+    assert_eq!(diagnostics.handoff_match_terms, ["export", "schema"]);
+    assert_eq!(diagnostics.handoff_reason, "delivered");
     assert_eq!(provider.call_count(), 0);
 }
 

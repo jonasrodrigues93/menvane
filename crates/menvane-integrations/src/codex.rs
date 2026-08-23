@@ -110,33 +110,56 @@ fn install(configuration: &mut toml::Table, executable: &Path) -> Result<bool> {
             .or_insert_with(|| toml::Value::Array(Vec::new()))
             .as_array_mut()
             .with_context(|| format!("Codex {event} hooks must be an array"))?;
-        let exists = groups.iter().any(|group| {
-            group
-                .get("hooks")
-                .and_then(toml::Value::as_array)
-                .is_some_and(|handlers| {
-                    handlers.iter().any(|handler| {
-                        handler.get("command").and_then(toml::Value::as_str) == Some(&command)
-                    })
-                })
-        });
+        let mut exists = false;
+        for group in groups.iter_mut() {
+            let Some(handlers) = group.get_mut("hooks").and_then(toml::Value::as_array_mut) else {
+                continue;
+            };
+            for handler in handlers {
+                if handler.get("command").and_then(toml::Value::as_str) != Some(&command) {
+                    continue;
+                }
+                exists = true;
+                let handler = handler
+                    .as_table_mut()
+                    .context("Codex hook handler must be a table")?;
+                if supports_additional_context(event) {
+                    if handler.get("additionalContextLimit") != Some(&toml::Value::Integer(6_000)) {
+                        handler.insert(
+                            "additionalContextLimit".to_owned(),
+                            toml::Value::Integer(6_000),
+                        );
+                        changed = true;
+                    }
+                } else if handler.remove("additionalContextLimit").is_some() {
+                    changed = true;
+                }
+            }
+        }
         if !exists {
+            let mut handler = toml::Table::from_iter([
+                ("type".to_owned(), toml::Value::String("command".to_owned())),
+                ("command".to_owned(), toml::Value::String(command)),
+                ("timeout".to_owned(), toml::Value::Integer(3)),
+            ]);
+            if supports_additional_context(event) {
+                handler.insert(
+                    "additionalContextLimit".to_owned(),
+                    toml::Value::Integer(6_000),
+                );
+            }
             groups.push(toml::Value::Table(toml::Table::from_iter([(
                 "hooks".to_owned(),
-                toml::Value::Array(vec![toml::Value::Table(toml::Table::from_iter([
-                    ("type".to_owned(), toml::Value::String("command".to_owned())),
-                    ("command".to_owned(), toml::Value::String(command)),
-                    ("timeout".to_owned(), toml::Value::Integer(3)),
-                    (
-                        "additionalContextLimit".to_owned(),
-                        toml::Value::Integer(6_000),
-                    ),
-                ]))]),
+                toml::Value::Array(vec![toml::Value::Table(handler)]),
             )])));
             changed = true;
         }
     }
     Ok(changed)
+}
+
+fn supports_additional_context(event: &str) -> bool {
+    matches!(event, "SessionStart" | "UserPromptSubmit" | "PostToolUse")
 }
 
 fn remove(configuration: &mut toml::Table, executable: &Path) -> bool {
@@ -257,9 +280,54 @@ mod tests {
         assert_eq!(connected["model"].as_str(), Some("existing"));
         assert!(connected["mcp_servers"]["other"].is_table());
         assert!(connected["mcp_servers"]["menvane"].is_table());
+        for event in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
+            assert_eq!(
+                connected["hooks"][event][0]["hooks"][0]["additionalContextLimit"].as_integer(),
+                Some(6_000)
+            );
+        }
+        for event in ["PreCompact", "PostCompact", "Stop", "SessionEnd"] {
+            assert!(
+                connected["hooks"][event][0]["hooks"][0]
+                    .get("additionalContextLimit")
+                    .is_none()
+            );
+        }
         assert!(installer.disconnect().unwrap());
         let disconnected = read_configuration(&path).unwrap();
         assert!(disconnected["mcp_servers"]["other"].is_table());
         assert!(disconnected["mcp_servers"].get("menvane").is_none());
+    }
+
+    #[test]
+    fn codex_install_removes_unsupported_additional_context_limits() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "'/opt/menvane' hook codex Stop"
+timeout = 3
+additionalContextLimit = 6000
+"#,
+        )
+        .unwrap();
+        let installer = CodexInstaller::new(
+            CodexPaths {
+                configuration: path.clone(),
+            },
+            "/opt/menvane",
+        );
+
+        assert!(installer.connect().unwrap());
+        let connected = read_configuration(&path).unwrap();
+        assert!(
+            connected["hooks"]["Stop"][0]["hooks"][0]
+                .get("additionalContextLimit")
+                .is_none()
+        );
+        assert!(!installer.connect().unwrap());
     }
 }

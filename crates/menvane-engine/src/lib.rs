@@ -58,6 +58,20 @@ pub use technology_detector::TechnologyDetector;
 pub const GLOBAL_SCOPE_CONFIDENCE_THRESHOLD: f64 = 0.9;
 pub const MAX_RELATED_MEMORIES: usize = 5;
 
+const HANDOFF_DELIVERY_KIND: &str = "handoff";
+const GENERIC_HANDOFF_TERMS: [&str; 10] = [
+    "arquivo",
+    "config",
+    "configuracao",
+    "configuration",
+    "error",
+    "erro",
+    "file",
+    "path",
+    "sistema",
+    "system",
+];
+
 #[derive(Debug, Clone)]
 pub struct WriteMemory {
     pub title: String,
@@ -85,6 +99,10 @@ struct HybridRecallCandidate {
 pub struct RecallDiagnostics {
     pub query: String,
     pub result_count: usize,
+    pub handoff_scope: String,
+    pub handoff_match_terms: Vec<String>,
+    pub handoff_required_match_count: usize,
+    pub handoff_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -412,23 +430,19 @@ impl Menvane {
         if prompt.trim().is_empty() {
             return Ok(PromptRecall {
                 results: Vec::new(),
-                diagnostics: RecallDiagnostics {
-                    query: String::new(),
-                    result_count: 0,
-                },
+                diagnostics: recall_diagnostics(String::new(), 0),
                 identity,
             });
         }
-        let mut terms = lexical_tokens(&prompt).into_iter().collect::<Vec<_>>();
+        let mut terms = automatic_recall_tokens(&prompt)
+            .into_iter()
+            .collect::<Vec<_>>();
         terms.sort();
         let query = terms.join(" ");
         if query.is_empty() {
             return Ok(PromptRecall {
                 results: Vec::new(),
-                diagnostics: RecallDiagnostics {
-                    query: prompt,
-                    result_count: 0,
-                },
+                diagnostics: recall_diagnostics(String::new(), 0),
                 identity,
             });
         }
@@ -510,10 +524,7 @@ impl Menvane {
                 .record_access(result.id, ReinforcementSignal::Retrieved)?;
         }
         Ok(PromptRecall {
-            diagnostics: RecallDiagnostics {
-                query: prompt,
-                result_count: results.len(),
-            },
+            diagnostics: recall_diagnostics(query, results.len()),
             results,
             identity,
         })
@@ -714,28 +725,18 @@ impl Menvane {
         client: &str,
         external_session_id: &str,
     ) -> Result<String> {
-        let project = self.ensure_project(cwd)?;
-        let identity = self.sessions.injection_identity(
-            client,
-            external_session_id,
-            project.as_ref().map(|value| value.id.as_str()),
-        )?;
-        let handoff =
-            self.current_handoff_items(project.as_ref().map(|value| value.id.as_str()))?;
+        let Some(project) = self.ensure_project(cwd)? else {
+            return Ok(String::new());
+        };
+        let identity =
+            self.sessions
+                .injection_identity(client, external_session_id, Some(&project.id))?;
+        let handoff = self.current_handoff_items(Some(&project.id))?;
         let mut context = String::from(
             "MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n",
         );
-        context.push_str(&format!(
-            "Scope: {}\n",
-            if project.is_some() {
-                "project"
-            } else {
-                "global"
-            }
-        ));
-        if let Some(project) = &project {
-            context.push_str(&format!("Project: {}\n", project.identity));
-        }
+        context.push_str("Scope: project\n");
+        context.push_str(&format!("Project: {}\n", project.identity));
         if !handoff.is_empty() {
             context.push_str("\n[CURRENT HANDOFF]\n");
             context.push_str(&session_rendering::render_handoff_items(&handoff, 2_000));
@@ -750,7 +751,7 @@ impl Menvane {
         ));
         if self
             .sessions
-            .claim_delivery(&identity, "handoff", &handoff_content_id)?
+            .claim_delivery(&identity, HANDOFF_DELIVERY_KIND, &handoff_content_id)?
         {
             Ok(context)
         } else {
@@ -781,36 +782,67 @@ impl Menvane {
         external_session_id: &str,
         prompt: &str,
     ) -> Result<(String, RecallDiagnostics)> {
-        let recall = self.prompt_recall(cwd, client, external_session_id, prompt, 3)?;
+        let PromptRecall {
+            results,
+            mut diagnostics,
+            identity,
+        } = self.prompt_recall(cwd, client, external_session_id, prompt, 3)?;
         let project = self.ensure_project(cwd)?;
         let items = self.current_handoff_items(project.as_ref().map(|value| value.id.as_str()))?;
-        let prompt_tokens = lexical_tokens(prompt);
-        let related = items
-            .into_iter()
-            .filter(|item| {
-                let text = format!(
-                    "{} {} {}",
-                    item.state,
-                    item.next_step.as_deref().unwrap_or_default(),
-                    item.blocker.as_deref().unwrap_or_default()
-                );
-                !prompt_tokens.is_empty() && !lexical_tokens(&text).is_disjoint(&prompt_tokens)
-            })
-            .collect::<Vec<_>>();
+        let has_handoff_items = !items.is_empty();
+        let prompt_tokens = handoff_lexical_tokens(prompt);
+        let required_match_count = required_handoff_match_count(prompt_tokens.len());
+        let mut observed_match_terms = HashSet::new();
+        let mut related = Vec::new();
+        for item in items {
+            let text = format!(
+                "{} {} {}",
+                item.state,
+                item.next_step.as_deref().unwrap_or_default(),
+                item.blocker.as_deref().unwrap_or_default()
+            );
+            let item_tokens = handoff_lexical_tokens(&text);
+            let match_terms = prompt_tokens
+                .intersection(&item_tokens)
+                .cloned()
+                .collect::<HashSet<_>>();
+            observed_match_terms.extend(match_terms.iter().cloned());
+            if match_terms.len() >= required_match_count {
+                related.push(item);
+            }
+        }
+        diagnostics.handoff_scope = if project.is_some() {
+            "project".to_owned()
+        } else {
+            "global".to_owned()
+        };
+        diagnostics.handoff_match_terms = observed_match_terms.into_iter().collect();
+        diagnostics.handoff_match_terms.sort();
+        diagnostics.handoff_required_match_count = required_match_count;
         let mut context = String::new();
         let related_handoff = session_rendering::render_handoff_items(&related, 2_000);
-        let related_content_id = content_identifier(&related_handoff);
-        if !related.is_empty()
-            && self.sessions.claim_delivery(
-                &recall.identity,
-                "handoff-prompt",
-                &related_content_id,
-            )?
-        {
+        let related_content_id = content_identifier(&session_rendering::render_handoff_items(
+            &related,
+            usize::MAX,
+        ));
+        diagnostics.handoff_reason = if prompt_tokens.is_empty() {
+            "no-meaningful-prompt-terms".to_owned()
+        } else if !has_handoff_items {
+            "no-current-handoff".to_owned()
+        } else if related.is_empty() {
+            "insufficient-overlap".to_owned()
+        } else if self.sessions.claim_delivery(
+            &identity,
+            HANDOFF_DELIVERY_KIND,
+            &related_content_id,
+        )? {
             context.push_str("MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n[CURRENT HANDOFF]\n");
             context.push_str(&related_handoff);
-        }
-        for result in &recall.results {
+            "delivered".to_owned()
+        } else {
+            "already-delivered".to_owned()
+        };
+        for result in &results {
             let entry = format!(
                 "\n\n[MEMORY CARD]\nID: {}\nType: {}\nTitle: {}\nExcerpt: {}",
                 result.id, result.knowledge_type, result.title, result.excerpt
@@ -820,7 +852,7 @@ impl Menvane {
             }
             if self
                 .sessions
-                .claim_delivery(&recall.identity, "memory", &result.id.to_string())?
+                .claim_delivery(&identity, "memory", &result.id.to_string())?
             {
                 context.push_str(&entry);
                 self.sessions
@@ -830,7 +862,7 @@ impl Menvane {
         if !context.is_empty() {
             context.push_str("\n\nEND MENVANE MEMORY CONTEXT");
         }
-        Ok((context, recall.diagnostics))
+        Ok((context, diagnostics))
     }
 
     pub fn set_integration_connected(&self, client: &str, connected: bool) -> Result<()> {
@@ -2052,6 +2084,50 @@ fn lexical_tokens(value: &str) -> HashSet<String> {
                 .then_some(token)
         })
         .collect()
+}
+
+fn automatic_recall_tokens(value: &str) -> HashSet<String> {
+    value
+        .split_whitespace()
+        .filter(|fragment| !looks_like_path(fragment))
+        .flat_map(lexical_tokens)
+        .collect()
+}
+
+fn handoff_lexical_tokens(value: &str) -> HashSet<String> {
+    automatic_recall_tokens(value)
+        .into_iter()
+        .filter(|token| !GENERIC_HANDOFF_TERMS.contains(&token.as_str()))
+        .collect()
+}
+
+fn looks_like_path(fragment: &str) -> bool {
+    let fragment = fragment.trim_matches(|character: char| {
+        matches!(
+            character,
+            '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+        )
+    });
+    fragment.contains('/') || fragment.contains('\\')
+}
+
+fn required_handoff_match_count(prompt_token_count: usize) -> usize {
+    if prompt_token_count == 0 {
+        0
+    } else {
+        prompt_token_count.div_ceil(3).clamp(2, 3)
+    }
+}
+
+fn recall_diagnostics(query: String, result_count: usize) -> RecallDiagnostics {
+    RecallDiagnostics {
+        query,
+        result_count,
+        handoff_scope: "not-evaluated".to_owned(),
+        handoff_match_terms: Vec::new(),
+        handoff_required_match_count: 0,
+        handoff_reason: "not-evaluated".to_owned(),
+    }
 }
 
 fn meaningful_lexical_overlap(
