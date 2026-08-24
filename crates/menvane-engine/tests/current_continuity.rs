@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use chrono::{TimeZone, Utc};
 use menvane_domain::{
     Applicability, EmbeddingError, EmbeddingProvider, HandoffItem, HandoffItemKind,
-    HandoffItemSource, JsonSchema, KnowledgeType, LlmError, LlmErrorKind, LlmProvider, LlmRequest,
-    Memory, MemoryMetadata, MemoryStatus, NormalizedEvent, NormalizedEventKind,
+    HandoffItemSource, JsonSchema, KnowledgeMetadata, KnowledgeRecord, KnowledgeType, LlmError,
+    LlmErrorKind, LlmProvider, LlmRequest, MemoryStatus, NormalizedEvent, NormalizedEventKind,
     ProviderCapabilities, ProviderHealth, ResponseUsage, Scope, StructuredResponse,
 };
 use menvane_engine::{CaptureOutcome, Menvane, ScopeSelection, WriteMemory};
@@ -133,7 +133,7 @@ impl LlmProvider for FakeLlmProvider {
 }
 
 #[test]
-fn context_and_playbook_round_trip_through_markdown_and_search() {
+fn memory_and_playbook_round_trip_through_markdown_and_search() {
     let (temporary, project, menvane) = setup_project();
     let context = menvane
         .write(
@@ -141,7 +141,7 @@ fn context_and_playbook_round_trip_through_markdown_and_search() {
             WriteMemory {
                 title: "Derived index rebuild".to_owned(),
                 body: "The index is derived from canonical Markdown.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: vec!["sqlite".to_owned()],
                 applies_to: Applicability::default(),
@@ -171,7 +171,7 @@ fn context_and_playbook_round_trip_through_markdown_and_search() {
             .search(&project, "canonical Markdown", ScopeSelection::Project, 10)
             .unwrap()[0]
             .knowledge_type,
-        KnowledgeType::Context
+        KnowledgeType::Memory
     );
     assert_eq!(
         menvane
@@ -187,7 +187,116 @@ fn context_and_playbook_round_trip_through_markdown_and_search() {
 }
 
 #[test]
-fn inferred_context_and_playbook_cross_the_promotion_barrier() {
+fn only_mcp_reads_reinforce_memories_and_never_playbooks() {
+    let (_temporary, project, menvane) = setup_project();
+    let memory = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "MCP reinforcement".to_owned(),
+                body: "Only an MCP read should reinforce this record.".to_owned(),
+                knowledge_type: KnowledgeType::Memory,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    let playbook = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Observe a service".to_owned(),
+                body: "Trigger: inspect a service\n\n1. Read status".to_owned(),
+                knowledge_type: KnowledgeType::Playbook,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    menvane.read(memory.metadata.id).unwrap();
+    menvane.read_without_recording(memory.metadata.id).unwrap();
+    assert_eq!(
+        menvane.memory_reinforcement(memory.metadata.id).unwrap().0,
+        0
+    );
+
+    menvane.read_from_mcp(memory.metadata.id).unwrap();
+    assert_eq!(
+        menvane.memory_reinforcement(memory.metadata.id).unwrap().0,
+        1
+    );
+
+    menvane.read_from_mcp(playbook.metadata.id).unwrap();
+    assert_eq!(
+        menvane
+            .memory_reinforcement(playbook.metadata.id)
+            .unwrap()
+            .0,
+        0
+    );
+}
+
+#[test]
+fn expired_memory_is_hidden_but_mcp_can_find_and_revive_it() {
+    let (temporary, project, menvane) = setup_project();
+    let mut memory = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Old deployment detail".to_owned(),
+                body: "The old deployment detail remains explicitly recoverable.".to_owned(),
+                knowledge_type: KnowledgeType::Memory,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    memory.metadata.created_at = Utc::now() - chrono::Duration::days(91);
+    let markdown = MarkdownStore::new(menvane.home());
+    let path = markdown
+        .memory_files()
+        .unwrap()
+        .into_iter()
+        .find(|path| markdown.parse_memory(path).unwrap().metadata.id == memory.metadata.id)
+        .unwrap();
+    markdown.update_memory(&path, &memory).unwrap();
+    drop(menvane);
+
+    let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+    assert_eq!(
+        menvane.read(memory.metadata.id).unwrap().metadata.status,
+        MemoryStatus::Forgotten
+    );
+    assert!(
+        menvane
+            .search(&project, "deployment detail", ScopeSelection::Project, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        menvane
+            .search_including_forgotten(&project, "deployment detail", ScopeSelection::Project, 10,)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    assert_eq!(
+        menvane
+            .read_from_mcp(memory.metadata.id)
+            .unwrap()
+            .metadata
+            .status,
+        MemoryStatus::Active
+    );
+}
+
+#[test]
+fn inferred_memory_and_playbook_cross_the_promotion_barrier() {
     let (_temporary, project, _provider, menvane) =
         setup_provider(vec![Ok(promotion_result()), Ok(promotion_result())]);
     let timestamp = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
@@ -229,7 +338,7 @@ fn inferred_context_and_playbook_cross_the_promotion_barrier() {
     assert_eq!(
         memories
             .iter()
-            .find(|memory| memory.metadata.knowledge_type == KnowledgeType::Context)
+            .find(|memory| memory.metadata.knowledge_type == KnowledgeType::Memory)
             .unwrap()
             .metadata
             .status,
@@ -299,7 +408,7 @@ fn forgotten_memory_is_not_recreated_by_an_explicit_duplicate_write() {
             WriteMemory {
                 title: "External deployment constraint".to_owned(),
                 body: "The deployment requires an external approval window.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -314,7 +423,7 @@ fn forgotten_memory_is_not_recreated_by_an_explicit_duplicate_write() {
                 WriteMemory {
                     title: memory.title,
                     body: memory.body,
-                    knowledge_type: KnowledgeType::Context,
+                    knowledge_type: KnowledgeType::Memory,
                     scope: Scope::Project,
                     tags: Vec::new(),
                     applies_to: Applicability::default(),
@@ -473,7 +582,7 @@ fn consolidation_merge_and_supersede_apply_lifecycle_operations() {
             WriteMemory {
                 title: "Export path".to_owned(),
                 body: "The export path uses the remote runner.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -486,7 +595,7 @@ fn consolidation_merge_and_supersede_apply_lifecycle_operations() {
             WriteMemory {
                 title: "Export verification".to_owned(),
                 body: "Export verification uses the remote runner output.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -499,7 +608,7 @@ fn consolidation_merge_and_supersede_apply_lifecycle_operations() {
             WriteMemory {
                 title: "Old export rule".to_owned(),
                 body: "The old export rule uses a local runner.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -858,7 +967,7 @@ fn reindex_rebuilds_knowledge_without_touching_session_state() {
             WriteMemory {
                 title: "Reindex marker".to_owned(),
                 body: "reindex preserves canonical context".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -944,7 +1053,7 @@ fn unrelated_prompt_receives_no_handoff_items_or_cards() {
             WriteMemory {
                 title: "Export runner".to_owned(),
                 body: "The export runner requires a remote approval window.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -968,7 +1077,7 @@ fn portuguese_stopwords_do_not_trigger_an_unrelated_global_memory() {
                 title: "Preferência para downloads longos".to_owned(),
                 body: "Inicie downloads em background para que continuem com retomada automática."
                     .to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Global,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -997,7 +1106,7 @@ fn english_stopwords_do_not_trigger_an_unrelated_global_memory() {
                 title: "Long download preference".to_owned(),
                 body: "Keep downloads running in the background so they continue after shutdown."
                     .to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Global,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1037,7 +1146,7 @@ fn hybrid_recall_finds_a_semantic_match_without_lexical_overlap() {
             WriteMemory {
                 title: "PITR procedure".to_owned(),
                 body: "Apply archived WAL segments after the base snapshot.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1080,7 +1189,7 @@ fn reindex_reconstructs_memory_embeddings() {
             WriteMemory {
                 title: "PITR procedure".to_owned(),
                 body: "Apply archived WAL segments after the base snapshot.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Global,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1119,7 +1228,7 @@ fn automatic_recall_falls_back_to_fts_when_embeddings_are_unavailable() {
             WriteMemory {
                 title: "Export schema procedure".to_owned(),
                 body: "Validate the export schema before publication.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1150,7 +1259,7 @@ fn automatic_recall_preserves_uppercase_technical_identifiers() {
             WriteMemory {
                 title: "CAN bus diagnostics".to_owned(),
                 body: "Inspect CAN bus frames before replacing the controller.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1205,7 +1314,7 @@ fn related_prompt_receives_matching_items_and_bounded_cards() {
                          words so the stored body stays well beyond the excerpt window and \
                          only ends with the FULL_BODY_MARKER token."
                     ),
-                    knowledge_type: KnowledgeType::Context,
+                    knowledge_type: KnowledgeType::Memory,
                     scope: Scope::Project,
                     tags: Vec::new(),
                     applies_to: Applicability::default(),
@@ -1244,7 +1353,7 @@ fn automatic_recall_enforces_project_isolation_and_global_eligibility() {
             WriteMemory {
                 title: "Alpha export rule".to_owned(),
                 body: "The alpha export rule requires the remote runner.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1257,7 +1366,7 @@ fn automatic_recall_enforces_project_isolation_and_global_eligibility() {
             WriteMemory {
                 title: "Beta export rule".to_owned(),
                 body: "The beta export rule requires the local runner.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1270,7 +1379,7 @@ fn automatic_recall_enforces_project_isolation_and_global_eligibility() {
             WriteMemory {
                 title: "Universal export guideline".to_owned(),
                 body: "Every export verification records the runner output.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Global,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1283,7 +1392,7 @@ fn automatic_recall_enforces_project_isolation_and_global_eligibility() {
             WriteMemory {
                 title: "Python export caveat".to_owned(),
                 body: "Python export jobs need an explicit interpreter pin.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Global,
                 tags: Vec::new(),
                 applies_to: Applicability {
@@ -1331,7 +1440,7 @@ fn explicit_search_may_inspect_incompatible_contextual_memory() {
             WriteMemory {
                 title: "Python export caveat".to_owned(),
                 body: "Python export jobs need an explicit interpreter pin.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Global,
                 tags: Vec::new(),
                 applies_to: Applicability {
@@ -1361,7 +1470,7 @@ fn superseded_memories_leave_retrieval_but_remain_inspectable() {
             WriteMemory {
                 title: "Old export rule".to_owned(),
                 body: "The old export rule uses a local runner.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1421,7 +1530,7 @@ fn hot_path_never_calls_the_provider() {
             WriteMemory {
                 title: "Export schema constraint".to_owned(),
                 body: "The export schema requires an external approval window.".to_owned(),
-                knowledge_type: KnowledgeType::Context,
+                knowledge_type: KnowledgeType::Memory,
                 scope: Scope::Project,
                 tags: Vec::new(),
                 applies_to: Applicability::default(),
@@ -1458,15 +1567,15 @@ fn prompt_context_stays_fast_with_large_corpus() {
     let markdown = MarkdownStore::new(menvane.home());
     let index = IndexStore::new(menvane.home().join("index.sqlite"));
     for number in 0..1_000u32 {
-        let metadata = MemoryMetadata::new(
-            KnowledgeType::Context,
+        let metadata = KnowledgeMetadata::new(
+            KnowledgeType::Memory,
             Scope::Project,
             Some(project_record.id.clone()),
             Vec::new(),
             Applicability::default(),
             MemoryStatus::Active,
         );
-        let memory = Memory {
+        let memory = KnowledgeRecord {
             metadata,
             title: format!("Corpus note {number}"),
             body: format!(
@@ -1625,12 +1734,12 @@ fn promotion_result() -> serde_json::Value {
         {
             "operation": "create",
             "target_memory_ids": [],
-            "knowledge_type": "context",
+            "knowledge_type": "memory",
             "title": "Remote deployment approval",
             "scope": "project",
             "scope_confidence": 0.95,
             "applies_to": {},
-            "content": {"context": {"body": "Remote deployments require an external approval window before verification."}},
+            "content": {"memory": {"body": "Remote deployments require an external approval window before verification."}},
             "evidence_event_ids": ["tool"],
             "contradicting_event_ids": []
         },
@@ -1656,12 +1765,12 @@ fn supersede_result(target: Uuid) -> serde_json::Value {
         {
             "operation": "supersede",
             "target_memory_ids": [target],
-            "knowledge_type": "context",
+            "knowledge_type": "memory",
             "title": "Replacement export rule",
             "scope": "project",
             "scope_confidence": 0.95,
             "applies_to": {},
-            "content": {"context": {"body": "The replacement export rule uses the remote runner."}},
+            "content": {"memory": {"body": "The replacement export rule uses the remote runner."}},
             "evidence_event_ids": ["tool"],
             "contradicting_event_ids": []
         }
@@ -1675,24 +1784,24 @@ fn merge_and_supersede_result(first: Uuid, second: Uuid, third: Uuid) -> serde_j
         {
             "operation": "merge",
             "target_memory_ids": [first, second],
-            "knowledge_type": "context",
+            "knowledge_type": "memory",
             "title": "Merged export guidance",
             "scope": "project",
             "scope_confidence": 0.95,
             "applies_to": {},
-            "content": {"context": {"body": "Merged export guidance"}},
+            "content": {"memory": {"body": "Merged export guidance"}},
             "evidence_event_ids": ["tool"],
             "contradicting_event_ids": []
         },
         {
             "operation": "supersede",
             "target_memory_ids": [third],
-            "knowledge_type": "context",
+            "knowledge_type": "memory",
             "title": "Replacement export rule",
             "scope": "project",
             "scope_confidence": 0.95,
             "applies_to": {},
-            "content": {"context": {"body": "The replacement export rule uses the remote runner."}},
+            "content": {"memory": {"body": "The replacement export rule uses the remote runner."}},
             "evidence_event_ids": ["tool"],
             "contradicting_event_ids": []
         }

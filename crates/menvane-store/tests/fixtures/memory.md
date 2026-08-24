@@ -1,6 +1,6 @@
 ---
 id: 018f5c7e-7b3a-7a11-8f4b-5e49efde6210
-type: context
+type: memory
 scope: global
 status: active
 created_at: 2026-01-02T03:04:05Z

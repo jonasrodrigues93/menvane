@@ -6,7 +6,7 @@ use axum::extract::{Form, Path, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use menvane_domain::{
-    HandoffItem, KnowledgeType, Memory, NormalizedEvent, Project, ProviderHealth,
+    HandoffItem, KnowledgeRecord, KnowledgeType, NormalizedEvent, Project, ProviderHealth,
 };
 use menvane_engine::{Menvane, ScopeSelection};
 use serde::Deserialize;
@@ -39,11 +39,11 @@ async fn dashboard(State(menvane): State<Arc<Menvane>>) -> Response {
         let integrations = menvane.integrations()?;
         let provider = menvane.provider_health().await.ok();
         let ready = provider.is_some_and(|(_, _, health)| health == ProviderHealth::Ready);
-        let context_count = memories
+        let memory_count = memories
             .iter()
-            .filter(|memory| memory.metadata.knowledge_type == KnowledgeType::Context)
+            .filter(|memory| memory.metadata.knowledge_type == KnowledgeType::Memory)
             .count();
-        let playbook_count = memories.len() - context_count;
+        let playbook_count = memories.len() - memory_count;
         let pending = jobs.iter().filter(|job| job.status == "pending").count();
         let names = project_names(&projects);
         let recent_memories = memories.iter().take(5).cloned().collect::<Vec<_>>();
@@ -66,16 +66,16 @@ async fn dashboard(State(menvane): State<Arc<Menvane>>) -> Response {
         let connections =
             format!("<section class='connections' aria-label='Connections'>{connections}</section>");
         Ok(format!(
-            "{}<section class='metrics'>{}{}</section><div class='dashboard-grid'><section><div class='section-title compact'><div><h2>Projects</h2><p>Known identities and durable knowledge</p></div><a href='/projects'>All projects →</a></div><section class='panel'><table class='project-table'><thead><tr><th>Project</th><th>Technologies</th><th>Knowledge</th></tr></thead><tbody>{}</tbody></table></section></section><aside class='right-stack'><section class='panel'><header class='panel-head'><div><h2>System</h2><p>Local runtime</p></div></header><div class='system-list'><div class='system-row'><span>Provider</span><strong class='{}'>{}</strong></div><div class='system-row'><span>Queue</span><strong>{} pending</strong></div><div class='system-row'><span>Storage</span><strong>Markdown + SQLite</strong></div></div></section><section class='panel'><header class='panel-head'><div><h2>Recent sessions</h2><p>Chronological evidence</p></div><a class='panel-link' href='/sessions'>All sessions →</a></header><div class='session-list'>{}</div></section></aside></div><section class='panel overview-memory'><header class='panel-head'><div><h2>Recent durable knowledge</h2><p>Context and playbooks</p></div><a class='panel-link' href='/memories'>All memories →</a></header><div class='memory-list'>{}</div></section>{}",
+            "{}<section class='metrics'>{}{}</section><div class='dashboard-grid'><section><div class='section-title compact'><div><h2>Projects</h2><p>Known identities and durable knowledge</p></div><a href='/projects'>All projects →</a></div><section class='panel'><table class='project-table'><thead><tr><th>Project</th><th>Technologies</th><th>Knowledge</th></tr></thead><tbody>{}</tbody></table></section></section><aside class='right-stack'><section class='panel'><header class='panel-head'><div><h2>System</h2><p>Local runtime</p></div></header><div class='system-list'><div class='system-row'><span>Provider</span><strong class='{}'>{}</strong></div><div class='system-row'><span>Queue</span><strong>{} pending</strong></div><div class='system-row'><span>Storage</span><strong>Markdown + SQLite</strong></div></div></section><section class='panel'><header class='panel-head'><div><h2>Recent sessions</h2><p>Chronological evidence</p></div><a class='panel-link' href='/sessions'>All sessions →</a></header><div class='session-list'>{}</div></section></aside></div><section class='panel overview-memory'><header class='panel-head'><div><h2>Recent durable knowledge</h2><p>Memories and playbooks</p></div><a class='panel-link' href='/memories'>All memories →</a></header><div class='memory-list'>{}</div></section>{}",
             page_head("Overview", "Projects first, then operational health and durable knowledge."),
-            metric("", "Context", context_count, "durable records"),
+            metric("", "Memories", memory_count, "decaying records"),
             metric("", "Playbooks", playbook_count, "reusable procedures"),
             project_rows(&projects, &memories),
             if ready { "ready" } else { "attention" },
             if ready { "Ready" } else { "Attention" },
             pending,
             if recent_sessions.is_empty() { empty_state("No sessions captured yet.") } else { recent_sessions },
-            memory_list(&recent_memories, &names),
+            memory_list(&recent_memories, &names, &menvane),
             connections,
         ))
     }
@@ -111,13 +111,13 @@ async fn project_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Stri
             .collect::<Vec<_>>();
         let handoff = menvane.current_project_handoff(Some(&project.id))?;
         Ok(format!(
-            "{}<section class='panel metadata-panel'><dl class='metadata'><dt>Identity</dt><dd>{}</dd><dt>Known paths</dt><dd>{}</dd><dt>Technologies</dt><dd>{}</dd></dl></section>{}<div class='section-title'><div><h2>Knowledge</h2><p>Context and playbooks scoped to this project</p></div></div><section class='panel'><div class='memory-list'>{}</div></section>",
+            "{}<section class='panel metadata-panel'><dl class='metadata'><dt>Identity</dt><dd>{}</dd><dt>Known paths</dt><dd>{}</dd><dt>Technologies</dt><dd>{}</dd></dl></section>{}<div class='section-title'><div><h2>Knowledge</h2><p>Memories and playbooks scoped to this project</p></div></div><section class='panel'><div class='memory-list'>{}</div></section>",
             page_head(&project.name, "Project identity and current work fronts."),
             escape(&project.identity),
             escape(&project.known_paths.join(" · ")),
             escape(&technologies(&project)),
             handoff_sections(handoff.as_ref()),
-            memory_list(&memories, &project_names(std::slice::from_ref(&project)))
+            memory_list(&memories, &project_names(std::slice::from_ref(&project)), &menvane)
         ))
     });
     page_result(&menvane, "projects", "Project", content)
@@ -181,11 +181,14 @@ async fn memories(
             .cloned()
             .collect::<Vec<_>>();
         Ok(format!(
-            "{}<form class='filters'><label class='search-field'><span>⌕</span><input name='q' placeholder='Search title or content' value='{}'></label><select name='type'><option value=''>All types</option><option value='context'>Context</option><option value='playbook'>Playbook</option></select><select name='scope'><option value=''>All scopes</option><option value='project'>Project</option><option value='global'>Global</option></select><button>Apply</button></form><section class='panel'><header class='panel-head'><div><h2>Context and playbooks</h2><p>{} records match this view</p></div></header><div class='memory-list'>{}</div></section>",
-            page_head("Memories", "Durable context and playbooks only."),
+            "{}<form class='filters'><label class='search-field'><span>⌕</span><input name='q' placeholder='Search title or content' value='{}'></label><select name='type'><option value=''>All types</option><option value='memory'>Memory</option><option value='playbook'>Playbook</option></select><select name='scope'><option value=''>All scopes</option><option value='project'>Project</option><option value='global'>Global</option></select><button>Apply</button></form><section class='panel'><header class='panel-head'><div><h2>Memories and playbooks</h2><p>{} records match this view</p></div></header><div class='memory-list'>{}</div></section>",
+            page_head(
+                "Memories",
+                "Decaying memories and lifecycle-managed playbooks."
+            ),
             escape_attribute(filters.q.as_deref().unwrap_or_default()),
             filtered.len(),
-            memory_list(&filtered, &names)
+            memory_list(&filtered, &names, &menvane)
         ))
     })();
     page_result(&menvane, "memories", "Memories", content)
@@ -193,12 +196,14 @@ async fn memories(
 
 async fn memory_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid>) -> Response {
     let content = menvane.read_without_recording(id).map(|memory| {
+        let decay = decay_visual(&menvane, &memory);
         format!(
-            "{}<section class='panel detail-grid'><article class='rendered'>{}</article><aside class='detail-side'><div class='stamp'>{} / {}</div><dl class='metadata'><dt>Type</dt><dd>{}</dd><dt>Scope</dt><dd>{}</dd><dt>Status</dt><dd>{}</dd><dt>Tags</dt><dd>{}</dd><dt>Applies to</dt><dd>{}</dd><dt>Sources</dt><dd>{}</dd></dl></aside></section>",
+            "{}<section class='panel detail-grid'><article class='rendered'>{}</article><aside class='detail-side'><div class='stamp'>{} / {}</div>{}<dl class='metadata'><dt>Type</dt><dd>{}</dd><dt>Scope</dt><dd>{}</dd><dt>Status</dt><dd>{}</dd><dt>Tags</dt><dd>{}</dd><dt>Applies to</dt><dd>{}</dd><dt>Sources</dt><dd>{}</dd></dl></aside></section>",
             page_head(&memory.title, "Durable memory detail."),
             render_markdown(&memory.body),
             memory.metadata.knowledge_type,
             memory.metadata.status,
+            decay,
             memory.metadata.knowledge_type,
             memory.metadata.scope,
             memory.metadata.status,
@@ -402,13 +407,14 @@ async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
                 .unwrap_or_else(|| fallback.to_owned())
         };
         format!(
-            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
+            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
             page_head("Settings", "Observable runtime configuration."),
             get("capture", "max_prompt_bytes", "16384"),
             get("capture", "max_tool_input_bytes", "4096"),
             get("capture", "max_tool_output_bytes", "4096"),
             get("sessions", "idle_finalize_seconds", "120"),
             get("jobs", "lease_timeout_seconds", "300"),
+            get("decay", "memory_lifetime_days", "90"),
             get("llm", "provider", "openai"),
             get("llm", "model", "gpt-5.6-luna"),
             reasoning_options(&get("llm", "reasoning_effort", "medium")),
@@ -439,6 +445,7 @@ struct SettingsEdit {
     max_tool_output_bytes: u64,
     idle_finalize_seconds: u64,
     lease_timeout_seconds: u64,
+    memory_lifetime_days: u64,
     provider: String,
     model: String,
     reasoning_effort: String,
@@ -478,6 +485,11 @@ async fn update_settings(
                 "jobs",
                 "lease_timeout_seconds",
                 toml::Value::Integer(edit.lease_timeout_seconds as i64),
+            ),
+            (
+                "decay",
+                "memory_lifetime_days",
+                toml::Value::Integer(edit.memory_lifetime_days as i64),
             ),
             (
                 "llm",
@@ -525,13 +537,13 @@ async fn update_settings(
     }
 }
 
-fn knowledge_memories(memories: Vec<Memory>) -> Vec<Memory> {
+fn knowledge_memories(memories: Vec<KnowledgeRecord>) -> Vec<KnowledgeRecord> {
     memories
         .into_iter()
         .filter(|memory| {
             matches!(
                 memory.metadata.knowledge_type,
-                KnowledgeType::Context | KnowledgeType::Playbook
+                KnowledgeType::Memory | KnowledgeType::Playbook
             )
         })
         .collect()
@@ -544,7 +556,7 @@ fn project_names(projects: &[Project]) -> HashMap<String, String> {
         .collect()
 }
 
-fn project_row(project: &Project, memories: &[Memory]) -> String {
+fn project_row(project: &Project, memories: &[KnowledgeRecord]) -> String {
     let count = memories
         .iter()
         .filter(|memory| memory.metadata.project_id.as_deref() == Some(project.id.as_str()))
@@ -558,7 +570,7 @@ fn project_row(project: &Project, memories: &[Memory]) -> String {
     )
 }
 
-fn project_rows(projects: &[Project], memories: &[Memory]) -> String {
+fn project_rows(projects: &[Project], memories: &[KnowledgeRecord]) -> String {
     if projects.is_empty() {
         "<tr><td colspan='3' class='table-empty'>No projects yet. Start in a Git repository to establish identity.</td></tr>".to_owned()
     } else {
@@ -605,7 +617,11 @@ fn technologies(project: &Project) -> String {
     .join(" · ")
 }
 
-fn memory_list(memories: &[Memory], names: &HashMap<String, String>) -> String {
+fn memory_list(
+    memories: &[KnowledgeRecord],
+    names: &HashMap<String, String>,
+    menvane: &Menvane,
+) -> String {
     if memories.is_empty() {
         return empty_state("No memories match these filters.");
     }
@@ -620,15 +636,17 @@ fn memory_list(memories: &[Memory], names: &HashMap<String, String>) -> String {
                 .map(String::as_str)
                 .unwrap_or("Global");
             let kind = memory.metadata.knowledge_type.to_string();
-            let abbreviation = if kind == "playbook" { "PB" } else { "CX" };
+            let abbreviation = if kind == "playbook" { "PB" } else { "MM" };
+            let decay = decay_visual(menvane, memory);
             format!(
-                "<a class='memory-row' data-kind='{kind}' href='/memories/{}'><span class='type'>{abbreviation}</span><div class='memory-copy'><h3>{}</h3><p>{}</p><div class='memory-meta'><span>{}</span><span class='status'>{}</span><span>{}</span></div></div><div class='memory-tail'><span class='scope-tag'>{}</span><span>{}</span></div></a>",
+                "<a class='memory-row' data-kind='{kind}' href='/memories/{}'><span class='type'>{abbreviation}</span><div class='memory-copy'><h3>{}</h3><p>{}</p><div class='memory-meta'><span>{}</span><span class='status'>{}</span><span>{}</span></div>{}</div><div class='memory-tail'><span class='scope-tag'>{}</span><span>{}</span></div></a>",
                 memory.metadata.id,
                 escape(&memory.title),
                 escape(&memory_summary(memory)),
                 memory.metadata.knowledge_type,
                 memory.metadata.status,
                 escape(origin),
+                decay,
                 memory.metadata.scope,
                 memory.metadata.updated_at.format("%Y-%m-%d"),
             )
@@ -636,7 +654,32 @@ fn memory_list(memories: &[Memory], names: &HashMap<String, String>) -> String {
         .collect()
 }
 
-fn memory_summary(memory: &Memory) -> String {
+fn decay_visual(menvane: &Menvane, memory: &KnowledgeRecord) -> String {
+    if memory.metadata.knowledge_type == KnowledgeType::Playbook {
+        return "<div class='decay-state stable'><span>Lifecycle managed · no expiry</span></div>"
+            .to_owned();
+    }
+    let Ok(Some(decay)) = menvane.decay_state(memory) else {
+        return String::new();
+    };
+    if memory.metadata.status.to_string() == "forgotten" || decay.score == 0.0 {
+        return "<div class='decay-state forgotten'><span>Forgotten · explicit MCP access only</span><i><b style='width:0%'></b></i></div>".to_owned();
+    }
+    let label = if decay.score >= 0.66 {
+        "Fresh"
+    } else if decay.score >= 0.33 {
+        "Aging"
+    } else {
+        "Fading"
+    };
+    format!(
+        "<div class='decay-state'><span>{label} · about {} days until forgotten</span><i><b style='width:{:.0}%'></b></i></div>",
+        decay.days_remaining.ceil(),
+        decay.score * 100.0,
+    )
+}
+
+fn memory_summary(memory: &KnowledgeRecord) -> String {
     truncate_text(
         &memory
             .body
@@ -853,6 +896,7 @@ const JS: &str = r"const menu=document.querySelector('#mobile-menu');const sideb
 const CSS: &str = r#"
 :root{color-scheme:light;--canvas:#efeee8;--surface:#faf9f5;--raised:#fff;--muted-surface:#e7e6df;--ink:#1d1e1b;--text:#3e403a;--muted:#777970;--quiet:#a3a59b;--line:#d0d1c9;--strong:#a9aba1;--accent:#315cf4;--accent-soft:#e7ebff;--signal:#b9e936;--signal-soft:#eff8d4;--warn:#d88614;--warn-soft:#fff0d9;--danger:#d8523f;--rail:224px;--mono:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;--sans:"Aptos","Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--canvas)}body{min-height:100vh;margin:0;background:var(--canvas);color:var(--ink);font:14px var(--sans)}button,input,select{font:inherit}a{color:inherit}:focus-visible{outline:3px solid rgba(49,92,244,.35);outline-offset:2px}.app{display:grid;grid-template-columns:var(--rail) minmax(0,1fr);min-height:100vh}.sidebar{position:fixed;inset:0 auto 0 0;z-index:30;width:var(--rail);height:100vh;display:flex;flex-direction:column;border-right:1px solid var(--strong);background:#e5e4dd}.brand{height:68px;display:flex;align-items:center;gap:11px;padding:0 17px;border-bottom:1px solid var(--strong);text-decoration:none}.brand-mark{position:relative;width:30px;height:30px;flex:none;border:1px solid var(--ink);background:var(--signal)}.brand-mark:before,.brand-mark:after{content:"";position:absolute;background:var(--ink)}.brand-mark:before{width:14px;height:1px;left:7px;top:14px}.brand-mark:after{width:1px;height:14px;left:14px;top:7px}.brand-copy strong,.brand-copy small{display:block}.brand-copy strong{font:800 13px var(--mono);letter-spacing:.1em}.brand-copy small{margin-top:4px;color:var(--muted);font:8px var(--mono);letter-spacing:.08em}.nav-label{padding:20px 17px 7px;color:var(--quiet);font:8px var(--mono);letter-spacing:.12em;text-transform:uppercase}.nav{display:grid;gap:2px;padding:0 9px}.nav a{min-height:38px;display:grid;grid-template-columns:22px 1fr auto;align-items:center;gap:8px;padding:0 9px;border:1px solid transparent;color:var(--text);text-decoration:none;font-size:12px}.nav a:hover{border-color:var(--strong);background:rgba(255,255,255,.45)}.nav a.active{border-color:var(--ink);background:var(--raised);box-shadow:3px 3px 0 var(--ink);color:var(--ink)}.nav-icon,.nav-count{color:var(--quiet);font:8px var(--mono)}.nav a.active .nav-icon{color:var(--accent)}.sidebar-foot{margin-top:auto;padding:14px 17px 17px;border-top:1px solid var(--strong)}.daemon{display:flex;align-items:center;gap:8px;color:var(--text);font:8px var(--mono);text-transform:uppercase}.daemon i,.local-label:before{width:7px;height:7px;background:var(--signal);border:1px solid #769b0a;content:""}.storage{overflow:hidden;margin-top:9px;color:var(--muted);font:8px/1.5 var(--mono);text-overflow:ellipsis;white-space:nowrap}.main{grid-column:2;min-width:0}.topbar{position:sticky;top:0;z-index:25;height:52px;display:flex;align-items:center;gap:16px;padding:0 24px;border-bottom:1px solid var(--strong);background:rgba(239,238,232,.94);backdrop-filter:blur(14px)}.mobile-menu{display:none}.breadcrumb{color:var(--muted);font:8px var(--mono);letter-spacing:.04em;text-transform:uppercase}.breadcrumb strong{color:var(--ink)}.command-trigger{width:min(420px,45vw);height:32px;display:flex;align-items:center;gap:9px;margin-left:auto;padding:0 10px;border:1px solid var(--strong);background:var(--surface);color:var(--muted);text-decoration:none;font:8px var(--mono)}.command-trigger:hover{border-color:var(--ink);background:var(--raised)}.command-trigger kbd{margin-left:auto;padding:2px 4px;border:1px solid var(--line);background:var(--canvas);font:7px var(--mono)}.local-label{display:flex;align-items:center;gap:7px;color:var(--muted);font:8px var(--mono);white-space:nowrap}.workspace{max-width:1480px;margin:0 auto;padding:28px 30px 50px}.page-head{display:flex;justify-content:space-between;gap:24px;margin-bottom:24px}.page-head h1{margin:0;font-size:30px;line-height:1;letter-spacing:-.035em}.page-head p{margin:8px 0 0;color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));margin-bottom:18px;border:1px solid var(--strong);background:var(--surface)}.metric{min-width:0;padding:14px 15px;border-right:1px solid var(--line)}.metric:last-child{border:0}.metric-label{display:flex;gap:7px;color:var(--muted);font:8px var(--mono);text-transform:uppercase}.metric-label b{color:var(--quiet);font-weight:400}.metric strong{display:block;margin-top:10px;font:600 24px/1 var(--mono);letter-spacing:-.06em}.metric small{display:block;overflow:hidden;margin-top:7px;color:var(--quiet);font:8px var(--mono);text-overflow:ellipsis;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.55fr);gap:18px;align-items:start}.panel{border:1px solid var(--strong);background:var(--surface)}.panel-head{min-height:48px;display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--line)}.panel-head h2{margin:0;font-size:13px}.panel-head p{margin:3px 0 0;color:var(--muted);font:8px var(--mono)}.panel-link{margin-left:auto;color:var(--accent);font:8px var(--mono);text-decoration:none}.right-stack{display:grid;gap:18px}.memory-list{display:grid}.memory-row{display:grid;grid-template-columns:36px minmax(0,1fr) auto;gap:12px;min-height:86px;align-items:start;padding:13px 14px;border-bottom:1px solid var(--line);text-decoration:none}.memory-row:last-child{border:0}.memory-row:hover{background:var(--accent-soft)}.type{width:30px;height:30px;display:grid;place-items:center;border:1px solid var(--strong);background:var(--raised);font:9px var(--mono)}.memory-row[data-kind=playbook] .type{border-color:#88a91e;background:var(--signal-soft)}.memory-copy h3{margin:0 0 5px;font-size:12px}.memory-copy p{overflow:hidden;margin:0;color:var(--muted);font:8px/1.5 var(--mono);text-overflow:ellipsis;white-space:nowrap}.memory-meta{display:flex;flex-wrap:wrap;gap:9px;margin-top:8px;color:var(--quiet);font:7px var(--mono);text-transform:uppercase}.memory-tail{display:grid;justify-items:end;gap:8px;color:var(--quiet);font:7px var(--mono);text-transform:uppercase}.scope-tag,.status-badge{padding:3px 5px;border:1px solid var(--line);background:var(--raised);font:8px var(--mono);text-transform:uppercase}.session-list{padding:3px 14px 8px}.session-row{display:grid;grid-template-columns:50px 1fr auto;gap:10px;padding:11px 0;border-bottom:1px solid var(--line);text-decoration:none}.session-row:last-child{border:0}.session-row:hover strong{color:var(--accent)}.session-row time,.session-state{color:var(--quiet);font:7px var(--mono);text-transform:uppercase}.session-row strong{display:block;font-size:10px}.session-row p{margin:4px 0 0;color:var(--muted);font:7px var(--mono)}.system-list{padding:5px 14px 10px}.system-row{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;min-height:42px;border-bottom:1px solid var(--line)}.system-row:last-child{border:0}.system-row span{font-size:10px}.system-row strong{font:8px var(--mono);text-transform:uppercase}.system-row strong.ready{color:#66810d}.system-row strong.attention{color:var(--warn)}.section-title{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin:24px 0 10px}.section-title h2{margin:0;font-size:16px}.section-title p{margin:4px 0 0;color:var(--muted);font:8px var(--mono)}.section-title a{color:var(--accent);font:8px var(--mono);text-decoration:none}.project-table{width:100%;border-collapse:collapse}.project-table th{height:34px;padding:0 13px;border-bottom:1px solid var(--line);color:var(--quiet);font:7px var(--mono);text-align:left;text-transform:uppercase}.project-table td{height:52px;padding:0 13px;border-bottom:1px solid var(--line);font-size:10px}.project-table tr:last-child td{border:0}.project-table tbody tr:hover{background:var(--accent-soft)}.project-name strong{display:block}.project-name a{text-decoration:none}.project-name small{display:block;max-width:250px;overflow:hidden;margin-top:4px;color:var(--quiet);font:7px var(--mono);text-overflow:ellipsis;white-space:nowrap}.tech{color:var(--muted);font:7px var(--mono)}.number{font:9px var(--mono);text-align:right}.table-empty,.empty-state{padding:18px!important;color:var(--muted);font:8px var(--mono)}.filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px}.filters select,.filters input{height:32px;padding:0 9px;border:1px solid var(--strong);background:var(--surface);color:var(--text);font:8px var(--mono)}.search-field{display:flex;align-items:center;border:1px solid var(--strong);background:var(--surface)}.search-field span{padding-left:9px;color:var(--accent)}.search-field input{width:260px;border:0}.filters button{height:32px;padding:0 12px;border:1px solid var(--ink);background:var(--signal);box-shadow:2px 2px 0 var(--ink);cursor:pointer;font:8px var(--mono);text-transform:uppercase}.metadata-panel{margin-bottom:18px}.metadata{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0;padding:16px}.metadata dt{color:var(--quiet);font:7px var(--mono);text-transform:uppercase}.metadata dd{margin:0;overflow-wrap:anywhere;color:var(--text);font:8px/1.5 var(--mono)}.detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(260px,.55fr)}.rendered{padding:18px;font-size:12px;line-height:1.65}.rendered h2{margin:16px 0 7px;font-size:15px}.rendered p{margin:0 0 8px}.detail-side{padding:18px;border-left:1px solid var(--line)}.stamp{margin-bottom:12px;color:var(--muted);font:8px var(--mono);text-transform:uppercase}.handoff-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.handoff-card{min-width:0;padding:12px;border:1px solid var(--strong);background:var(--surface);box-shadow:3px 3px 0 var(--strong)}.handoff-card[data-kind=blocked]{background:var(--warn-soft)}.handoff-card-top{display:flex;justify-content:space-between;gap:8px;color:var(--quiet);font:7px var(--mono)}.handoff-status{color:var(--text);text-transform:uppercase}.handoff-card h3{margin:10px 0;font-size:11px;line-height:1.35}.handoff-facts{display:grid;grid-template-columns:55px 1fr;gap:6px 8px;margin:0}.handoff-facts dt{color:var(--quiet);font:7px var(--mono);text-transform:uppercase}.handoff-facts dd{overflow:hidden;margin:0;color:var(--text);font:7px/1.4 var(--mono);text-overflow:ellipsis;white-space:nowrap}.session-overview{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:18px;padding:16px}.session-overview h2{margin:5px 0 0;font-size:16px}.session-overview p{margin:6px 0 0;color:var(--muted);font:8px var(--mono)}.eyebrow{color:var(--quiet);font:7px var(--mono);letter-spacing:.08em;text-transform:uppercase}.status-stack{display:flex;gap:6px}.status-badge.subtle{color:var(--muted)}.session-detail-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(300px,.75fr);gap:18px;align-items:start}.session-detail-grid>div{display:grid;gap:18px}.summary-result{padding:16px;border-bottom:1px solid var(--line);font-size:12px;line-height:1.55}.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.summary-grid section{padding:14px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.summary-grid section:nth-child(2n){border-right:0}.summary-grid section:nth-last-child(-n+2){border-bottom:0}.summary-grid h3{margin:0 0 8px;color:var(--quiet);font:7px var(--mono);text-transform:uppercase}.summary-grid ul{margin:0;padding-left:16px;color:var(--text);font:9px/1.55 var(--mono)}.diagnostic-panel .metadata{padding:14px}.evidence-list{display:grid}.evidence-row{display:grid;grid-template-columns:120px minmax(0,1fr);gap:12px;padding:12px 14px;border-bottom:1px solid var(--line)}.evidence-row:last-child{border:0}.evidence-row strong{font-size:10px}.evidence-row span{display:block;margin-top:4px;color:var(--quiet);font:7px var(--mono)}.evidence-row p{grid-column:2;margin:0;color:var(--text);font:8px/1.5 var(--mono);overflow-wrap:anywhere}.callout{padding:16px}.callout pre{overflow:auto;font:8px/1.5 var(--mono)}
+.decay-state{display:grid;gap:5px;margin-top:8px;color:var(--muted);font:7px var(--mono)}.decay-state i{display:block;width:min(260px,100%);height:5px;border:1px solid var(--line);background:var(--muted-surface)}.decay-state b{display:block;height:100%;background:var(--accent)}.decay-state.stable{color:#66810d}.decay-state.forgotten{color:var(--danger)}.decay-state.forgotten b{background:var(--danger)}
 @media(max-width:1180px){.app{display:block}.sidebar{width:min(278px,86vw);transform:translateX(-105%);transition:transform .17s ease;box-shadow:18px 0 50px rgba(29,30,27,.22)}.sidebar.open{transform:translateX(0)}.main{grid-column:auto}.topbar{padding:0 13px}.mobile-menu{width:30px;height:30px;display:grid;place-items:center;border:1px solid var(--ink);background:var(--signal)}.breadcrumb{display:none}.command-trigger{width:auto;flex:1;margin:0}.local-label{font-size:0}.workspace{padding:22px 14px 38px}.dashboard-grid,.detail-grid,.session-detail-grid{grid-template-columns:1fr}.detail-side{border-left:0;border-top:1px solid var(--line)}.handoff-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.metric{border-bottom:1px solid var(--line)}.metric:nth-child(2n){border-right:0}.page-head h1{font-size:25px}.memory-row{grid-template-columns:34px 1fr}.memory-tail{display:none}.memory-copy p{white-space:normal}.project-table th:nth-child(2),.project-table td:nth-child(2),.project-table th:nth-child(3),.project-table td:nth-child(3){display:none}.handoff-grid,.summary-grid{grid-template-columns:1fr}.summary-grid section{border-right:0}.session-overview{align-items:flex-start;flex-direction:column}.evidence-row{grid-template-columns:1fr}.evidence-row p{grid-column:1}.filters{display:grid}.filters>*{width:100%}.search-field input{width:100%}}
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation-duration:.01ms!important;transition-duration:.01ms!important}}

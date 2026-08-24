@@ -26,7 +26,7 @@ Menvane is local-first: durable knowledge is human-readable Markdown, while SQLi
 Menvane is designed for teams and developers who want agents to remember the work without handing their project context to a hosted memory service.
 
 - **Resume work faster:** a per-project handoff tracks only still-live work fronts, with provenance and next steps.
-- **Reuse proven knowledge:** non-obvious contexts and playbooks are consolidated from captured evidence, and most sessions promote nothing.
+- **Reuse proven knowledge:** non-obvious memories and playbooks are consolidated from captured evidence, and most sessions promote nothing.
 - **Recall the right context:** each prompt receives only the handoff items related to its intent plus up to three knowledge cards.
 - **Keep projects isolated:** project memory is separated from unrelated repositories, with applicable global knowledge available when appropriate.
 - **Inspect and own the data:** Markdown is the durable source of truth and remains readable without Menvane.
@@ -40,7 +40,14 @@ Each durable session is a chronological, sanitized capture of the observed event
 
 ### Evidence-based memory
 
-One language-model consolidation per finalized session interprets the chronological capture and produces the episodic summary, explicit operations over every handoff item, and zero or more durable contexts or playbooks — only non-obvious knowledge reusable beyond the current task passes the promotion barrier.
+One language-model consolidation per finalized session interprets the chronological capture and produces the episodic summary, explicit operations over every handoff item, and zero or more durable memories or playbooks — only non-obvious knowledge reusable beyond the current task passes the promotion barrier.
+
+Memories decay to forgotten after 90 days by default, while playbooks keep their validation lifecycle without temporal decay. MCP reads and actual agent injection reinforce memories; CLI, REST, and dashboard views are observational. The lifetime is configurable:
+
+```toml
+[decay]
+memory_lifetime_days = 90
+```
 
 ### Local and rebuildable storage
 
@@ -112,12 +119,12 @@ The local dashboard is available at <http://127.0.0.1:47831/>.
 ```bash
 menvane search "database migration"
 menvane read <memory-id>
-menvane write --type context --title "Migration rule" --content "..."
+menvane write --type memory --title "Migration rule" --content "..."
 menvane forget <memory-id>
 menvane handoff inspect
 ```
 
-Session start delivers only minimal project identity and the current handoff. Each prompt then receives only the handoff items related to its intent plus up to three context or playbook cards; the hot path never calls a language-model provider. Full memory bodies stay available through explicit reads.
+Session start delivers only minimal project identity and the current handoff. Each prompt then receives only the handoff items related to its intent plus up to three memory or playbook cards; the hot path never calls a language-model provider. Full memory bodies stay available through explicit reads.
 
 Explicit search uses the query provided by the caller. Full Markdown and bounded provenance remain available through `menvane read` and the local UI.
 

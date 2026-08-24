@@ -90,7 +90,7 @@ fn is_zero(value: &u32) -> bool {
 pub enum ReinforcementSignal {
     Retrieved,
     Injected,
-    ExplicitlyRead,
+    McpRead,
     SuccessfullyApplied,
     FailedApplication,
 }
@@ -100,7 +100,7 @@ impl ReinforcementSignal {
         match self {
             Self::Retrieved => "retrieved",
             Self::Injected => "injected",
-            Self::ExplicitlyRead => "explicitly_read",
+            Self::McpRead => "mcp_read",
             Self::SuccessfullyApplied => "successfully_applied",
             Self::FailedApplication => "failed_application",
         }

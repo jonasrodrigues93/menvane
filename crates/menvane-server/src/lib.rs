@@ -541,7 +541,7 @@ mod tests {
                 WriteMemory {
                     title: "UI inspection memory".to_owned(),
                     body: "Visible durable evidence".to_owned(),
-                    knowledge_type: KnowledgeType::Context,
+                    knowledge_type: KnowledgeType::Memory,
                     scope: Scope::Project,
                     tags: Vec::new(),
                     applies_to: Applicability::default(),
@@ -558,7 +558,8 @@ mod tests {
             ))
             .unwrap();
         let session_id = menvane.sessions(1).unwrap()[0].id;
-        let router = app(Arc::new(menvane));
+        let menvane = Arc::new(menvane);
+        let router = app(menvane.clone());
         let project_response = router
             .clone()
             .oneshot(
@@ -608,6 +609,26 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/memories/{}", memory.metadata.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Fresh · about"));
+        assert!(body.contains("days until forgotten"));
+        assert!(body.contains("decay-state"));
+        assert_eq!(
+            menvane.memory_reinforcement(memory.metadata.id).unwrap().0,
+            0
+        );
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri("/settings")
                     .body(Body::empty())
                     .unwrap(),
@@ -619,6 +640,7 @@ mod tests {
         assert!(body.contains("settings-form"));
         assert!(body.contains("name='max_prompt_bytes'"));
         assert!(body.contains("name='reasoning_effort'"));
+        assert!(body.contains("name='memory_lifetime_days'"));
         assert!(!body.contains("<pre>[llm]"));
 
         let response = router
@@ -628,7 +650,7 @@ mod tests {
                     .method("POST")
                     .uri("/settings")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("max_prompt_bytes=12000&max_tool_input_bytes=3000&max_tool_output_bytes=3500&idle_finalize_seconds=90&lease_timeout_seconds=240&provider=openai&model=gpt-test&reasoning_effort=high&base_url=https%3A%2F%2Fapi.openai.com%2Fv1&api_key_env=OPENAI_API_KEY&consolidation_prompt="))
+                    .body(Body::from("max_prompt_bytes=12000&max_tool_input_bytes=3000&max_tool_output_bytes=3500&idle_finalize_seconds=90&lease_timeout_seconds=240&memory_lifetime_days=90&provider=openai&model=gpt-test&reasoning_effort=high&base_url=https%3A%2F%2Fapi.openai.com%2Fv1&api_key_env=OPENAI_API_KEY&consolidation_prompt="))
                     .unwrap(),
             )
             .await
@@ -637,6 +659,7 @@ mod tests {
         let configuration = fs::read_to_string(temporary.path().join("home/config.toml")).unwrap();
         assert!(configuration.contains("max_prompt_bytes = 12000"));
         assert!(configuration.contains("model = \"gpt-test\""));
+        assert!(configuration.contains("memory_lifetime_days = 90"));
 
         let response = router
             .oneshot(

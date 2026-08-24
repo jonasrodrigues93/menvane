@@ -8,7 +8,7 @@ mod summary;
 
 pub use consolidation::{
     ConsolidationExecution, ConsolidationPacket, ConsolidationResult, ConsolidationValidationError,
-    ContextContent, KnowledgeContent, KnowledgeOperation, KnowledgeOperationKind, PlaybookContent,
+    KnowledgeContent, KnowledgeOperation, KnowledgeOperationKind, MemoryContent, PlaybookContent,
     RelatedMemory, RelatedSummary, consolidation_result_schema, preserve_handoff_transitions,
     validate_consolidation_result, validate_knowledge_promotion,
 };
@@ -17,8 +17,8 @@ pub use handoff::{
     HandoffReplacement, HandoffTransition, HandoffUpdate, NewHandoffItem,
 };
 pub use memory::{
-    Applicability, KnowledgeType, Memory, MemoryMetadata, MemoryStatus, ParseKnowledgeTypeError,
-    Scope,
+    Applicability, KnowledgeMetadata, KnowledgeRecord, KnowledgeType, MemoryStatus,
+    ParseKnowledgeTypeError, Scope,
 };
 pub use project::{Project, ProjectTechnologies};
 pub use retrieval::{

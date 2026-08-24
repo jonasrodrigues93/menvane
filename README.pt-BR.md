@@ -26,7 +26,7 @@ O Menvane é local-first: o conhecimento durável fica em Markdown legível por 
 O Menvane foi criado para equipes e desenvolvedores que querem que os agentes se lembrem do trabalho sem enviar o contexto dos projetos para um serviço de memória hospedado.
 
 - **Retome o trabalho mais rápido:** um handoff por projeto acompanha apenas as frentes ainda vivas, com proveniência e próximos passos.
-- **Reutilize conhecimento comprovado:** contextos e playbooks não óbvios são consolidados a partir de evidências capturadas, e a maioria das sessões não promove nada.
+- **Reutilize conhecimento comprovado:** memórias e playbooks não óbvios são consolidados a partir de evidências capturadas, e a maioria das sessões não promove nada.
 - **Recupere o contexto certo:** cada prompt recebe apenas os itens do handoff relacionados à sua intenção, mais até três cartões de conhecimento.
 - **Mantenha projetos isolados:** a memória de cada projeto é separada de repositórios não relacionados, com conhecimento global aplicável disponível quando apropriado.
 - **Inspecione e controle os dados:** Markdown é a fonte durável da verdade e continua legível sem o Menvane.
@@ -40,7 +40,14 @@ Cada sessão durável é uma captura cronológica e sanitizada dos eventos obser
 
 ### Memória baseada em evidências
 
-Uma consolidação por modelo de linguagem por sessão finalizada interpreta a captura cronológica e produz o resumo episódico, operações explícitas sobre cada item do handoff e zero ou mais contextos ou playbooks duráveis — apenas conhecimento não óbvio e reutilizável além da tarefa corrente passa pela barreira de promoção.
+Uma consolidação por modelo de linguagem por sessão finalizada interpreta a captura cronológica e produz o resumo episódico, operações explícitas sobre cada item do handoff e zero ou mais memórias ou playbooks duráveis — apenas conhecimento não óbvio e reutilizável além da tarefa corrente passa pela barreira de promoção.
+
+Memórias chegam a `forgotten` após 90 dias por padrão, enquanto playbooks mantêm seu lifecycle de validação sem decay temporal. Leituras MCP e injeções reais pelo agente reforçam memórias; CLI, REST e dashboard são observacionais. O tempo de vida é configurável:
+
+```toml
+[decay]
+memory_lifetime_days = 90
+```
 
 ### Armazenamento local e reconstruível
 
@@ -112,12 +119,12 @@ O dashboard local está disponível em <http://127.0.0.1:47831/>.
 ```bash
 menvane search "database migration"
 menvane read <memory-id>
-menvane write --type context --title "Regra de migração" --content "..."
+menvane write --type memory --title "Regra de migração" --content "..."
 menvane forget <memory-id>
 menvane handoff inspect
 ```
 
-O início da sessão entrega apenas a identidade mínima do projeto e o handoff corrente. Cada prompt recebe então somente os itens do handoff relacionados à sua intenção, mais até três cartões de contexto ou playbook; o caminho crítico nunca chama um provedor de modelo de linguagem. Os corpos completos das memórias continuam disponíveis por leitura explícita.
+O início da sessão entrega apenas a identidade mínima do projeto e o handoff corrente. Cada prompt recebe então somente os itens do handoff relacionados à sua intenção, mais até três cartões de memória ou playbook; o caminho crítico nunca chama um provedor de modelo de linguagem. Os corpos completos das memórias continuam disponíveis por leitura explícita.
 
 A busca explícita usa somente a consulta fornecida pelo chamador. O Markdown completo e a proveniência limitada continuam disponíveis por `menvane read` e pela interface local.
 

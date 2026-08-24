@@ -5,7 +5,7 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
-use menvane_domain::{Memory, MemoryMetadata, Project, Scope, SessionMetadata};
+use menvane_domain::{KnowledgeMetadata, KnowledgeRecord, Project, Scope, SessionMetadata};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
@@ -42,7 +42,7 @@ impl MarkdownStore {
             fs::create_dir_all(&path)
                 .with_context(|| format!("failed to create {}", path.display()))?;
         }
-        for directory in ["context", "playbooks"] {
+        for directory in ["memories", "playbooks"] {
             fs::create_dir_all(self.memory_root.join("global").join(directory))?;
         }
         let config = self.home.join("config.toml");
@@ -62,7 +62,7 @@ impl MarkdownStore {
 
     pub fn write_project(&self, project: &Project) -> Result<PathBuf> {
         let directory = self.project_directory(project);
-        for name in ["context", "playbooks", "sessions"] {
+        for name in ["memories", "playbooks", "sessions"] {
             fs::create_dir_all(directory.join(name))?;
         }
         let path = directory.join("project.md");
@@ -71,7 +71,11 @@ impl MarkdownStore {
         Ok(path)
     }
 
-    pub fn write_memory(&self, memory: &Memory, project: Option<&Project>) -> Result<PathBuf> {
+    pub fn write_memory(
+        &self,
+        memory: &KnowledgeRecord,
+        project: Option<&Project>,
+    ) -> Result<PathBuf> {
         let base = match memory.metadata.scope {
             Scope::Global => self.memory_root.join("global"),
             Scope::Project => {
@@ -89,16 +93,16 @@ impl MarkdownStore {
         Ok(path)
     }
 
-    pub fn update_memory(&self, path: &Path, memory: &Memory) -> Result<()> {
+    pub fn update_memory(&self, path: &Path, memory: &KnowledgeRecord) -> Result<()> {
         let body = format!("# {}\n\n{}\n", memory.title.trim(), memory.body.trim());
         let markdown = serialize_frontmatter(&memory.metadata, &body)?;
         self.atomic_write(path, markdown.as_bytes())
     }
 
-    pub fn parse_memory(&self, path: &Path) -> Result<Memory> {
-        let parsed: ParsedMarkdown<MemoryMetadata> = parse_frontmatter(path)?;
+    pub fn parse_memory(&self, path: &Path) -> Result<KnowledgeRecord> {
+        let parsed: ParsedMarkdown<KnowledgeMetadata> = parse_frontmatter(path)?;
         let (title, body) = parse_title(&parsed.body)?;
-        Ok(Memory {
+        Ok(KnowledgeRecord {
             metadata: parsed.metadata,
             title,
             body,
@@ -343,12 +347,12 @@ fn slugify(value: &str) -> String {
 }
 
 fn default_config() -> &'static str {
-    "[capture]\nmax_prompt_bytes = 16384\nmax_tool_output_bytes = 4096\nmax_tool_input_bytes = 4096\nignore_paths = [\".env\", \".env.*\", \"**/secrets/**\", \"**/.ssh/**\", \"AGENTS.md\", \"**/AGENTS.md\", \"SKILL.md\", \"**/SKILL.md\", \"skills/**\", \"**/skills/**\"]\n\n[sessions]\nidle_finalize_seconds = 120\n\n\n\n[jobs]\nlease_timeout_seconds = 300\n\n[llm]\nprovider = \"openai\"\nmodel = \"gpt-5.6-luna\"\nreasoning_effort = \"medium\"\noauth_issuer = \"https://auth.openai.com\"\noauth_endpoint = \"https://chatgpt.com/backend-api/codex/responses\"\n"
+    "[capture]\nmax_prompt_bytes = 16384\nmax_tool_output_bytes = 4096\nmax_tool_input_bytes = 4096\nignore_paths = [\".env\", \".env.*\", \"**/secrets/**\", \"**/.ssh/**\", \"AGENTS.md\", \"**/AGENTS.md\", \"SKILL.md\", \"**/SKILL.md\", \"skills/**\", \"**/skills/**\"]\n\n[sessions]\nidle_finalize_seconds = 120\n\n[decay]\nmemory_lifetime_days = 90\n\n[jobs]\nlease_timeout_seconds = 300\n\n[llm]\nprovider = \"openai\"\nmodel = \"gpt-5.6-luna\"\nreasoning_effort = \"medium\"\noauth_issuer = \"https://auth.openai.com\"\noauth_endpoint = \"https://chatgpt.com/backend-api/codex/responses\"\n"
 }
 
 #[cfg(test)]
 mod tests {
-    use menvane_domain::{Applicability, KnowledgeType, MemoryMetadata, MemoryStatus, Scope};
+    use menvane_domain::{Applicability, KnowledgeMetadata, KnowledgeType, MemoryStatus, Scope};
     use tempfile::TempDir;
 
     use super::*;
@@ -358,9 +362,9 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let store = MarkdownStore::new(temporary.path());
         store.initialize().unwrap();
-        let memory = Memory {
-            metadata: MemoryMetadata::new(
-                KnowledgeType::Context,
+        let memory = KnowledgeRecord {
+            metadata: KnowledgeMetadata::new(
+                KnowledgeType::Memory,
                 Scope::Global,
                 None,
                 vec!["rust".to_owned()],

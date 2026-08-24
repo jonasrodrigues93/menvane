@@ -309,7 +309,7 @@ struct ForgetArgs {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum WritableType {
-    Context,
+    Memory,
     Playbook,
 }
 
@@ -590,7 +590,7 @@ async fn main() -> Result<()> {
                     title: arguments.title,
                     body: arguments.content,
                     knowledge_type: match arguments.r#type {
-                        WritableType::Context => KnowledgeType::Context,
+                        WritableType::Memory => KnowledgeType::Memory,
                         WritableType::Playbook => KnowledgeType::Playbook,
                     },
                     scope: match arguments.scope {

@@ -1,3 +1,4 @@
+mod decay;
 mod embeddings;
 mod oauth_provider;
 mod project_resolver;
@@ -14,7 +15,7 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -22,10 +23,10 @@ use fs2::FileExt;
 use menvane_domain::{
     Applicability, ConsolidationPacket, ConsolidationResult, EmbeddingProvider, EpisodicSummary,
     HandoffItem, HandoffItemOperation, HandoffItemSource, JsonSchema, KnowledgeContent,
-    KnowledgeOperation, KnowledgeOperationKind, KnowledgeType, LlmError, LlmProvider, LlmRequest,
-    Memory, MemoryMetadata, MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession,
-    Project, ProviderHealth, ReinforcementSignal, Scope, SessionMetadata, SessionState,
-    SummaryStatus,
+    KnowledgeMetadata, KnowledgeOperation, KnowledgeOperationKind, KnowledgeRecord, KnowledgeType,
+    LlmError, LlmProvider, LlmRequest, MemoryStatus, NormalizedEvent, NormalizedEventKind,
+    NormalizedSession, Project, ProviderHealth, ReinforcementSignal, Scope, SessionMetadata,
+    SessionState, SummaryStatus,
 };
 use menvane_store::{
     IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MAX_SUMMARY_SELECTION_BYTES,
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+pub use decay::{MemoryDecay, memory_decay};
 pub use embeddings::OpenAICompatibleEmbeddingProvider;
 pub use menvane_store::{
     ConsolidationMarker, IngestResult, JobRecord as StoreJobRecord, MAX_HANDOFF_ITEM_BYTES,
@@ -142,6 +144,22 @@ struct MenvaneConfig {
     llm: LlmConfiguration,
     #[serde(default)]
     embeddings: EmbeddingConfiguration,
+    #[serde(default)]
+    decay: DecayConfiguration,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct DecayConfiguration {
+    #[serde(default = "default_memory_lifetime_days")]
+    memory_lifetime_days: u64,
+}
+
+impl Default for DecayConfiguration {
+    fn default() -> Self {
+        Self {
+            memory_lifetime_days: default_memory_lifetime_days(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,6 +259,9 @@ fn default_idle_finalize_seconds() -> u64 {
 fn default_job_lease_timeout_seconds() -> u64 {
     300
 }
+fn default_memory_lifetime_days() -> u64 {
+    decay::DEFAULT_MEMORY_LIFETIME_DAYS as u64
+}
 fn default_llm_provider() -> String {
     "openai".to_owned()
 }
@@ -273,6 +294,7 @@ pub struct Menvane {
     worker_owner: String,
     provider_override: Option<Arc<dyn LlmProvider>>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    decay_last_sweep: Mutex<chrono::DateTime<Utc>>,
 }
 
 impl DoctorReport {
@@ -300,7 +322,10 @@ impl Menvane {
         index.initialize()?;
         let sessions = SessionRepository::new(home.join("state.sqlite"));
         sessions.initialize()?;
-        Ok(Self {
+        if config.decay.memory_lifetime_days < 1 {
+            bail!("decay.memory_lifetime_days must be at least 1");
+        }
+        let menvane = Self {
             home,
             markdown,
             index,
@@ -309,7 +334,14 @@ impl Menvane {
             worker_owner: Uuid::now_v7().to_string(),
             provider_override: None,
             embedding_provider,
-        })
+            decay_last_sweep: Mutex::new(chrono::DateTime::<Utc>::UNIX_EPOCH),
+        };
+        menvane.expire_memories()?;
+        *menvane
+            .decay_last_sweep
+            .lock()
+            .map_err(|_| anyhow::anyhow!("decay sweep lock is poisoned"))? = Utc::now();
+        Ok(menvane)
     }
 
     pub fn new_with_provider(
@@ -334,7 +366,7 @@ impl Menvane {
         &self.home
     }
 
-    pub fn write(&self, cwd: &Path, request: WriteMemory) -> Result<Memory> {
+    pub fn write(&self, cwd: &Path, request: WriteMemory) -> Result<KnowledgeRecord> {
         if request.title.trim().is_empty() {
             bail!("memory title cannot be empty");
         }
@@ -346,7 +378,7 @@ impl Menvane {
             Scope::Global => None,
         };
         let scope = project.as_ref().map_or(Scope::Global, |_| request.scope);
-        let metadata = MemoryMetadata::new(
+        let metadata = KnowledgeMetadata::new(
             request.knowledge_type,
             scope,
             project.as_ref().map(|value| value.id.clone()),
@@ -354,7 +386,7 @@ impl Menvane {
             request.applies_to,
             MemoryStatus::Active,
         );
-        let memory = Memory {
+        let memory = KnowledgeRecord {
             metadata,
             title: request.title.trim().to_owned(),
             body: request.body.trim().to_owned(),
@@ -388,6 +420,31 @@ impl Menvane {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         self.search_inner(cwd, query, scope, limit)
+    }
+
+    pub fn search_including_forgotten(
+        &self,
+        cwd: &Path,
+        query: &str,
+        scope: ScopeSelection,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.expire_memories_if_due()?;
+        let project = match scope {
+            ScopeSelection::Global => None,
+            ScopeSelection::Auto | ScopeSelection::Project => self.ensure_project(cwd)?,
+        };
+        let search_scope = match scope {
+            ScopeSelection::Auto => project.as_ref().map_or(SearchScope::Global, |value| {
+                SearchScope::Auto(value.id.as_str())
+            }),
+            ScopeSelection::Project => project.as_ref().map_or(SearchScope::Global, |value| {
+                SearchScope::Project(value.id.as_str())
+            }),
+            ScopeSelection::Global => SearchScope::Global,
+        };
+        self.index
+            .search_including_forgotten(query, search_scope, limit)
     }
 
     pub fn search_with_sessions(
@@ -530,18 +587,24 @@ impl Menvane {
         })
     }
 
-    pub fn read(&self, id: Uuid) -> Result<Memory> {
-        let memory = self.index.read_memory(&self.markdown, id)?.0;
-        self.sessions
-            .record_access(id, ReinforcementSignal::ExplicitlyRead)?;
+    pub fn read(&self, id: Uuid) -> Result<KnowledgeRecord> {
+        self.read_without_recording(id)
+    }
+
+    pub fn read_from_mcp(&self, id: Uuid) -> Result<KnowledgeRecord> {
+        let memory = self.read_without_recording(id)?;
+        if memory.metadata.knowledge_type == KnowledgeType::Memory {
+            self.record_memory_reinforcement(id, ReinforcementSignal::McpRead)?;
+            return self.read_without_recording(id);
+        }
         Ok(memory)
     }
 
-    pub fn read_without_recording(&self, id: Uuid) -> Result<Memory> {
+    pub fn read_without_recording(&self, id: Uuid) -> Result<KnowledgeRecord> {
         Ok(self.index.read_memory(&self.markdown, id)?.0)
     }
 
-    pub fn forget(&self, id: Uuid) -> Result<Memory> {
+    pub fn forget(&self, id: Uuid) -> Result<KnowledgeRecord> {
         let (mut memory, path) = self.index.read_memory(&self.markdown, id)?;
         mark_forgotten(&mut memory);
         self.markdown.update_memory(&path, &memory)?;
@@ -562,7 +625,7 @@ impl Menvane {
         Ok(counts)
     }
 
-    fn refresh_memory_embedding(&self, memory: &Memory) -> Result<()> {
+    fn refresh_memory_embedding(&self, memory: &KnowledgeRecord) -> Result<()> {
         let Some(provider) = &self.embedding_provider else {
             return Ok(());
         };
@@ -664,11 +727,96 @@ impl Menvane {
         self.sessions.access_counts(memory_id)
     }
 
-    pub fn memory_meaningful_access(
+    pub fn memory_reinforcement(
         &self,
         memory_id: Uuid,
     ) -> Result<(u64, Option<chrono::DateTime<Utc>>)> {
-        self.sessions.meaningful_access(memory_id)
+        self.sessions.memory_reinforcement(memory_id)
+    }
+
+    pub fn decay_state(&self, memory: &KnowledgeRecord) -> Result<Option<MemoryDecay>> {
+        if memory.metadata.knowledge_type != KnowledgeType::Memory {
+            return Ok(None);
+        }
+        let (count, latest) = self.sessions.memory_reinforcement(memory.metadata.id)?;
+        Ok(Some(memory_decay(
+            memory.metadata.created_at,
+            count,
+            latest,
+            Utc::now(),
+            self.config.decay.memory_lifetime_days as f64,
+        )))
+    }
+
+    fn record_memory_reinforcement(
+        &self,
+        memory_id: Uuid,
+        signal: ReinforcementSignal,
+    ) -> Result<()> {
+        self.sessions.record_access(memory_id, signal)?;
+        let (mut memory, path) = self.index.read_memory(&self.markdown, memory_id)?;
+        if memory.metadata.knowledge_type != KnowledgeType::Memory {
+            return Ok(());
+        }
+        let decay = self
+            .decay_state(&memory)?
+            .context("memory has no decay state")?;
+        if memory.metadata.status == MemoryStatus::Forgotten
+            && memory.metadata.decayed_at.is_some()
+            && decay.score > 0.0
+        {
+            memory.metadata.status = MemoryStatus::Active;
+            memory.metadata.decayed_at = None;
+            memory.metadata.updated_at = Utc::now();
+            self.markdown.update_memory(&path, &memory)?;
+            self.index.upsert_memory(&memory, &path)?;
+            self.markdown
+                .commit(&format!("feat(memory): revive {memory_id}"));
+        }
+        Ok(())
+    }
+
+    fn expire_memories(&self) -> Result<usize> {
+        let mut expired = 0;
+        for path in self.markdown.memory_files()? {
+            let mut memory = self.markdown.parse_memory(&path)?;
+            if memory.metadata.knowledge_type != KnowledgeType::Memory
+                || memory.metadata.status != MemoryStatus::Active
+            {
+                continue;
+            }
+            let decay = self
+                .decay_state(&memory)?
+                .context("memory has no decay state")?;
+            if decay.score > 0.0 {
+                continue;
+            }
+            memory.metadata.status = MemoryStatus::Forgotten;
+            memory.metadata.decayed_at = Some(Utc::now());
+            memory.metadata.updated_at = Utc::now();
+            self.markdown.update_memory(&path, &memory)?;
+            self.index.upsert_memory(&memory, &path)?;
+            expired += 1;
+        }
+        if expired > 0 {
+            self.markdown
+                .commit(&format!("chore(memory): expire {expired} records"));
+        }
+        Ok(expired)
+    }
+
+    fn expire_memories_if_due(&self) -> Result<usize> {
+        let mut last_sweep = self
+            .decay_last_sweep
+            .lock()
+            .map_err(|_| anyhow::anyhow!("decay sweep lock is poisoned"))?;
+        let now = Utc::now();
+        if now - *last_sweep < chrono::Duration::hours(1) {
+            return Ok(0);
+        }
+        let expired = self.expire_memories()?;
+        *last_sweep = now;
+        Ok(expired)
     }
 
     pub fn apply_playbook(
@@ -855,8 +1003,9 @@ impl Menvane {
                 .claim_delivery(&identity, "memory", &result.id.to_string())?
             {
                 context.push_str(&entry);
-                self.sessions
-                    .record_access(result.id, ReinforcementSignal::Injected)?;
+                if result.knowledge_type == KnowledgeType::Memory {
+                    self.record_memory_reinforcement(result.id, ReinforcementSignal::Injected)?;
+                }
             }
         }
         if !context.is_empty() {
@@ -1014,7 +1163,8 @@ impl Menvane {
             .collect()
     }
 
-    pub fn all_memories(&self) -> Result<Vec<Memory>> {
+    pub fn all_memories(&self) -> Result<Vec<KnowledgeRecord>> {
+        self.expire_memories_if_due()?;
         self.markdown
             .memory_files()?
             .into_iter()
@@ -1022,7 +1172,7 @@ impl Menvane {
             .collect()
     }
 
-    pub fn edit_memory(&self, id: Uuid, title: &str, body: &str) -> Result<Memory> {
+    pub fn edit_memory(&self, id: Uuid, title: &str, body: &str) -> Result<KnowledgeRecord> {
         let (mut memory, path) = self.index.read_memory(&self.markdown, id)?;
         if title.trim().is_empty() {
             bail!("memory title cannot be empty");
@@ -1042,7 +1192,10 @@ impl Menvane {
     }
 
     pub fn update_configuration_text(&self, configuration: &str) -> Result<()> {
-        let _: MenvaneConfig = toml::from_str(configuration)?;
+        let parsed: MenvaneConfig = toml::from_str(configuration)?;
+        if parsed.decay.memory_lifetime_days < 1 {
+            bail!("decay.memory_lifetime_days must be at least 1");
+        }
         let lowercase = configuration.to_ascii_lowercase();
         for forbidden in ["api_key =", "token =", "password =", "secret ="] {
             if lowercase.contains(forbidden) {
@@ -1560,7 +1713,7 @@ impl Menvane {
                     None
                 };
                 let scope = project.as_ref().map_or(Scope::Global, |_| scope);
-                let mut metadata = MemoryMetadata::new(
+                let mut metadata = KnowledgeMetadata::new(
                     knowledge_type,
                     scope,
                     project.as_ref().map(|value| value.id.clone()),
@@ -1583,7 +1736,7 @@ impl Menvane {
                 if self.duplicate_memory(&metadata, &title, &body)? {
                     return Ok(());
                 }
-                let memory = Memory {
+                let memory = KnowledgeRecord {
                     metadata,
                     title,
                     body,
@@ -1681,7 +1834,7 @@ impl Menvane {
                 let scope = project
                     .as_ref()
                     .map_or(Scope::Global, |_| operation.scope.unwrap_or(Scope::Project));
-                let mut metadata = MemoryMetadata::new(
+                let mut metadata = KnowledgeMetadata::new(
                     knowledge_type,
                     scope,
                     project.as_ref().map(|value| value.id.clone()),
@@ -1700,7 +1853,7 @@ impl Menvane {
                 if self.index.read_memory(&self.markdown, metadata.id).is_ok() {
                     return Ok(());
                 }
-                let memory = Memory {
+                let memory = KnowledgeRecord {
                     metadata,
                     title,
                     body,
@@ -1713,7 +1866,12 @@ impl Menvane {
         }
     }
 
-    fn duplicate_memory(&self, metadata: &MemoryMetadata, title: &str, body: &str) -> Result<bool> {
+    fn duplicate_memory(
+        &self,
+        metadata: &KnowledgeMetadata,
+        title: &str,
+        body: &str,
+    ) -> Result<bool> {
         let title = normalize_memory_text(title);
         let body = normalize_memory_text(body);
         Ok(self.all_memories()?.into_iter().any(|memory| {
@@ -1856,6 +2014,7 @@ impl Menvane {
         limit: usize,
         include_sessions: bool,
     ) -> Result<Vec<SearchResult>> {
+        self.expire_memories_if_due()?;
         let project = match scope {
             ScopeSelection::Global => None,
             ScopeSelection::Auto | ScopeSelection::Project => self.ensure_project(cwd)?,
@@ -2026,7 +2185,7 @@ fn check(name: &'static str, result: Result<String>) -> DoctorCheck {
 
 fn content_markdown(content: &KnowledgeContent) -> String {
     match content {
-        KnowledgeContent::Context(value) => value.body.trim().to_owned(),
+        KnowledgeContent::Memory(value) => value.body.trim().to_owned(),
         KnowledgeContent::Playbook(value) => format!(
             "## Trigger\n\n{}\n\n## Applicability\n\n{}\n\n## Steps\n\n{}\n\n## Validation\n\n{}\n\n## Failure handling\n\n{}",
             value.trigger,

@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use menvane_domain::{
-    Applicability, EpisodicSummary, KnowledgeType, Memory, MemoryStatus, Project, RelatedSummary,
+    Applicability, EpisodicSummary, KnowledgeRecord, KnowledgeType, MemoryStatus, Project,
+    RelatedSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
@@ -129,7 +130,7 @@ impl IndexStore {
         insert_project(&connection, project, path)
     }
 
-    pub fn upsert_memory(&self, memory: &Memory, path: &Path) -> Result<()> {
+    pub fn upsert_memory(&self, memory: &KnowledgeRecord, path: &Path) -> Result<()> {
         let mut connection = self.open_initialized()?;
         let transaction = connection.transaction()?;
         insert_memory(&transaction, memory, path)?;
@@ -416,7 +417,11 @@ impl IndexStore {
         Ok(selected)
     }
 
-    pub fn read_memory(&self, markdown: &MarkdownStore, id: Uuid) -> Result<(Memory, PathBuf)> {
+    pub fn read_memory(
+        &self,
+        markdown: &MarkdownStore,
+        id: Uuid,
+    ) -> Result<(KnowledgeRecord, PathBuf)> {
         let connection = self.open_initialized()?;
         let path: Option<String> = connection
             .query_row(
@@ -438,6 +443,26 @@ impl IndexStore {
         _include_sessions: bool,
         match_all_terms: bool,
     ) -> Result<Vec<SearchResult>> {
+        self.search_with_statuses(query, scope, limit, match_all_terms, false)
+    }
+
+    pub fn search_including_forgotten(
+        &self,
+        query: &str,
+        scope: SearchScope<'_>,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_with_statuses(query, scope, limit, false, true)
+    }
+
+    fn search_with_statuses(
+        &self,
+        query: &str,
+        scope: SearchScope<'_>,
+        limit: usize,
+        match_all_terms: bool,
+        include_forgotten: bool,
+    ) -> Result<Vec<SearchResult>> {
         let fts_query = fts_query(query, match_all_terms);
         if fts_query.is_empty() {
             bail!("search query must contain letters or numbers");
@@ -450,11 +475,16 @@ impl IndexStore {
             SearchScope::Project(project_id) => ("m.project_id = ?2", project_id),
             SearchScope::Global => ("m.scope = 'global'", ""),
         };
+        let status_sql = if include_forgotten {
+            "m.status IN ('active', 'candidate', 'forgotten')"
+        } else {
+            "m.status IN ('active', 'candidate')"
+        };
         let sql = format!(
             "SELECT m.id, m.type, m.scope, m.title, m.status, m.applicability_json, m.source_sessions_json, m.supersedes_json, snippet(memory_fts, 2, '', '', ' ... ', 24), -bm25(memory_fts) AS score, MAX(0, julianday('now') - julianday(m.updated_at))
              FROM memory_fts
              JOIN memories m ON m.id = memory_fts.id
-              WHERE memory_fts MATCH ?1 AND {scope_sql} AND m.status IN ('active', 'candidate')
+              WHERE memory_fts MATCH ?1 AND {scope_sql} AND {status_sql}
               ORDER BY CASE m.status WHEN 'active' THEN 0 ELSE 1 END, score DESC
              LIMIT ?3"
         );
@@ -799,7 +829,7 @@ fn insert_project(connection: &Connection, project: &Project, path: &Path) -> Re
     Ok(())
 }
 
-fn insert_memory(connection: &Connection, memory: &Memory, path: &Path) -> Result<()> {
+fn insert_memory(connection: &Connection, memory: &KnowledgeRecord, path: &Path) -> Result<()> {
     let metadata = &memory.metadata;
     connection.execute(
         "DELETE FROM memory_fts WHERE id = ?1",
@@ -942,8 +972,9 @@ fn fts_query(query: &str, match_all_terms: bool) -> String {
         .join(if match_all_terms { " AND " } else { " OR " })
 }
 
-pub fn mark_forgotten(memory: &mut Memory) {
+pub fn mark_forgotten(memory: &mut KnowledgeRecord) {
     memory.metadata.status = MemoryStatus::Forgotten;
+    memory.metadata.decayed_at = None;
     memory.metadata.updated_at = chrono::Utc::now();
 }
 
@@ -951,7 +982,7 @@ pub fn mark_forgotten(memory: &mut Memory) {
 mod tests {
     use chrono::TimeZone;
     use menvane_domain::{
-        Applicability, EpisodicSummary, KnowledgeType, MemoryMetadata, MemoryStatus, Scope,
+        Applicability, EpisodicSummary, KnowledgeMetadata, KnowledgeType, MemoryStatus, Scope,
         SummaryOutcome,
     };
     use tempfile::TempDir;
@@ -966,9 +997,9 @@ mod tests {
         markdown.initialize().unwrap();
         let index = IndexStore::new(temporary.path().join("index.sqlite"));
         index.initialize().unwrap();
-        let mut memory = Memory {
-            metadata: MemoryMetadata::new(
-                KnowledgeType::Context,
+        let mut memory = KnowledgeRecord {
+            metadata: KnowledgeMetadata::new(
+                KnowledgeType::Memory,
                 Scope::Global,
                 None,
                 Vec::new(),
@@ -1005,9 +1036,9 @@ mod tests {
         markdown.initialize().unwrap();
         let index = IndexStore::new(temporary.path().join("index.sqlite"));
         index.initialize().unwrap();
-        let mut memory = Memory {
-            metadata: MemoryMetadata::new(
-                KnowledgeType::Context,
+        let mut memory = KnowledgeRecord {
+            metadata: KnowledgeMetadata::new(
+                KnowledgeType::Memory,
                 Scope::Global,
                 None,
                 Vec::new(),
@@ -1043,9 +1074,9 @@ mod tests {
         ]
         .into_iter()
         .map(|(title, embedding)| {
-            let memory = Memory {
-                metadata: MemoryMetadata::new(
-                    KnowledgeType::Context,
+            let memory = KnowledgeRecord {
+                metadata: KnowledgeMetadata::new(
+                    KnowledgeType::Memory,
                     Scope::Global,
                     None,
                     Vec::new(),

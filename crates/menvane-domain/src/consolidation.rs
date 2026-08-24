@@ -72,14 +72,14 @@ pub struct PlaybookContent {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ContextContent {
+pub struct MemoryContent {
     pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KnowledgeContent {
-    Context(ContextContent),
+    Memory(MemoryContent),
     Playbook(PlaybookContent),
 }
 
@@ -354,7 +354,7 @@ pub fn validate_knowledge_promotion(
 
 fn knowledge_text(operation: &KnowledgeOperation) -> String {
     match operation.content.as_ref() {
-        Some(KnowledgeContent::Context(value)) => value.body.clone(),
+        Some(KnowledgeContent::Memory(value)) => value.body.clone(),
         Some(KnowledgeContent::Playbook(value)) => format!(
             "{} {} {} {} {}",
             value.trigger,
@@ -574,11 +574,11 @@ fn validate_knowledge_operation(
             "global knowledge needs high scope confidence".into(),
         ));
     }
-    if operation.knowledge_type == Some(KnowledgeType::Context)
-        && !matches!(operation.content, Some(KnowledgeContent::Context(_)))
+    if operation.knowledge_type == Some(KnowledgeType::Memory)
+        && !matches!(operation.content, Some(KnowledgeContent::Memory(_)))
     {
         return Err(ConsolidationValidationError(
-            "context operation needs context content".into(),
+            "memory operation needs memory content".into(),
         ));
     }
     if operation.knowledge_type == Some(KnowledgeType::Playbook)
@@ -589,11 +589,11 @@ fn validate_knowledge_operation(
         ));
     }
     match operation.content.as_ref() {
-        Some(KnowledgeContent::Context(value))
+        Some(KnowledgeContent::Memory(value))
             if value.body.chars().count() > MAX_KNOWLEDGE_BODY_CHARS =>
         {
             return Err(ConsolidationValidationError(
-                "context content exceeds the limit".into(),
+                "memory content exceeds the limit".into(),
             ));
         }
         Some(KnowledgeContent::Playbook(value)) => {
@@ -615,7 +615,7 @@ fn validate_knowledge_operation(
                 ));
             }
         }
-        None | Some(KnowledgeContent::Context(_)) => {}
+        None | Some(KnowledgeContent::Memory(_)) => {}
     }
     Ok(())
 }
@@ -757,24 +757,24 @@ fn knowledge_operation_schema() -> serde_json::Value {
         "properties": {
             "operation": {"type": "string", "enum": ["create", "reinforce", "merge", "supersede", "no-op"]},
             "target_memory_ids": {"type": "array", "items": {"type": "string"}},
-            "knowledge_type": {"type": ["string", "null"], "enum": ["context", "playbook", null]},
+            "knowledge_type": {"type": ["string", "null"], "enum": ["memory", "playbook", null]},
             "title": {"type": ["string", "null"], "maxLength": MAX_SUMMARY_TEXT_CHARS},
             "scope": {"type": ["string", "null"], "enum": ["global", "project", null]},
             "scope_confidence": {"type": ["number", "null"]},
             "applies_to": applicability_schema(),
-            "content": {"anyOf": [{"type": "null"}, context_content_schema(), playbook_content_schema()]},
+            "content": {"anyOf": [{"type": "null"}, memory_content_schema(), playbook_content_schema()]},
             "evidence_event_ids": {"type": "array", "items": {"type": "string"}},
             "contradicting_event_ids": {"type": "array", "items": {"type": "string"}}
         }
     })
 }
 
-fn context_content_schema() -> serde_json::Value {
+fn memory_content_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["context"],
-        "properties": {"context": {"type": "object", "additionalProperties": false, "required": ["body"], "properties": {"body": {"type": "string", "maxLength": MAX_KNOWLEDGE_BODY_CHARS}}}}
+        "required": ["memory"],
+        "properties": {"memory": {"type": "object", "additionalProperties": false, "required": ["body"], "properties": {"body": {"type": "string", "maxLength": MAX_KNOWLEDGE_BODY_CHARS}}}}
     })
 }
 
@@ -945,12 +945,12 @@ mod tests {
         KnowledgeOperation {
             operation: KnowledgeOperationKind::Create,
             target_memory_ids: Vec::new(),
-            knowledge_type: Some(KnowledgeType::Context),
+            knowledge_type: Some(KnowledgeType::Memory),
             title: Some("External deployment constraint".to_owned()),
             scope: Some(Scope::Project),
             scope_confidence: Some(0.95),
             applies_to: Applicability::default(),
-            content: Some(KnowledgeContent::Context(ContextContent {
+            content: Some(KnowledgeContent::Memory(MemoryContent {
                 body: body.to_owned(),
             })),
             evidence_event_ids: vec!["tool".to_owned()],

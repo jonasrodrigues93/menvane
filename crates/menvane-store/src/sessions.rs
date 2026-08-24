@@ -759,10 +759,10 @@ impl SessionRepository {
             .map_err(Into::into)
     }
 
-    pub fn meaningful_access(&self, memory_id: Uuid) -> Result<(u64, Option<DateTime<Utc>>)> {
+    pub fn memory_reinforcement(&self, memory_id: Uuid) -> Result<(u64, Option<DateTime<Utc>>)> {
         let connection = self.open()?;
         let (count, latest): (u64, Option<String>) = connection.query_row(
-            "SELECT COUNT(*), MAX(created_at) FROM access_events WHERE memory_id=?1 AND signal IN ('explicitly_read', 'successfully_applied')",
+            "SELECT COUNT(*), MAX(created_at) FROM access_events WHERE memory_id=?1 AND signal IN ('mcp_read', 'injected')",
             [memory_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;

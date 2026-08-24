@@ -11,14 +11,14 @@ use crate::project::ProjectTechnologies;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KnowledgeType {
-    Context,
+    Memory,
     Playbook,
 }
 
 impl KnowledgeType {
     pub fn directory_name(self) -> &'static str {
         match self {
-            Self::Context => "context",
+            Self::Memory => "memories",
             Self::Playbook => "playbooks",
         }
     }
@@ -27,7 +27,7 @@ impl KnowledgeType {
 impl Display for KnowledgeType {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Context => "context",
+            Self::Memory => "memory",
             Self::Playbook => "playbook",
         })
     }
@@ -38,7 +38,7 @@ impl FromStr for KnowledgeType {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "context" => Ok(Self::Context),
+            "memory" => Ok(Self::Memory),
             "playbook" => Ok(Self::Playbook),
             _ => Err(ParseKnowledgeTypeError(value.to_owned())),
         }
@@ -140,7 +140,7 @@ impl Applicability {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MemoryMetadata {
+pub struct KnowledgeMetadata {
     pub id: Uuid,
     #[serde(rename = "type")]
     pub knowledge_type: KnowledgeType,
@@ -166,9 +166,11 @@ pub struct MemoryMetadata {
     pub failures: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_project_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decayed_at: Option<DateTime<Utc>>,
 }
 
-impl MemoryMetadata {
+impl KnowledgeMetadata {
     pub fn new(
         knowledge_type: KnowledgeType,
         scope: Scope,
@@ -195,13 +197,14 @@ impl MemoryMetadata {
             successes: playbook.then_some(0),
             failures: playbook.then_some(0),
             source_project_ids: Vec::new(),
+            decayed_at: None,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Memory {
-    pub metadata: MemoryMetadata,
+pub struct KnowledgeRecord {
+    pub metadata: KnowledgeMetadata,
     pub title: String,
     pub body: String,
 }
