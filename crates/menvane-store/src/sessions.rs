@@ -484,7 +484,7 @@ impl SessionRepository {
         let now_text = now.to_rfc3339();
         let lease_until = now + chrono::Duration::seconds(i64::try_from(lease_timeout_seconds)?);
         transaction.execute("UPDATE jobs SET status='pending', owner=NULL, lease_started_at=NULL, lease_until=NULL, updated_at=?1 WHERE status='running' AND lease_until <= ?1", [&now_text])?;
-        let id: Option<String> = transaction.query_row("SELECT id FROM jobs WHERE status='pending' AND next_retry_at <= ?1 ORDER BY created_at LIMIT 1", [&now_text], |row| row.get(0)).optional()?;
+        let id: Option<String> = transaction.query_row("SELECT id FROM jobs WHERE status='pending' AND next_retry_at <= ?1 ORDER BY next_retry_at, created_at LIMIT 1", [&now_text], |row| row.get(0)).optional()?;
         let Some(id) = id else {
             transaction.commit()?;
             return Ok(None);

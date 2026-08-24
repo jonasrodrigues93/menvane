@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -101,6 +102,7 @@ impl JsonlImporter {
         let mut cwd = None;
         let mut events = Vec::new();
         let mut invalid = 0;
+        let mut codex_tool_calls = HashMap::new();
         for (line_number, line) in BufReader::new(file).split(b'\n').enumerate() {
             let line = match line {
                 Ok(line) if line.len() <= self.max_line_bytes => line,
@@ -120,9 +122,13 @@ impl JsonlImporter {
                 find_string(&record, &["session_id", "sessionId", "id"]).map(str::to_owned)
             });
             cwd = cwd.or_else(|| find_string(&record, &["cwd"]).map(str::to_owned));
-            if let Some((kind, input, output, tool, success, origin, role)) =
+            let normalized = if self.client == "codex" {
+                normalize_codex_record(&record, &mut codex_tool_calls)
+                    .unwrap_or_else(|| normalize_record(&record))
+            } else {
                 normalize_record(&record)
-            {
+            };
+            if let Some((kind, input, output, tool, success, origin, role)) = normalized {
                 let timestamp = find_string(&record, &["timestamp", "created_at"])
                     .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                     .map(|value| value.with_timezone(&Utc))
@@ -145,9 +151,9 @@ impl JsonlImporter {
                     cwd: cwd.clone().unwrap_or_default(),
                     project_id: None,
                     tool_family: tool,
+                    attributed_path: input.as_deref().and_then(imported_attributed_path),
                     bounded_input: input,
                     bounded_output: output,
-                    attributed_path: None,
                     success,
                     model: find_string(&record, &["model"]).map(str::to_owned),
                     harness_injected: false,
@@ -222,6 +228,99 @@ type ImportedEvent = (
     NormalizedEventOrigin,
     NormalizedEventRole,
 );
+
+#[derive(Default)]
+struct PendingCodexToolCall {
+    tool: Option<String>,
+    input: Option<String>,
+    success: Option<bool>,
+}
+
+fn normalize_codex_record(
+    record: &Value,
+    tool_calls: &mut HashMap<String, PendingCodexToolCall>,
+) -> Option<Option<ImportedEvent>> {
+    if record.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let Some(payload) = record.get("payload") else {
+        return Some(None);
+    };
+    let Some(payload_type) = payload.get("type").and_then(Value::as_str) else {
+        return Some(None);
+    };
+    match payload_type {
+        "message" => {
+            if payload.get("role").and_then(Value::as_str) != Some("user") {
+                return Some(None);
+            }
+            Some(
+                payload
+                    .get("content")
+                    .and_then(content_text)
+                    .map(|content| {
+                        (
+                            NormalizedEventKind::UserPrompt,
+                            Some(content),
+                            None,
+                            None,
+                            None,
+                            NormalizedEventOrigin::User,
+                            NormalizedEventRole::UserPrompt,
+                        )
+                    }),
+            )
+        }
+        "custom_tool_call" | "function_call" => {
+            let call_id = find_string(payload, &["call_id", "id"]).map(str::to_owned);
+            if let Some(call_id) = call_id {
+                let status = payload.get("status").and_then(Value::as_str);
+                tool_calls.insert(
+                    call_id,
+                    PendingCodexToolCall {
+                        tool: payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        input: payload
+                            .get("input")
+                            .or_else(|| payload.get("arguments"))
+                            .map(value_text),
+                        success: match status {
+                            Some("completed") => Some(true),
+                            Some("failed" | "error") => Some(false),
+                            _ => None,
+                        },
+                    },
+                );
+            }
+            Some(None)
+        }
+        "custom_tool_call_output" | "function_call_output" => {
+            let call_id = find_string(payload, &["call_id", "id"]).map(str::to_owned);
+            let pending = call_id
+                .as_ref()
+                .and_then(|call_id| tool_calls.remove(call_id))
+                .unwrap_or_default();
+            let output = payload.get("output").map(value_text);
+            let success = payload
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .map(|is_error| !is_error)
+                .or(pending.success);
+            Some(Some((
+                NormalizedEventKind::ToolCompleted,
+                pending.input.or(call_id),
+                output,
+                pending.tool.or_else(|| Some("tool".to_owned())),
+                success,
+                NormalizedEventOrigin::Tool,
+                NormalizedEventRole::ToolActivity,
+            )))
+        }
+        _ => Some(None),
+    }
+}
 
 impl OpenCodeImporter {
     pub fn new(base_url: impl Into<String>) -> Self {
@@ -660,6 +759,51 @@ mod tests {
                 .iter()
                 .any(|event| { event.bounded_input.as_deref() == Some("imported-session-prompt") })
         );
+    }
+
+    #[test]
+    fn codex_custom_tool_calls_and_outputs_become_tool_evidence() {
+        let temporary = TempDir::new().unwrap();
+        let sessions = temporary.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("session.jsonl"),
+            concat!(
+                "{\"timestamp\":\"2026-08-23T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-1\",\"cwd\":\"/tmp\"}}\n",
+                "{\"timestamp\":\"2026-08-23T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"run tests\"}]}}\n",
+                "{\"timestamp\":\"2026-08-23T10:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"call_id\":\"call-1\",\"status\":\"completed\",\"input\":\"{\\\"cmd\\\":\\\"cargo test\\\"}\"}}\n",
+                "{\"timestamp\":\"2026-08-23T10:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call_output\",\"call_id\":\"call-1\",\"output\":\"tests passed\"}}\n",
+                "{\"timestamp\":\"2026-08-23T10:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let scan = JsonlImporter::with_roots("codex", vec![sessions])
+            .scan()
+            .unwrap();
+        let events = &scan.sessions[0].events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == NormalizedEventKind::UserPrompt)
+                .count(),
+            1
+        );
+        let tool = events
+            .iter()
+            .find(|event| event.kind == NormalizedEventKind::ToolCompleted)
+            .unwrap();
+        assert_eq!(tool.tool_family.as_deref(), Some("exec"));
+        assert_eq!(
+            tool.bounded_input.as_deref(),
+            Some("{\"cmd\":\"cargo test\"}")
+        );
+        assert_eq!(tool.bounded_output.as_deref(), Some("tests passed"));
+        assert_eq!(tool.success, Some(true));
+        assert!(events.iter().all(|event| {
+            event.bounded_input.as_deref() != Some("done")
+                && event.bounded_output.as_deref() != Some("done")
+        }));
     }
 
     #[test]

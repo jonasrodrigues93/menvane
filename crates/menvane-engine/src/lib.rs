@@ -1511,7 +1511,10 @@ impl Menvane {
             .config
             .llm
             .consolidation_prompt
-            .clone()
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .map(str::to_owned)
             .unwrap_or_else(|| session_consolidator::CONSOLIDATION_SYSTEM_PROMPT.to_owned());
         let outcome = SessionConsolidator::new(self.configured_provider()?)
             .with_prompt(prompt)

@@ -143,6 +143,39 @@ fn retryable_jobs_remain_pending_and_failed_consolidations_can_be_requeued() {
 }
 
 #[test]
+fn retry_waits_behind_jobs_that_have_not_run() {
+    let home = TempDir::new().unwrap();
+    let state = SessionRepository::new(home.path().join("state.sqlite"));
+    state.initialize().unwrap();
+    state
+        .enqueue_job("consolidate_session", "session-retry", "{}")
+        .unwrap();
+
+    let now = Utc::now();
+    let retry = state.claim_job_at("test-owner", 300, now).unwrap().unwrap();
+    state
+        .finish_job(retry.id, "test-owner", None, Some("invalid"), false)
+        .unwrap();
+    state
+        .enqueue_job("consolidate_session", "session-fresh", "{}")
+        .unwrap();
+    let retry_at = state
+        .jobs()
+        .unwrap()
+        .into_iter()
+        .find(|job| job.dedupe_key == "session-retry")
+        .unwrap()
+        .next_retry_at;
+
+    let claimed = state
+        .claim_job_at("test-owner", 300, retry_at + Duration::seconds(1))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(claimed.dedupe_key, "session-fresh");
+}
+
+#[test]
 fn unversioned_operational_database_is_rejected() {
     let home = TempDir::new().unwrap();
     let path = home.path().join("state.sqlite");

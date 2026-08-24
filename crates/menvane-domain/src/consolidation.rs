@@ -282,23 +282,7 @@ pub fn validate_knowledge_promotion(
     }
     if operation.evidence_event_ids.is_empty() {
         return Err(ConsolidationValidationError(
-            "knowledge promotion needs observable evidence".into(),
-        ));
-    }
-    let observable = packet.events.iter().any(|event| {
-        operation
-            .evidence_event_ids
-            .iter()
-            .any(|id| id == &event.event_id)
-            && (event.success == Some(true)
-                || event
-                    .bounded_output
-                    .as_deref()
-                    .is_some_and(|output| !output.trim().is_empty()))
-    });
-    if !observable {
-        return Err(ConsolidationValidationError(
-            "knowledge promotion needs observable evidence".into(),
+            "knowledge promotion needs session evidence".into(),
         ));
     }
     if operation
@@ -964,6 +948,26 @@ mod tests {
         let operation = promotion_operation(
             "When appending to the deployment log, keep entries single line to limit spending.",
         );
+        validate_knowledge_promotion(&packet, &operation).unwrap();
+    }
+
+    #[test]
+    fn promotion_barrier_accepts_memory_supported_by_user_decision() {
+        let mut packet = promotion_packet();
+        packet.events[0].event_id = "user-decision".to_owned();
+        packet.events[0].kind = crate::session::NormalizedEventKind::UserPrompt;
+        packet.events[0].origin = crate::session::NormalizedEventOrigin::User;
+        packet.events[0].role = crate::session::NormalizedEventRole::UserPrompt;
+        packet.events[0].bounded_input = Some(
+            "Keep deployment log entries on one line to control provider spending.".to_owned(),
+        );
+        packet.events[0].bounded_output = None;
+        packet.events[0].success = None;
+        let mut operation = promotion_operation(
+            "Deployment log entries stay on one line to control provider spending.",
+        );
+        operation.evidence_event_ids = vec!["user-decision".to_owned()];
+
         validate_knowledge_promotion(&packet, &operation).unwrap();
     }
 

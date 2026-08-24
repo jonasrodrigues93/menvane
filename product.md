@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 2.4.0
+Version: 2.5.0
 
 Menvane is a local persistent memory system for agents. Its central product is operational continuity between agents, sessions, and different days. It preserves four distinct layers:
 
@@ -32,7 +32,7 @@ Deleting `index.sqlite` does not delete durable knowledge or operational evidenc
 
 A session is not a memory type. Each durable session is a chronological sanitized capture of the observed events, created deterministically at finalization before any provider call. The session Markdown is the canonical human artifact of the session and contains an immutable chronological section plus a derived episodic-summary section appended atomically after consolidation. Provider failure leaves the session valid, with the summary pending and a retryable job.
 
-Durable knowledge uses exactly two functional types: `memory` and `playbook`. A `memory` stores non-obvious information that is not canonical in the project and is reusable beyond the current task. A `playbook` stores a non-trivial procedure with trigger, applicability, ordered steps, validation, and failure handling. Open errors, implemented decisions, behavior evident in the code, and pending work never become durable knowledge. Zero promotion is the expected outcome for most sessions.
+Durable knowledge uses exactly two functional types: `memory` and `playbook`. A `memory` stores non-obvious information that is not canonical in the project and is reusable beyond the current task, including user decisions, constraints, preferences, corrections, and confirmed outcomes. A `playbook` stores a non-trivial procedure with trigger, applicability, ordered steps, validation, and failure handling. Open errors, behavior evident in canonical project sources, and pending work never become durable knowledge. Zero promotion remains valid when a session has no reusable knowledge.
 
 Physical scope is either global or project. Project scope exists only when the working directory belongs to a Git repository; outside Git, writes, sessions, search, and automatic recall use global scope and no project metadata is created. Project search returns the current project plus global memories by default and never includes unrelated projects. Forgotten memories remain in Markdown with `status: forgotten`, are excluded from automatic recall and normal search, and are never silently recreated. Explicit MCP search may include them, and an MCP read can reinforce a memory forgotten by decay.
 
@@ -87,7 +87,9 @@ There is at most one logical consolidation per session. One structured-output re
 
 The packet contains the current session, the current handoff, a few related episodic summaries, and related memories only to prevent duplication or contradiction. It never includes injected instructions, complete diffs, credentials, or private reasoning. Every previous handoff item must have an explicit destination in the response. Every cited evidence must exist in the packet. Schema, references, scope, targets, and limits are validated before any write, and sources are validated before the result is applied.
 
-Candidate knowledge must pass a promotion barrier: utility beyond the current task, not evident in the repository, not present in a known canonical source, observable evidence, and a plausible future retrieval scenario.
+Candidate knowledge must pass a promotion barrier: utility beyond the current task, not evident in the repository, not present in a known canonical source, cited session evidence, and a plausible future retrieval scenario. A memory may cite user prompts, decisions, corrections, confirmed outcomes, or tool evidence and never requires a tool event. Tool calls and results are strong signals for identifying a possible playbook, while playbook activation remains governed by independent successful applications.
+
+An absent or blank consolidation prompt uses the built-in prompt. The built-in prompt actively identifies reusable memory, treats tools as playbook signals rather than a universal promotion prerequisite, and requires exactly one operation for each supplied handoff item.
 
 Applying the complete result is idempotent and uses a single transactional marker. Markdown writes use staging and become visible only after complete structural and referential validation. Invalid structured output never alters Markdown, the handoff, or knowledge. Consolidation records provider, model, latency, attempts, input and output bytes and, when available, token usage and credits; private reasoning is never recorded.
 
@@ -115,7 +117,7 @@ MCP search returns identifiers, type, scope, title, score, status, applicability
 
 `menvane serve` runs the Axum daemon on `127.0.0.1:47831` by default. A per-home process lock prevents duplicate daemons. `menvane daemon start`, `stop`, `restart`, and `status` manage the background process.
 
-The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture, consolidation, and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, error fields, an owner, and a configurable 300-second lease timeout by default. The daemon worker claims finalization and consolidation jobs, recovers expired leases after restart, and retries all paths idempotently. Provider availability, authentication, rate, network, and capability failures remain pending with bounded exponential backoff until the provider recovers; invalid input, invalid schemas, and internal failures become failed after the normal retry limit. `menvane jobs retry` explicitly requeues failed consolidation jobs. Graceful shutdown flushes dirty state when feasible, and capture does not wait for background work.
+The REST foundation is under `/api/v1`. Health, normalized event ingestion, and job inspection are available. Capture, consolidation, and finalization share the same engine and stores used by CLI and MCP. SQLite jobs use pending, running, completed, and failed lifecycle states with attempts, retry time, error fields, an owner, and a configurable 300-second lease timeout by default. The daemon worker claims finalization and consolidation jobs, recovers expired leases after restart, and retries all paths idempotently. Eligible jobs are ordered by their next-attempt time and then creation time, so a session in backoff cannot preempt untouched sessions or block the queue. Provider availability, authentication, rate, network, and capability failures remain pending with bounded exponential backoff until the provider recovers; invalid input, invalid schemas, and internal failures become failed after the normal retry limit. `menvane jobs retry` explicitly requeues failed consolidation jobs. Graceful shutdown flushes dirty state when feasible, and capture does not wait for background work.
 
 REST covers sessions with their episodic summaries, the current handoff with items and provenance, recall, and memory and playbook knowledge. Removed legacy selectors and endpoints return explicit absence, not partial behavior. Session reads by ID return the chronological capture and, when present, the episodic summary.
 
@@ -173,7 +175,7 @@ Menvane records retrieved, injected, MCP-read, successfully applied, and failed 
 
 ## Historical Import
 
-`menvane import claude` and `menvane import codex` recursively discover supported JSONL session files under configured client homes. Readers stream line by line, enforce a one-megabyte record bound, skip and count malformed records, ignore unknown event types, and retain only useful user and tool evidence. Codex checks both active and archived session directories. `menvane import opencode` uses the configured local OpenCode HTTP API rather than scraping private storage. An optional positional window such as `7d` imports only sessions with activity in the last seven days; only day-based windows are supported.
+`menvane import claude` and `menvane import codex` recursively discover supported JSONL session files under configured client homes. Readers stream line by line, enforce a one-megabyte record bound, skip and count malformed records, ignore unknown event types, and retain only useful user and tool evidence. Codex checks both active and archived session directories and pairs supported tool-call records with their output records into one normalized tool-completed event while excluding assistant reasoning and messages. `menvane import opencode` uses the configured local OpenCode HTTP API rather than scraping private storage. An optional positional window such as `7d` imports only sessions with activity in the last seven days; only day-based windows are supported.
 
 All importers produce client-independent normalized sessions and pass them through the normal session pipeline; they never create consolidated knowledge directly. External formats are treated as versioned best-effort input. Reimport uses client plus external session identifier and is idempotent: importing the same session twice never duplicates the session, its summary, handoff items, or knowledge.
 
