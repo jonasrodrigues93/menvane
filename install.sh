@@ -44,7 +44,8 @@ install_dir=$home/.local/bin
 installed_binary=$install_dir/menvane
 install -d "$install_dir"
 
-if [ "$(uname -s)" = Linux ]; then
+platform=$(uname -s)
+if [ "$platform" = Linux ]; then
     command -v systemctl >/dev/null 2>&1 || {
         printf '%s\n' "systemctl is required for automatic startup on Linux" >&2
         exit 1
@@ -79,7 +80,50 @@ if [ "$(uname -s)" = Linux ]; then
     install -m 755 "$binary" "$installed_binary"
     systemctl --user restart --no-block menvane.service
     printf 'Installed %s and enabled menvane.service\n' "$installed_binary"
+elif [ "$platform" = Darwin ]; then
+    command -v launchctl >/dev/null 2>&1 || {
+        printf '%s\n' "launchctl is required for automatic startup on macOS" >&2
+        exit 1
+    }
+    install -m 755 "$binary" "$installed_binary"
+    launch_agent_dir=$home/Library/LaunchAgents
+    launch_agent=$launch_agent_dir/com.jonasrodrigues93.menvane.plist
+    log_dir=$home/Library/Logs
+    install -d "$launch_agent_dir" "$log_dir"
+    escaped_binary=$(printf '%s' "$installed_binary" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g; s/"/\\&quot;/g; s/'"'"'/\\&apos;/g')
+    escaped_log_dir=$(printf '%s' "$log_dir" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g; s/"/\\&quot;/g; s/'"'"'/\\&apos;/g')
+    temporary_agent=$launch_agent.tmp.$$
+    trap 'rm -f "$temporary_agent"' EXIT HUP INT TERM
+    printf '%s\n' \
+        '<?xml version="1.0" encoding="UTF-8"?>' \
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+        '<plist version="1.0">' \
+        '<dict>' \
+        '    <key>Label</key>' \
+        '    <string>com.jonasrodrigues93.menvane</string>' \
+        '    <key>ProgramArguments</key>' \
+        '    <array>' \
+        "        <string>$escaped_binary</string>" \
+        '        <string>serve</string>' \
+        '    </array>' \
+        '    <key>RunAtLoad</key>' \
+        '    <true/>' \
+        '    <key>KeepAlive</key>' \
+        '    <true/>' \
+        "    <key>StandardOutPath</key>" \
+        "    <string>$escaped_log_dir/menvane.log</string>" \
+        "    <key>StandardErrorPath</key>" \
+        "    <string>$escaped_log_dir/menvane.error.log</string>" \
+        '</dict>' \
+        '</plist>' > "$temporary_agent"
+    chmod 644 "$temporary_agent"
+    mv "$temporary_agent" "$launch_agent"
+    trap - EXIT HUP INT TERM
+    launch_domain="gui/$(id -u)"
+    launchctl bootout "$launch_domain" "$launch_agent" >/dev/null 2>&1 || true
+    launchctl bootstrap "$launch_domain" "$launch_agent"
+    printf 'Installed %s and enabled the macOS LaunchAgent\n' "$installed_binary"
 else
     install -m 755 "$binary" "$installed_binary"
-    printf 'Installed %s; automatic startup is currently supported only on Linux\n' "$installed_binary"
+    printf 'Installed %s; automatic startup is currently supported on Linux and macOS\n' "$installed_binary"
 fi

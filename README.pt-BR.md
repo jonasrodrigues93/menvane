@@ -80,16 +80,36 @@ O Menvane captura eventos normalizados e limitados, remove dados sensíveis e ca
 
 ### Instale e conecte um agente
 
+Requisitos: macOS ou Linux com shell POSIX, `install` e Rust (`cargo`) ou um
+binário pré-compilado do Menvane. A inicialização automática no Linux também
+exige uma sessão systemd do usuário e `systemctl --user`; no WSL, o systemd
+precisa estar habilitado. Windows nativo ainda não é um alvo de release.
+
 ```bash
+git clone https://github.com/jonasrodrigues93/menvane.git
+cd menvane
 ./install.sh
 
 menvane doctor
 menvane connect claude
 ```
 
-O script compila o Menvane com Cargo. Use `--binary <caminho>` para instalar um binário de release existente. No Linux, a instalação habilita e inicia um `menvane.service` no escopo do usuário sem bloquear a inicialização do sistema. O daemon e a UI local passam a iniciar automaticamente com a sessão do usuário. Use `menvane connect codex` ou `menvane connect opencode` para os outros clientes. Captura e recuperação acontecem automaticamente; nenhuma Skill, arquivo de instruções do repositório ou instrução explícita de memória é necessária.
+O script compila o Menvane com Cargo e o instala em `~/.local/bin/menvane`.
+Se o Cargo não estiver instalado, instale Rust primeiro com o
+[rustup](https://rustup.rs/). Também é possível usar `--binary <caminho>` para
+instalar um binário de release existente. Garanta que `~/.local/bin` esteja no
+seu `PATH`.
 
-O Menvane suporta Linux, macOS e WSL. Windows nativo ainda não é um alvo de release.
+No Linux, a instalação habilita e inicia um `menvane.service` no escopo do
+usuário. O daemon e a UI local passam a iniciar automaticamente com a sessão
+do usuário. No macOS, a instalação cria e carrega um LaunchAgent em
+`~/Library/LaunchAgents/com.jonasrodrigues93.menvane.plist`; assim, o daemon
+inicia no login e reinicia após falhas. Use `menvane connect codex` ou
+`menvane connect opencode` para os outros clientes. Captura e recuperação
+acontecem automaticamente; nenhuma Skill, arquivo de instruções do repositório
+ou instrução explícita de memória é necessária.
+
+O Menvane suporta Linux, macOS e WSL com systemd habilitado.
 
 ### Ative a compilação de memória
 
@@ -181,4 +201,4 @@ cargo build --release --locked
 
 ## Contribuição
 
-Issues, melhorias na documentação, testes e contribuições de implementação são bem-vindos. Mantenha as alterações focadas, preserve o comportamento documentado em [`product.md`](product.md) e execute a suíte de testes relevante antes de enviar uma alteração.
+Issues, melhorias na documentação, testes e contribuições de implementação são bem-vindos. Mantenha as alterações focadas, preserve o comportamento documentado em [`product.md`](product.md) e execute a suíte de testes relevante antes de enviar uma alteração. Consulte [`LICENCE.md`](LICENCE.md) e [`SECURITY.md`](SECURITY.md) para os termos do projeto e o relato privado de vulnerabilidades.

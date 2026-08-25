@@ -80,16 +80,35 @@ Menvane captures bounded normalized events, removes sensitive data and ignored p
 
 ### Install And Connect
 
+Requirements: macOS or Linux with a POSIX shell, `install`, and either Rust
+(`cargo`) or a prebuilt Menvane binary. Linux automatic startup additionally
+requires a user systemd session and `systemctl --user`; WSL requires systemd
+to be enabled. Native Windows is not currently a release target.
+
 ```bash
+git clone https://github.com/jonasrodrigues93/menvane.git
+cd menvane
 ./install.sh
 
 menvane doctor
 menvane connect claude
 ```
 
-The script builds Menvane with Cargo. Pass `--binary <path>` to install an existing release binary instead. On Linux, installation enables and starts a user-scoped `menvane.service` without blocking system startup. The daemon and local UI then start automatically with the user session. Use `menvane connect codex` or `menvane connect opencode` for the other supported clients. Capture and recall happen automatically; no Skill, repository instruction file, or explicit memory prompt is required.
+The script builds Menvane with Cargo and installs it at `~/.local/bin/menvane`.
+If Cargo is not installed, install Rust with [rustup](https://rustup.rs/) first.
+You can pass `--binary <path>` to install an existing release binary instead.
+Make sure `~/.local/bin` is in your `PATH`.
 
-Menvane supports Linux, macOS, and WSL. Native Windows is not currently a release target.
+On Linux, installation enables and starts a user-scoped `menvane.service`.
+The daemon and local UI then start automatically with the user session. On
+macOS, installation creates and loads a LaunchAgent at
+`~/Library/LaunchAgents/com.jonasrodrigues93.menvane.plist`, so the daemon
+starts at login and restarts after failure. Use `menvane connect codex` or
+`menvane connect opencode` for the other supported clients. Capture and recall
+happen automatically; no Skill, repository instruction file, or explicit
+memory prompt is required.
+
+Menvane supports Linux, macOS, and WSL with systemd enabled.
 
 ### Enable Memory Compilation
 
@@ -181,4 +200,4 @@ cargo build --release --locked
 
 ## Contributing
 
-Issues, documentation improvements, tests, and implementation contributions are welcome. Please keep changes focused, preserve the documented product behavior in [`product.md`](product.md), and run the relevant test suite before submitting a change.
+Issues, documentation improvements, tests, and implementation contributions are welcome. Please keep changes focused, preserve the documented product behavior in [`product.md`](product.md), and run the relevant test suite before submitting a change. See [`LICENCE.md`](LICENCE.md) and [`SECURITY.md`](SECURITY.md) for project terms and private vulnerability reporting.
