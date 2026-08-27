@@ -14,6 +14,7 @@ O Menvane é local-first: o conhecimento durável fica em Markdown legível por 
 - [Principais capacidades](#principais-capacidades)
 - [Como funciona](#como-funciona)
 - [Início rápido](#início-rápido)
+- [Binários de release](#binários-de-release)
 - [Integrações](#integrações)
 - [Busca e memória](#busca-e-memória)
 - [Privacidade e confiança](#privacidade-e-confiança)
@@ -80,10 +81,12 @@ O Menvane captura eventos normalizados e limitados, remove dados sensíveis e ca
 
 ### Instale e conecte um agente
 
-Requisitos: macOS ou Linux com shell POSIX, `install` e Rust (`cargo`) ou um
-binário pré-compilado do Menvane. A inicialização automática no Linux também
-exige uma sessão systemd do usuário e `systemctl --user`; no WSL, o systemd
-precisa estar habilitado. Windows nativo ainda não é um alvo de release.
+Requisitos: macOS ou Linux com shell POSIX, `install`, e `curl` ou `wget` com
+`tar` para binários publicados. Cargo só é necessário quando não houver um
+release compatível para baixar ou quando for preciso compilar da fonte. A
+inicialização automática no Linux também exige uma sessão systemd do usuário e
+`systemctl --user`; no WSL, o systemd precisa estar habilitado. Windows nativo
+ainda não é um alvo de release.
 
 ```bash
 git clone https://github.com/jonasrodrigues93/menvane.git
@@ -94,11 +97,12 @@ menvane doctor
 menvane connect claude
 ```
 
-O script compila o Menvane com Cargo e o instala em `~/.local/bin/menvane`.
-Se o Cargo não estiver instalado, instale Rust primeiro com o
-[rustup](https://rustup.rs/). Também é possível usar `--binary <caminho>` para
-instalar um binário de release existente. Garanta que `~/.local/bin` esteja no
-seu `PATH`.
+O script baixa e verifica o release compatível mais recente e o instala em
+`~/.local/bin/menvane`. Use `--version <versão>` para fixar um release ou
+`--binary <caminho>` para instalar um executável existente. Se não houver um
+release compatível, uma instalação sem versão fixada retorna ao build com
+Cargo. Uma versão solicitada que não esteja disponível falha sem instalar uma
+versão diferente. Garanta que `~/.local/bin` esteja no seu `PATH`.
 
 No Linux, a instalação habilita e inicia um `menvane.service` no escopo do
 usuário. O daemon e a UI local passam a iniciar automaticamente com a sessão
@@ -110,6 +114,52 @@ acontecem automaticamente; nenhuma Skill, arquivo de instruções do repositóri
 ou instrução explícita de memória é necessária.
 
 O Menvane suporta Linux, macOS e WSL com systemd habilitado.
+
+## Binários de release
+
+Os releases publicados incluem estes alvos:
+
+| Plataforma | Arquitetura | Asset |
+| --- | --- | --- |
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux | arm64 | `aarch64-unknown-linux-gnu` |
+| macOS | Intel | `x86_64-apple-darwin` |
+| macOS | Apple Silicon | `aarch64-apple-darwin` |
+| WSL | x86_64 ou arm64 | Use o asset Linux correspondente |
+
+O instalador atualiza uma instalação existente com segurança e mantém a
+configuração atual do serviço systemd no Linux ou do LaunchAgent no macOS:
+
+```bash
+./install.sh
+./install.sh --version 0.1.0
+```
+
+Para baixar e verificar um asset manualmente, substitua `TARGET` pelo alvo
+correspondente na tabela:
+
+```bash
+VERSION=0.1.0
+TARGET=x86_64-unknown-linux-gnu
+ARCHIVE=menvane-${TARGET}.tar.gz
+BASE=https://github.com/jonasrodrigues93/menvane/releases/download/v${VERSION}
+curl --fail --location --output "$ARCHIVE" "$BASE/$ARCHIVE"
+curl --fail --location --output SHA256SUMS "$BASE/SHA256SUMS"
+EXPECTED=$(awk -v name="$ARCHIVE" '$2 == name { print $1; exit }' SHA256SUMS)
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$ARCHIVE" | awk '{ print $1 }')
+else
+    ACTUAL=$(shasum -a 256 "$ARCHIVE" | awk '{ print $1 }')
+fi
+test "$EXPECTED" = "$ACTUAL"
+tar -xzf "$ARCHIVE"
+install -d "$HOME/.local/bin"
+install -m 755 menvane "$HOME/.local/bin/menvane"
+```
+
+O workflow de release é executado para tags `v*`, empacota um executável por
+asset e publica o manifesto `SHA256SUMS` com o release do GitHub. Windows
+nativo não é um alvo de release.
 
 ### Ative a compilação de memória
 

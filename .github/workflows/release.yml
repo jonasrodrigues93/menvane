@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          target: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package release binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          binary="target/${TARGET}/release/menvane"
+          archive="dist/menvane-${TARGET}.tar.gz"
+          mkdir -p dist
+          python3 - "$binary" "$archive" <<'PY'
+          import gzip
+          import io
+          import os
+          import sys
+          import tarfile
+
+          binary_path, archive_path = sys.argv[1:]
+          with open(binary_path, "rb") as source:
+              content = source.read()
+          info = tarfile.TarInfo("menvane")
+          info.size = len(content)
+          info.mode = 0o755
+          info.uid = 0
+          info.gid = 0
+          info.uname = "root"
+          info.gname = "root"
+          info.mtime = 0
+          with open(archive_path, "wb") as destination:
+              with gzip.GzipFile(fileobj=destination, mode="wb", mtime=0) as compressed:
+                  with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive_file:
+                      archive_file.addfile(info, io.BytesIO(content))
+          os.chmod(archive_path, 0o644)
+          PY
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/menvane-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -eu
+          cd dist
+          sha256sum menvane-*.tar.gz > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+              gh release create "$TAG_NAME" --verify-tag --title "Menvane $TAG_NAME" --generate-notes
+          fi
+          gh release upload "$TAG_NAME" dist/menvane-*.tar.gz dist/SHA256SUMS --clobber

@@ -14,6 +14,7 @@ Menvane is local-first: durable knowledge is human-readable Markdown, while SQLi
 - [Key Capabilities](#key-capabilities)
 - [How It Works](#how-it-works)
 - [Quickstart](#quickstart)
+- [Release Binaries](#release-binaries)
 - [Integrations](#integrations)
 - [Search And Memory](#search-and-memory)
 - [Privacy And Trust](#privacy-and-trust)
@@ -80,10 +81,12 @@ Menvane captures bounded normalized events, removes sensitive data and ignored p
 
 ### Install And Connect
 
-Requirements: macOS or Linux with a POSIX shell, `install`, and either Rust
-(`cargo`) or a prebuilt Menvane binary. Linux automatic startup additionally
-requires a user systemd session and `systemctl --user`; WSL requires systemd
-to be enabled. Native Windows is not currently a release target.
+Requirements: macOS or Linux with a POSIX shell, `install`, and `curl` or
+`wget` plus `tar` for published binaries. Cargo is only needed when no
+compatible release can be downloaded or when building from source. Linux
+automatic startup additionally requires a user systemd session and
+`systemctl --user`; WSL requires systemd to be enabled. Native Windows is not
+currently a release target.
 
 ```bash
 git clone https://github.com/jonasrodrigues93/menvane.git
@@ -94,10 +97,12 @@ menvane doctor
 menvane connect claude
 ```
 
-The script builds Menvane with Cargo and installs it at `~/.local/bin/menvane`.
-If Cargo is not installed, install Rust with [rustup](https://rustup.rs/) first.
-You can pass `--binary <path>` to install an existing release binary instead.
-Make sure `~/.local/bin` is in your `PATH`.
+The script downloads and verifies the latest compatible release, then installs
+it at `~/.local/bin/menvane`. Use `--version <version>` for a pinned release
+or `--binary <path>` to install an existing executable. If no compatible
+release is available, an unpinned install falls back to a Cargo source build.
+A requested version that is unavailable fails without installing a different
+version. Make sure `~/.local/bin` is in your `PATH`.
 
 On Linux, installation enables and starts a user-scoped `menvane.service`.
 The daemon and local UI then start automatically with the user session. On
@@ -109,6 +114,52 @@ happen automatically; no Skill, repository instruction file, or explicit
 memory prompt is required.
 
 Menvane supports Linux, macOS, and WSL with systemd enabled.
+
+## Release Binaries
+
+Published releases include these targets:
+
+| Platform | Architecture | Asset |
+| --- | --- | --- |
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` |
+| Linux | arm64 | `aarch64-unknown-linux-gnu` |
+| macOS | Intel | `x86_64-apple-darwin` |
+| macOS | Apple Silicon | `aarch64-apple-darwin` |
+| WSL | x86_64 or arm64 | Use the matching Linux asset |
+
+The installer updates an existing installation safely and keeps the current
+Linux systemd service or macOS LaunchAgent configuration:
+
+```bash
+./install.sh
+./install.sh --version 0.1.0
+```
+
+To download and verify an asset manually, replace `TARGET` with the matching
+target from the table:
+
+```bash
+VERSION=0.1.0
+TARGET=x86_64-unknown-linux-gnu
+ARCHIVE=menvane-${TARGET}.tar.gz
+BASE=https://github.com/jonasrodrigues93/menvane/releases/download/v${VERSION}
+curl --fail --location --output "$ARCHIVE" "$BASE/$ARCHIVE"
+curl --fail --location --output SHA256SUMS "$BASE/SHA256SUMS"
+EXPECTED=$(awk -v name="$ARCHIVE" '$2 == name { print $1; exit }' SHA256SUMS)
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL=$(sha256sum "$ARCHIVE" | awk '{ print $1 }')
+else
+    ACTUAL=$(shasum -a 256 "$ARCHIVE" | awk '{ print $1 }')
+fi
+test "$EXPECTED" = "$ACTUAL"
+tar -xzf "$ARCHIVE"
+install -d "$HOME/.local/bin"
+install -m 755 menvane "$HOME/.local/bin/menvane"
+```
+
+The release workflow runs for `v*` tags, packages one executable per asset,
+and publishes the `SHA256SUMS` manifest with the GitHub release. Native
+Windows is not a release target.
 
 ### Enable Memory Compilation
 
