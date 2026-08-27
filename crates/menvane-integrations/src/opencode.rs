@@ -153,7 +153,8 @@ async function invoke(event, payload) {{
 
 function processEnv() {{ return {{ ...globalThis.process?.env }} }}
 
-export const Menvane = async ({{ directory }}) => ({{
+export const Menvane = async ({{ directory }}) => {{
+  return {{
   event: async ({{ event }}) => {{
     const map = {{ "session.created": "SessionStart", "session.idle": "Stop", "session.compacted": "PostCompact", "session.deleted": "SessionEnd", "tool.completed": "PostToolUse" }}
     const name = map[event.type]
@@ -166,7 +167,7 @@ export const Menvane = async ({{ directory }}) => ({{
     if (!prompt) return
     const response = await invoke("UserPromptSubmit", {{ session_id: input.sessionID, cwd: directory, prompt, hook_event_name: "UserPromptSubmit" }})
     const context = response.hookSpecificOutput?.additionalContext
-    if (context && Array.isArray(output.system) && !output.system.includes(context)) output.system.push(context)
+    if (context && Array.isArray(output.parts)) output.parts.push({{ type: "text", text: `\n\n${{context}}` }})
   }},
   "experimental.chat.system.transform": async (input, output) => {{
     if (!input.sessionID) return
@@ -175,7 +176,8 @@ export const Menvane = async ({{ directory }}) => ({{
     if (context && !output.system.includes(context)) output.system.push(context)
   }},
   "tool.execute.after": async (input, output) => {{ await invoke("PostToolUse", {{ session_id: input.sessionID, cwd: directory, tool_name: input.tool, tool_input: input.args, tool_response: output, hook_event_name: "PostToolUse" }}) }}
-}})
+  }}
+}}
 "#
     )
 }
@@ -258,8 +260,8 @@ mod tests {
         assert!(source.contains("experimental.chat.system.transform"));
         assert!(source.contains("const response = await invoke(\"UserPromptSubmit\""));
         assert!(source.contains("response.hookSpecificOutput?.additionalContext"));
+        assert!(source.contains("output.parts.push"));
         assert!(source.contains("output.system.push"));
-        assert!(!source.contains("output.parts.push"));
         assert!(!source.contains("output.options.system"));
         assert!(installer.disconnect().unwrap());
         let disconnected = read_object(&paths.configuration).unwrap();
