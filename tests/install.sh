@@ -40,6 +40,7 @@ run_install() {
     platform=$2
     mkdir -p "$test_home"
     HOME="$test_home" \
+    XDG_CONFIG_HOME="$test_home/.config" \
     MENVANE_TEST_PLATFORM="$platform" \
     PATH="$fake_bin:$PATH" \
         "$script_dir/install.sh" --binary "$binary"
