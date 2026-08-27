@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 2.5.2
+Version: 2.6.0
 
 Menvane is a local persistent memory system for agents. Its central product is operational continuity between agents, sessions, and different days. It preserves four distinct layers:
 
@@ -67,7 +67,7 @@ Capture removes authentication headers, likely API keys and tokens, bounds promp
 
 The durable session preserves event order, types, timestamps, and stable references, but never private reasoning, secrets, unbounded payloads, or harness instructions. System prompts, skills, `AGENTS.md`, `SKILL.md`, tool metadata, Menvane context, and every injected instruction never enter the durable session, any language-model packet, or any episodic summary. Real user prompts, tool activity, and lifecycle events are distinct categories; system and agent messages are never represented as `UserPrompt` without explicit provenance.
 
-Sessions are open, idle, or finalized. Session end queues deterministic finalization without waiting for background work. Turn stop marks idle, and idle sessions queue finalization after 120 seconds by default. Events arriving after finalization reuse the external session identifier in a new generation and process only new evidence. Finalization is asynchronous, idempotent, provider-independent, and recoverable through the daemon worker. Empty or purely operational sessions do not produce consolidation.
+Sessions are open, idle, or finalized. Session end queues deterministic finalization without waiting for background work. Turn stop marks idle, and idle sessions queue finalization after 120 seconds by default. Open sessions whose client omits both terminal events become finalized after 1,800 seconds of inactivity by default, preventing abandoned integrations from withholding consolidation indefinitely. Each finalized session records whether it ended through an explicit session event, idle timeout, or inactivity timeout. Events arriving after finalization reuse the external session identifier in a new generation and process only new evidence. Finalization is asynchronous, idempotent, provider-independent, and recoverable through the daemon worker. Empty or purely operational sessions do not produce consolidation.
 
 Each eligible event is rendered in chronological order with timestamp, type and actor, a stable reference, and bounded sanitized content. Useful tool details such as name, attributed path, success, and sanitized input and output are preserved without inferring decisions or outcomes. Complete payloads remain only in `state.sqlite`; the Markdown is bounded, human-oriented, and reconstructible from the operational evidence.
 

@@ -407,12 +407,14 @@ async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
                 .unwrap_or_else(|| fallback.to_owned())
         };
         format!(
-            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>GitHub OAuth client ID<input name='github_client_id' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
+            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Open-session inactivity seconds<input name='open_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
+            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Open-session inactivity seconds<input name='open_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>GitHub OAuth client ID<input name='github_client_id' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
             page_head("Settings", "Observable runtime configuration."),
             get("capture", "max_prompt_bytes", "16384"),
             get("capture", "max_tool_input_bytes", "4096"),
             get("capture", "max_tool_output_bytes", "4096"),
             get("sessions", "idle_finalize_seconds", "120"),
+            get("sessions", "open_finalize_seconds", "1800"),
             get("jobs", "lease_timeout_seconds", "300"),
             get("decay", "memory_lifetime_days", "90"),
             get("llm", "provider", "openai"),
@@ -445,6 +447,7 @@ struct SettingsEdit {
     max_tool_input_bytes: u64,
     max_tool_output_bytes: u64,
     idle_finalize_seconds: u64,
+    open_finalize_seconds: u64,
     lease_timeout_seconds: u64,
     memory_lifetime_days: u64,
     provider: String,
@@ -483,6 +486,11 @@ async fn update_settings(
                 "sessions",
                 "idle_finalize_seconds",
                 toml::Value::Integer(edit.idle_finalize_seconds as i64),
+            ),
+            (
+                "sessions",
+                "open_finalize_seconds",
+                toml::Value::Integer(edit.open_finalize_seconds as i64),
             ),
             (
                 "jobs",

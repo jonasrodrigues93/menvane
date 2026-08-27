@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     imported INTEGER NOT NULL DEFAULT 0,
     summary_status TEXT NOT NULL DEFAULT 'pending',
     summary_json TEXT,
+    finalization_reason TEXT,
     UNIQUE(client, external_session_id, generation)
 );
 CREATE INDEX IF NOT EXISTS sessions_external ON sessions(client, external_session_id, generation DESC);
@@ -157,6 +158,7 @@ pub struct SessionRecord {
     pub markdown_path: Option<PathBuf>,
     pub imported: bool,
     pub summary_status: SummaryStatus,
+    pub finalization_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +242,7 @@ impl SessionRepository {
         reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
         ensure_retryable_job_column(&connection)?;
+        ensure_session_finalization_reason_column(&connection)?;
         connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         Ok(())
     }
@@ -286,9 +289,11 @@ impl SessionRepository {
         )?;
         let state = state_after_event(session.state, event.kind);
         let ended_at = (state == SessionState::Finalized).then(|| event.timestamp.to_rfc3339());
+        let finalization_reason =
+            (event.kind == NormalizedEventKind::SessionEnded).then_some("session-ended");
         transaction.execute(
-            "UPDATE sessions SET state=?1, last_event_at=?2, ended_at=COALESCE(?3, ended_at), project_id=COALESCE(project_id, ?4) WHERE id=?5",
-            params![session_state(state), event.timestamp.to_rfc3339(), ended_at, project_id, session.id.to_string()],
+            "UPDATE sessions SET state=?1, last_event_at=?2, ended_at=COALESCE(?3, ended_at), project_id=COALESCE(project_id, ?4), finalization_reason=COALESCE(?5, finalization_reason) WHERE id=?6",
+            params![session_state(state), event.timestamp.to_rfc3339(), ended_at, project_id, finalization_reason, session.id.to_string()],
         )?;
         if state == SessionState::Finalized {
             enqueue_job_tx(
@@ -323,18 +328,25 @@ impl SessionRepository {
         })
     }
 
-    pub fn finalize_idle_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<SessionRecord>> {
+    pub fn finalize_inactive_before(
+        &self,
+        idle_cutoff: DateTime<Utc>,
+        open_cutoff: DateTime<Utc>,
+    ) -> Result<Vec<SessionRecord>> {
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ids = {
-            let mut statement = transaction.prepare("SELECT id FROM sessions WHERE state='idle' AND last_event_at <= ?1 ORDER BY last_event_at")?;
+            let mut statement = transaction.prepare("SELECT id, CASE WHEN state='idle' THEN 'idle-timeout' ELSE 'inactivity-timeout' END FROM sessions WHERE (state='idle' AND last_event_at <= ?1) OR (state='open' AND last_event_at <= ?2) ORDER BY last_event_at")?;
             statement
-                .query_map([cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
+                .query_map(
+                    params![idle_cutoff.to_rfc3339(), open_cutoff.to_rfc3339()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut sessions = Vec::new();
-        for id in ids {
-            transaction.execute("UPDATE sessions SET state='finalized', ended_at=last_event_at WHERE id=?1 AND state='idle'", [&id])?;
+        for (id, reason) in ids {
+            transaction.execute("UPDATE sessions SET state='finalized', ended_at=last_event_at, finalization_reason=?2 WHERE id=?1 AND state IN ('idle', 'open')", params![id, reason])?;
             enqueue_job_tx(&transaction, "finalize_session", &id, "{}")?;
             sessions.push(session_by_id(&transaction, Uuid::parse_str(&id)?)?);
         }
@@ -377,14 +389,14 @@ impl SessionRepository {
     pub fn find_session(&self, id: Uuid) -> Result<Option<SessionRecord>> {
         let connection = self.open()?;
         connection
-            .query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE id=?1", [id.to_string()], session_from_row)
+            .query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions WHERE id=?1", [id.to_string()], session_from_row)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
         let connection = self.open()?;
-        let mut statement = connection.prepare("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions ORDER BY last_event_at DESC, id DESC LIMIT ?1")?;
+        let mut statement = connection.prepare("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions ORDER BY last_event_at DESC, id DESC LIMIT ?1")?;
         let rows = statement.query_map([i64::try_from(limit)?], session_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -847,7 +859,7 @@ fn latest_session_tx(
     client: &str,
     external_session_id: &str,
 ) -> Result<Option<SessionRecord>> {
-    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1", params![client, external_session_id], session_from_row).optional().map_err(Into::into)
+    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1", params![client, external_session_id], session_from_row).optional().map_err(Into::into)
 }
 
 fn latest_session_for_project(
@@ -856,11 +868,11 @@ fn latest_session_for_project(
     external_session_id: &str,
     project_id: Option<&str>,
 ) -> Result<Option<SessionRecord>> {
-    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE client=?1 AND external_session_id=?2 AND project_id IS ?3 ORDER BY generation DESC LIMIT 1", params![client, external_session_id, project_id], session_from_row).optional().map_err(Into::into)
+    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions WHERE client=?1 AND external_session_id=?2 AND project_id IS ?3 ORDER BY generation DESC LIMIT 1", params![client, external_session_id, project_id], session_from_row).optional().map_err(Into::into)
 }
 
 fn session_by_id(connection: &Connection, id: Uuid) -> Result<SessionRecord> {
-    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE id=?1", [id.to_string()], session_from_row).map_err(Into::into)
+    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions WHERE id=?1", [id.to_string()], session_from_row).map_err(Into::into)
 }
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -877,6 +889,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         markdown_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
         imported: row.get(10)?,
         summary_status: parse_summary_status(&row.get::<_, String>(11)?)?,
+        finalization_reason: row.get(12)?,
     })
 }
 
@@ -974,6 +987,20 @@ fn ensure_retryable_job_column(connection: &Connection) -> Result<()> {
     if !columns.iter().any(|column| column == "retryable") {
         connection.execute(
             "ALTER TABLE jobs ADD COLUMN retryable INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_session_finalization_reason_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "finalization_reason") {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN finalization_reason TEXT",
             [],
         )?;
     }

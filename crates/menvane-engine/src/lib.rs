@@ -193,12 +193,15 @@ impl Default for EmbeddingConfiguration {
 struct SessionConfiguration {
     #[serde(default = "default_idle_finalize_seconds")]
     idle_finalize_seconds: u64,
+    #[serde(default = "default_open_finalize_seconds")]
+    open_finalize_seconds: u64,
 }
 
 impl Default for SessionConfiguration {
     fn default() -> Self {
         Self {
             idle_finalize_seconds: default_idle_finalize_seconds(),
+            open_finalize_seconds: default_open_finalize_seconds(),
         }
     }
 }
@@ -263,6 +266,9 @@ impl Default for LlmConfiguration {
 
 fn default_idle_finalize_seconds() -> u64 {
     120
+}
+fn default_open_finalize_seconds() -> u64 {
+    1_800
 }
 fn default_job_lease_timeout_seconds() -> u64 {
     300
@@ -671,7 +677,10 @@ impl Menvane {
     }
 
     pub fn finalize_idle_sessions(&self) -> Result<usize> {
-        SessionEngine::new(self).finalize_idle(self.config.sessions.idle_finalize_seconds)
+        SessionEngine::new(self).finalize_inactive(
+            self.config.sessions.idle_finalize_seconds,
+            self.config.sessions.open_finalize_seconds,
+        )
     }
 
     pub fn jobs(&self) -> Result<Vec<JobRecord>> {

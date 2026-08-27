@@ -503,6 +503,41 @@ fn normalized_session_capture_is_sanitized_ordered_and_provider_independent() {
 }
 
 #[test]
+fn abandoned_open_session_is_finalized_with_an_auditable_reason() {
+    let (_temporary, project, menvane) = setup_project();
+    let timestamp = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+    menvane
+        .ingest_event(event(
+            &project,
+            "abandoned-prompt",
+            NormalizedEventKind::UserPrompt,
+            timestamp,
+            Some("Investigate the abandoned session"),
+            None,
+        ))
+        .unwrap();
+
+    assert_eq!(menvane.finalize_idle_sessions().unwrap(), 1);
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    let session = repository
+        .latest_session("test-client", "external-session")
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.state, menvane_domain::SessionState::Finalized);
+    assert_eq!(
+        session.finalization_reason.as_deref(),
+        Some("inactivity-timeout")
+    );
+    assert!(
+        menvane
+            .jobs()
+            .unwrap()
+            .iter()
+            .any(|job| job.job_type == "finalize_session")
+    );
+}
+
+#[test]
 fn consolidation_preserves_chronology_and_records_execution() {
     let (_temporary, project, provider, menvane) = setup_provider(vec![Ok(valid_result())]);
     ingest_meaningful_session(&menvane, &project);
