@@ -22,12 +22,12 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use fs2::FileExt;
 use menvane_domain::{
-    Applicability, ConsolidationPacket, ConsolidationResult, EmbeddingProvider, EpisodicSummary,
-    HandoffItem, HandoffItemOperation, HandoffItemSource, JsonSchema, KnowledgeContent,
-    KnowledgeMetadata, KnowledgeOperation, KnowledgeOperationKind, KnowledgeRecord, KnowledgeType,
-    LlmError, LlmProvider, LlmRequest, MemoryStatus, NormalizedEvent, NormalizedEventKind,
-    NormalizedSession, Project, ProviderHealth, ReinforcementSignal, Scope, SessionMetadata,
-    SessionState, SummaryStatus,
+    Applicability, ConsolidationPacket, ConsolidationResult, ContextEvaluation, ContextUtility,
+    DeliveredContextKind, EmbeddingProvider, EpisodicSummary, HandoffItem, HandoffItemOperation,
+    HandoffItemSource, JsonSchema, KnowledgeContent, KnowledgeMetadata, KnowledgeOperation,
+    KnowledgeOperationKind, KnowledgeRecord, KnowledgeType, LlmError, LlmProvider, LlmRequest,
+    MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProviderHealth,
+    ReinforcementSignal, Scope, SessionMetadata, SessionState, SummaryStatus,
 };
 use menvane_store::{
     IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MAX_SUMMARY_SELECTION_BYTES,
@@ -853,7 +853,10 @@ impl Menvane {
         if memory.metadata.knowledge_type != KnowledgeType::Playbook {
             bail!("memory is not a playbook");
         }
-        if memory.metadata.status == MemoryStatus::Forgotten {
+        if matches!(
+            memory.metadata.status,
+            MemoryStatus::Forgotten | MemoryStatus::Quarantined | MemoryStatus::Superseded
+        ) {
             return Ok(false);
         }
         if !self
@@ -871,6 +874,8 @@ impl Menvane {
             },
         )?;
         if successful {
+            memory.metadata.utility += (1.0 - memory.metadata.utility) * 0.25;
+            memory.metadata.confidence = (memory.metadata.confidence + 0.2).min(1.0);
             let successes = memory.metadata.successes.get_or_insert(0);
             *successes = successes.saturating_add(1);
             if memory.metadata.status == MemoryStatus::Candidate && *successes >= 2 {
@@ -878,8 +883,13 @@ impl Menvane {
             }
             memory.metadata.last_verified_at = Some(Utc::now());
         } else {
+            memory.metadata.utility *= 0.6;
+            memory.metadata.confidence = (memory.metadata.confidence - 0.25).max(0.0);
             let failures = memory.metadata.failures.get_or_insert(0);
             *failures = failures.saturating_add(1);
+            if *failures >= 3 && memory.metadata.confidence < 0.45 {
+                memory.metadata.status = MemoryStatus::Quarantined;
+            }
         }
         memory.metadata.updated_at = Utc::now();
         self.markdown.update_memory(&path, &memory)?;
@@ -1681,14 +1691,90 @@ impl Menvane {
         result: &ConsolidationResult,
     ) -> Result<()> {
         let session = self.sessions.session(session_id)?;
-        self.sessions
+        let evaluations = self
+            .sessions
             .record_context_evaluations(&session, &result.context_evaluations)?;
+        for evaluation in &evaluations {
+            self.apply_context_evaluation(evaluation)?;
+        }
         for (index, operation) in result.handoff.iter().enumerate() {
             self.apply_handoff_operation(session_id, project_id, index, operation)?;
         }
         for (index, operation) in result.knowledge.iter().enumerate() {
             self.apply_knowledge_operation(session_id, project_id, operation, index)?;
         }
+        Ok(())
+    }
+
+    fn apply_context_evaluation(&self, evaluation: &ContextEvaluation) -> Result<()> {
+        if evaluation.kind == DeliveredContextKind::Handoff {
+            return Ok(());
+        }
+        let Ok(id) = Uuid::parse_str(&evaluation.content_id) else {
+            return Ok(());
+        };
+        let Ok((mut memory, path)) = self.index.read_memory(&self.markdown, id) else {
+            return Ok(());
+        };
+        let previous = (memory.metadata.utility, memory.metadata.confidence);
+        match evaluation.utility {
+            ContextUtility::Useful => {
+                memory.metadata.utility += (1.0 - memory.metadata.utility) * 0.25;
+                memory.metadata.confidence = (memory.metadata.confidence + 0.2).min(1.0);
+                if memory.metadata.knowledge_type == KnowledgeType::Playbook {
+                    let successes = memory.metadata.successes.get_or_insert(0);
+                    *successes = successes.saturating_add(1);
+                    if memory.metadata.status == MemoryStatus::Candidate && *successes >= 2 {
+                        memory.metadata.status = MemoryStatus::Active;
+                    }
+                }
+                memory.metadata.last_verified_at = Some(Utc::now());
+            }
+            ContextUtility::Unused => {
+                memory.metadata.utility *= 0.85;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.08).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Irrelevant => {
+                memory.metadata.utility *= 0.9;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.05).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Incomplete => {
+                memory.metadata.utility *= 0.75;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.15).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Outdated => {
+                memory.metadata.utility *= 0.7;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.25).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Contradicted => {
+                memory.metadata.utility *= 0.5;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.4).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Harmful => {
+                memory.metadata.utility *= 0.25;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.5).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Unknown => return Ok(()),
+        }
+        memory.metadata.utility = memory.metadata.utility.clamp(0.0, 1.0);
+        if memory.metadata.knowledge_type == KnowledgeType::Playbook
+            && memory.metadata.failures.unwrap_or_default() >= 3
+            && memory.metadata.confidence < 0.45
+        {
+            memory.metadata.status = MemoryStatus::Quarantined;
+        }
+        if previous == (memory.metadata.utility, memory.metadata.confidence) {
+            return Ok(());
+        }
+        memory.metadata.updated_at = Utc::now();
+        self.markdown.update_memory(&path, &memory)?;
+        self.index.upsert_memory(&memory, &path)?;
         Ok(())
     }
 
@@ -2482,6 +2568,13 @@ fn content_identifier(value: &str) -> String {
 fn historical_context_header() -> String {
     "HISTORICAL CONTEXT\nUse only when relevant. Current user instructions and repository state are authoritative.\n"
         .to_owned()
+}
+
+fn record_autonomous_failure(memory: &mut KnowledgeRecord) {
+    if memory.metadata.knowledge_type == KnowledgeType::Playbook {
+        let failures = memory.metadata.failures.get_or_insert(0);
+        *failures = failures.saturating_add(1);
+    }
 }
 
 fn deterministic_uuid(session_id: Uuid, parts: &[String], discriminator: &[u8]) -> Uuid {

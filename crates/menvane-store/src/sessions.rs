@@ -701,13 +701,14 @@ impl SessionRepository {
         &self,
         session: &SessionRecord,
         evaluations: &[ContextEvaluation],
-    ) -> Result<()> {
+    ) -> Result<Vec<ContextEvaluation>> {
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let evaluated_at = Utc::now().to_rfc3339();
+        let mut newly_recorded = Vec::new();
         for evaluation in evaluations {
             let changed = transaction.execute(
-                "UPDATE delivery_claims SET evaluated_at=COALESCE(evaluated_at, ?1), utility=?2, evaluation_reason=?3, evidence_event_ids_json=?4 WHERE client=?5 AND external_session_id=?6 AND generation=?7 AND content_kind=?8 AND content_id=?9",
+                "UPDATE delivery_claims SET evaluated_at=?1, utility=?2, evaluation_reason=?3, evidence_event_ids_json=?4 WHERE client=?5 AND external_session_id=?6 AND generation=?7 AND content_kind=?8 AND content_id=?9 AND evaluated_at IS NULL",
                 params![
                     evaluated_at,
                     context_utility(evaluation.utility),
@@ -720,12 +721,24 @@ impl SessionRepository {
                     evaluation.content_id,
                 ],
             )?;
-            if changed != 1 {
-                bail!("context evaluation does not match one delivery")
+            if changed == 1 {
+                newly_recorded.push(evaluation.clone());
+            } else {
+                let exists = transaction
+                    .query_row(
+                        "SELECT 1 FROM delivery_claims WHERE client=?1 AND external_session_id=?2 AND generation=?3 AND content_kind=?4 AND content_id=?5",
+                        params![session.client, session.external_session_id, session.generation, delivered_context_kind(evaluation.kind), evaluation.content_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    bail!("context evaluation does not match one delivery")
+                }
             }
         }
         transaction.commit()?;
-        Ok(())
+        Ok(newly_recorded)
     }
 
     pub fn knowledge_utility(&self, memory_id: Uuid) -> Result<UtilitySummary> {

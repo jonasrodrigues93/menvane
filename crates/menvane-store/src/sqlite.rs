@@ -476,7 +476,7 @@ impl IndexStore {
             SearchScope::Global => ("m.scope = 'global'", ""),
         };
         let status_sql = if include_forgotten {
-            "m.status IN ('active', 'candidate', 'forgotten')"
+            "m.status IN ('active', 'candidate', 'quarantined', 'forgotten')"
         } else {
             "m.status IN ('active', 'candidate')"
         };

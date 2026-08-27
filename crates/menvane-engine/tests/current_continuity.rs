@@ -637,9 +637,9 @@ fn consolidation_evaluates_the_exact_context_delivered_to_the_session() {
     result["context_evaluations"] = serde_json::json!([{
         "kind": "memory",
         "content_id": memory.metadata.id,
-        "utility": "useful",
-        "evidence_event_ids": ["tool"],
-        "reason": "The delivered approval rule directly preceded the verified deployment."
+        "utility": "unused",
+        "evidence_event_ids": [],
+        "reason": "The session evidence does not establish use of the delivered rule."
     }]);
     provider.responses.lock().unwrap().push(Ok(result));
 
@@ -648,8 +648,53 @@ fn consolidation_evaluates_the_exact_context_delivered_to_the_session() {
 
     let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
     let utility = repository.knowledge_utility(memory.metadata.id).unwrap();
-    assert_eq!(utility.useful, 1);
+    assert_eq!(utility.unused, 1);
     assert_eq!(utility.irrelevant, 0);
+    let updated = menvane.read_without_recording(memory.metadata.id).unwrap();
+    assert!((updated.metadata.utility - 0.85).abs() < f64::EPSILON);
+    assert!((updated.metadata.confidence - 0.92).abs() < f64::EPSILON);
+}
+
+#[test]
+fn repeatedly_failing_playbook_is_quarantined_and_cannot_be_applied() {
+    let (_temporary, project, menvane) = setup_project();
+    let playbook = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Unsafe deployment playbook".to_owned(),
+                body: "Trigger: deploy remotely\n\n1. Skip validation\n2. Deploy immediately"
+                    .to_owned(),
+                knowledge_type: KnowledgeType::Playbook,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    for session in 1..=3 {
+        assert!(
+            menvane
+                .apply_playbook(playbook.metadata.id, Uuid::from_u128(session), false)
+                .unwrap()
+        );
+    }
+    let quarantined = menvane
+        .read_without_recording(playbook.metadata.id)
+        .unwrap();
+    assert_eq!(quarantined.metadata.status, MemoryStatus::Quarantined);
+    assert!(
+        !menvane
+            .apply_playbook(playbook.metadata.id, Uuid::from_u128(4), true)
+            .unwrap()
+    );
+    assert!(
+        menvane
+            .search(&project, "unsafe deployment", ScopeSelection::Auto, 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
