@@ -2140,7 +2140,7 @@ fn reliable_import_cwd(session: &NormalizedSession) -> Result<Option<PathBuf>> {
         event.success == Some(true)
             && matches!(
                 event.tool_family.as_deref(),
-                Some("apply_patch" | "edit" | "write")
+                Some("apply_patch" | "edit" | "write" | "read" | "search" | "grep" | "glob")
             )
     }) {
         let Some(path) = event.attributed_path.as_deref() else {

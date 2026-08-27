@@ -960,6 +960,167 @@ mod tests {
     }
 
     #[test]
+    fn successful_read_and_search_attributes_global_opencode_session_to_project() {
+        let temporary = TempDir::new().unwrap();
+        let project = temporary.path().join("read-only-project");
+        let outside = temporary.path().join("outside");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let timestamp = Utc::now();
+        let outside = outside.to_string_lossy().into_owned();
+        let project_file = project.join("src/main.rs").to_string_lossy().into_owned();
+        let mut session = NormalizedSession {
+            client: "opencode".to_owned(),
+            external_session_id: "global-read-only-work".to_owned(),
+            cwd: Some(outside.clone()),
+            events: vec![
+                boundary_event(
+                    "opencode",
+                    "global-read-only-work",
+                    &outside,
+                    timestamp,
+                    NormalizedEventKind::SessionStarted,
+                    "import-start",
+                ),
+                boundary_event(
+                    "opencode",
+                    "global-read-only-work",
+                    &outside,
+                    timestamp,
+                    NormalizedEventKind::SessionEnded,
+                    "import-end",
+                ),
+            ],
+            estimated_bytes: 0,
+        };
+        for (event_id, tool_family, attributed_path) in [
+            ("project-read", "read", project_file),
+            (
+                "project-search",
+                "grep",
+                project.to_string_lossy().into_owned(),
+            ),
+        ] {
+            session.events.insert(
+                session.events.len() - 1,
+                NormalizedEvent {
+                    event_id: event_id.to_owned(),
+                    kind: NormalizedEventKind::ToolCompleted,
+                    origin: NormalizedEventOrigin::Tool,
+                    role: NormalizedEventRole::ToolActivity,
+                    client: "opencode".to_owned(),
+                    external_session_id: "global-read-only-work".to_owned(),
+                    timestamp,
+                    cwd: outside.clone(),
+                    project_id: None,
+                    tool_family: Some(tool_family.to_owned()),
+                    bounded_input: Some("{}".to_owned()),
+                    bounded_output: Some("success".to_owned()),
+                    attributed_path: Some(attributed_path),
+                    success: Some(true),
+                    model: None,
+                    harness_injected: false,
+                },
+            );
+        }
+        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+        assert_eq!(
+            menvane.import_session(session).unwrap(),
+            ImportOutcome::Imported
+        );
+        let imported = menvane.sessions(1).unwrap().remove(0);
+        assert!(imported.project_id.is_some());
+    }
+
+    #[test]
+    fn ambiguous_read_only_paths_remain_unresolved() {
+        let temporary = TempDir::new().unwrap();
+        let first = temporary.path().join("first-project");
+        let second = temporary.path().join("second-project");
+        let outside = temporary.path().join("outside");
+        for project in [&first, &second] {
+            fs::create_dir_all(project).unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(project)
+                    .args(["init", "--quiet"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            fs::write(project.join("README.md"), "project\n").unwrap();
+        }
+        fs::create_dir_all(&outside).unwrap();
+        let timestamp = Utc::now();
+        let outside = outside.to_string_lossy().into_owned();
+        let mut session = NormalizedSession {
+            client: "opencode".to_owned(),
+            external_session_id: "ambiguous-read-only-work".to_owned(),
+            cwd: Some(outside.clone()),
+            events: vec![
+                boundary_event(
+                    "opencode",
+                    "ambiguous-read-only-work",
+                    &outside,
+                    timestamp,
+                    NormalizedEventKind::SessionStarted,
+                    "import-start",
+                ),
+                boundary_event(
+                    "opencode",
+                    "ambiguous-read-only-work",
+                    &outside,
+                    timestamp,
+                    NormalizedEventKind::SessionEnded,
+                    "import-end",
+                ),
+            ],
+            estimated_bytes: 0,
+        };
+        for (event_id, project) in [("first-read", first), ("second-read", second)] {
+            session.events.insert(
+                session.events.len() - 1,
+                NormalizedEvent {
+                    event_id: event_id.to_owned(),
+                    kind: NormalizedEventKind::ToolCompleted,
+                    origin: NormalizedEventOrigin::Tool,
+                    role: NormalizedEventRole::ToolActivity,
+                    client: "opencode".to_owned(),
+                    external_session_id: "ambiguous-read-only-work".to_owned(),
+                    timestamp,
+                    cwd: outside.clone(),
+                    project_id: None,
+                    tool_family: Some("read".to_owned()),
+                    bounded_input: Some("{}".to_owned()),
+                    bounded_output: Some("success".to_owned()),
+                    attributed_path: Some(project.join("README.md").to_string_lossy().into_owned()),
+                    success: Some(true),
+                    model: None,
+                    harness_injected: false,
+                },
+            );
+        }
+        let menvane = Menvane::new(temporary.path().join("home")).unwrap();
+        assert_eq!(
+            menvane.import_session(session).unwrap(),
+            ImportOutcome::Imported
+        );
+        let imported = menvane.sessions(1).unwrap().remove(0);
+        assert_eq!(imported.project_id, None);
+    }
+
+    #[test]
     fn unknown_project_is_orphaned_without_guessing() {
         let temporary = TempDir::new().unwrap();
         let menvane = Menvane::new(temporary.path().join("home")).unwrap();
