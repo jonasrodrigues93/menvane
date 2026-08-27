@@ -5,7 +5,8 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use menvane_domain::{
-    ConsolidationExecution, ConsolidationResult, EpisodicSummary, HandoffItem, HandoffItemKind,
+    ConsolidationExecution, ConsolidationResult, ContextEvaluation, ContextUtility,
+    DeliveredContext, DeliveredContextKind, EpisodicSummary, HandoffItem, HandoffItemKind,
     HandoffItemSource, NormalizedEvent, NormalizedEventKind, ReinforcementSignal, SessionState,
     SummaryStatus,
 };
@@ -139,7 +140,14 @@ CREATE TABLE IF NOT EXISTS delivery_claims (
     generation INTEGER NOT NULL,
     content_kind TEXT NOT NULL,
     content_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
     claimed_at TEXT NOT NULL,
+    evaluated_at TEXT,
+    utility TEXT,
+    evaluation_reason TEXT,
+    evidence_event_ids_json TEXT,
     PRIMARY KEY(client, external_session_id, generation, content_kind, content_id)
 );
 "#;
@@ -172,6 +180,18 @@ pub struct InjectionIdentity {
     pub client: String,
     pub external_session_id: String,
     pub generation: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UtilitySummary {
+    pub useful: u32,
+    pub unused: u32,
+    pub irrelevant: u32,
+    pub incomplete: u32,
+    pub outdated: u32,
+    pub contradicted: u32,
+    pub harmful: u32,
+    pub unknown: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +263,7 @@ impl SessionRepository {
         connection.execute_batch(SCHEMA)?;
         ensure_retryable_job_column(&connection)?;
         ensure_session_finalization_reason_column(&connection)?;
+        ensure_delivery_evaluation_columns(&connection)?;
         connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         Ok(())
     }
@@ -645,9 +666,90 @@ impl SessionRepository {
         identity: &InjectionIdentity,
         content_kind: &str,
         content_id: &str,
+        subject_id: &str,
+        title: &str,
+        content: &str,
     ) -> Result<bool> {
         let connection = self.open()?;
-        Ok(connection.execute("INSERT OR IGNORE INTO delivery_claims(client, external_session_id, generation, content_kind, content_id, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![identity.client, identity.external_session_id, identity.generation, content_kind, content_id, Utc::now().to_rfc3339()])? == 1)
+        Ok(connection.execute("INSERT OR IGNORE INTO delivery_claims(client, external_session_id, generation, content_kind, content_id, subject_id, title, content, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![identity.client, identity.external_session_id, identity.generation, content_kind, content_id, subject_id, title, content, Utc::now().to_rfc3339()])? == 1)
+    }
+
+    pub fn delivered_context(&self, session: &SessionRecord) -> Result<Vec<DeliveredContext>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare("SELECT content_kind, content_id, title, content FROM delivery_claims WHERE client=?1 AND external_session_id=?2 AND generation=?3 AND content_kind IN ('memory', 'playbook', 'handoff') ORDER BY claimed_at, content_kind, content_id")?;
+        let rows = statement.query_map(
+            params![
+                session.client,
+                session.external_session_id,
+                session.generation
+            ],
+            |row| {
+                let kind = parse_delivered_context_kind(&row.get::<_, String>(0)?)?;
+                Ok(DeliveredContext {
+                    kind,
+                    content_id: row.get(1)?,
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn record_context_evaluations(
+        &self,
+        session: &SessionRecord,
+        evaluations: &[ContextEvaluation],
+    ) -> Result<()> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let evaluated_at = Utc::now().to_rfc3339();
+        for evaluation in evaluations {
+            let changed = transaction.execute(
+                "UPDATE delivery_claims SET evaluated_at=COALESCE(evaluated_at, ?1), utility=?2, evaluation_reason=?3, evidence_event_ids_json=?4 WHERE client=?5 AND external_session_id=?6 AND generation=?7 AND content_kind=?8 AND content_id=?9",
+                params![
+                    evaluated_at,
+                    context_utility(evaluation.utility),
+                    evaluation.reason,
+                    serde_json::to_string(&evaluation.evidence_event_ids)?,
+                    session.client,
+                    session.external_session_id,
+                    session.generation,
+                    delivered_context_kind(evaluation.kind),
+                    evaluation.content_id,
+                ],
+            )?;
+            if changed != 1 {
+                bail!("context evaluation does not match one delivery")
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn knowledge_utility(&self, memory_id: Uuid) -> Result<UtilitySummary> {
+        let connection = self.open()?;
+        let mut summary = UtilitySummary::default();
+        let mut statement = connection.prepare("SELECT utility, COUNT(*) FROM delivery_claims WHERE subject_id=?1 AND utility IS NOT NULL GROUP BY utility")?;
+        let rows = statement.query_map([memory_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
+        for row in rows {
+            let (utility, count) = row?;
+            match utility.as_str() {
+                "useful" => summary.useful = count,
+                "unused" => summary.unused = count,
+                "irrelevant" => summary.irrelevant = count,
+                "incomplete" => summary.incomplete = count,
+                "outdated" => summary.outdated = count,
+                "contradicted" => summary.contradicted = count,
+                "harmful" => summary.harmful = count,
+                "unknown" => summary.unknown = count,
+                _ => {}
+            }
+        }
+        Ok(summary)
     }
 
     pub fn integrations(&self) -> Result<Vec<IntegrationRecord>> {
@@ -1005,6 +1107,64 @@ fn ensure_session_finalization_reason_column(connection: &Connection) -> Result<
         )?;
     }
     Ok(())
+}
+
+fn ensure_delivery_evaluation_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(delivery_claims)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (column, definition) in [
+        ("subject_id", "TEXT NOT NULL DEFAULT ''"),
+        ("title", "TEXT NOT NULL DEFAULT ''"),
+        ("content", "TEXT NOT NULL DEFAULT ''"),
+        ("evaluated_at", "TEXT"),
+        ("utility", "TEXT"),
+        ("evaluation_reason", "TEXT"),
+        ("evidence_event_ids_json", "TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection.execute(
+                &format!("ALTER TABLE delivery_claims ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    connection.execute(
+        "UPDATE delivery_claims SET subject_id=content_id WHERE subject_id=''",
+        [],
+    )?;
+    Ok(())
+}
+
+fn delivered_context_kind(kind: DeliveredContextKind) -> &'static str {
+    match kind {
+        DeliveredContextKind::Memory => "memory",
+        DeliveredContextKind::Playbook => "playbook",
+        DeliveredContextKind::Handoff => "handoff",
+    }
+}
+
+fn parse_delivered_context_kind(value: &str) -> rusqlite::Result<DeliveredContextKind> {
+    match value {
+        "memory" => Ok(DeliveredContextKind::Memory),
+        "playbook" => Ok(DeliveredContextKind::Playbook),
+        "handoff" => Ok(DeliveredContextKind::Handoff),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn context_utility(utility: ContextUtility) -> &'static str {
+    match utility {
+        ContextUtility::Useful => "useful",
+        ContextUtility::Unused => "unused",
+        ContextUtility::Irrelevant => "irrelevant",
+        ContextUtility::Incomplete => "incomplete",
+        ContextUtility::Outdated => "outdated",
+        ContextUtility::Contradicted => "contradicted",
+        ContextUtility::Harmful => "harmful",
+        ContextUtility::Unknown => "unknown",
+    }
 }
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {

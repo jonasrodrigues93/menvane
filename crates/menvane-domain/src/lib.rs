@@ -8,8 +8,9 @@ mod summary;
 
 pub use consolidation::{
     ConsolidationExecution, ConsolidationPacket, ConsolidationResult, ConsolidationValidationError,
-    KnowledgeContent, KnowledgeOperation, KnowledgeOperationKind, MemoryContent, PlaybookContent,
-    RelatedMemory, RelatedSummary, consolidation_result_schema, preserve_handoff_transitions,
+    ContextEvaluation, ContextUtility, DeliveredContext, DeliveredContextKind, KnowledgeContent,
+    KnowledgeOperation, KnowledgeOperationKind, MemoryContent, PlaybookContent, RelatedMemory,
+    RelatedSummary, consolidation_result_schema, preserve_handoff_transitions,
     validate_consolidation_result, validate_knowledge_promotion,
 };
 pub use handoff::{

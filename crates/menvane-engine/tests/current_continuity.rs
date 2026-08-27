@@ -578,6 +578,81 @@ fn consolidation_preserves_chronology_and_records_execution() {
 }
 
 #[test]
+fn consolidation_evaluates_the_exact_context_delivered_to_the_session() {
+    let (_temporary, project, provider, menvane) = setup_provider(Vec::new());
+    let memory = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Remote deployment approval".to_owned(),
+                body: "Remote deployments require approval before execution.".to_owned(),
+                knowledge_type: KnowledgeType::Memory,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+    let timestamp = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+    menvane
+        .ingest_event(event(
+            &project,
+            "prompt",
+            NormalizedEventKind::UserPrompt,
+            timestamp,
+            Some("remote deployments require approval"),
+            None,
+        ))
+        .unwrap();
+    let (context, _) = menvane
+        .prompt_context_for_client(
+            &project,
+            "test-client",
+            "external-session",
+            "remote deployments require approval",
+        )
+        .unwrap();
+    assert!(context.contains("Remote deployment approval"));
+    let mut tool = event(
+        &project,
+        "tool",
+        NormalizedEventKind::ToolCompleted,
+        timestamp + chrono::Duration::seconds(1),
+        Some("request approval and deploy"),
+        Some("approval granted; deployment verified"),
+    );
+    tool.success = Some(true);
+    menvane.ingest_event(tool).unwrap();
+    menvane
+        .ingest_event(event(
+            &project,
+            "end",
+            NormalizedEventKind::SessionEnded,
+            timestamp + chrono::Duration::seconds(2),
+            None,
+            None,
+        ))
+        .unwrap();
+    let mut result = valid_result();
+    result["context_evaluations"] = serde_json::json!([{
+        "kind": "memory",
+        "content_id": memory.metadata.id,
+        "utility": "useful",
+        "evidence_event_ids": ["tool"],
+        "reason": "The delivered approval rule directly preceded the verified deployment."
+    }]);
+    provider.responses.lock().unwrap().push(Ok(result));
+
+    process_next_job(&menvane);
+    process_next_job(&menvane);
+
+    let repository = SessionRepository::new(menvane.home().join("state.sqlite"));
+    let utility = repository.knowledge_utility(memory.metadata.id).unwrap();
+    assert_eq!(utility.useful, 1);
+    assert_eq!(utility.irrelevant, 0);
+}
+
+#[test]
 fn unavailable_provider_keeps_pending_session_and_retryable_job() {
     let (_temporary, project, provider, menvane) = setup_provider(vec![Err(LlmError {
         kind: LlmErrorKind::Unavailable,
@@ -914,7 +989,7 @@ fn global_session_start_waits_for_a_relevant_prompt() {
             "instalar pacote ALSA",
         )
         .unwrap();
-    assert!(related.contains("[CURRENT HANDOFF]"));
+    assert!(related.contains("Current work in progress:"));
     assert!(related.contains("A compilação ALSA está bloqueada"));
     assert_eq!(
         diagnostics.handoff_match_terms,
@@ -1361,7 +1436,7 @@ fn related_prompt_receives_matching_items_and_bounded_cards() {
     let context = menvane
         .prompt_context(&project, "continue the export schema work", "session")
         .unwrap();
-    assert!(context.contains("[CURRENT HANDOFF]"));
+    assert!(context.contains("Current work in progress:"));
     assert!(context.contains("Export is blocked on the schema"));
     assert!(!context.contains("Billing invoice cleanup"));
     assert!(context.matches("[MEMORY CARD]").count() <= 3);
@@ -1589,7 +1664,7 @@ fn hot_path_never_calls_the_provider() {
             "continue the export schema",
         )
         .unwrap();
-    assert!(context.contains("[CURRENT HANDOFF]"));
+    assert!(context.contains("Current work in progress:"));
     assert_eq!(diagnostics.handoff_match_terms, ["export", "schema"]);
     assert_eq!(diagnostics.handoff_reason, "delivered");
     assert_eq!(provider.call_count(), 0);
@@ -1759,7 +1834,8 @@ fn valid_result() -> serde_json::Value {
             "candidate-learnings": []
         },
         "handoff": [],
-        "knowledge": []
+        "knowledge": [],
+        "context_evaluations": []
     })
 }
 

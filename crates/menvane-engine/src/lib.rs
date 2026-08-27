@@ -63,6 +63,7 @@ pub const GLOBAL_SCOPE_CONFIDENCE_THRESHOLD: f64 = 0.9;
 pub const MAX_RELATED_MEMORIES: usize = 5;
 
 const HANDOFF_DELIVERY_KIND: &str = "handoff";
+const PROJECT_IDENTITY_DELIVERY_KIND: &str = "project-identity";
 const GENERIC_HANDOFF_TERMS: [&str; 10] = [
     "arquivo",
     "config",
@@ -903,31 +904,43 @@ impl Menvane {
             self.sessions
                 .injection_identity(client, external_session_id, Some(&project.id))?;
         let handoff = self.current_handoff_items(Some(&project.id))?;
-        let mut context = String::from(
-            "MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n",
-        );
-        context.push_str("Scope: project\n");
-        context.push_str(&format!("Project: {}\n", project.identity));
-        if !handoff.is_empty() {
-            context.push_str("\n[CURRENT HANDOFF]\n");
-            context.push_str(&session_rendering::render_handoff_items(&handoff, 2_000));
-            context.push('\n');
+        let identity_delivered = self.sessions.claim_delivery(
+            &identity,
+            PROJECT_IDENTITY_DELIVERY_KIND,
+            &project.id,
+            &project.id,
+            "Project identity",
+            &project.identity,
+        )?;
+        let mut delivered_handoff = Vec::new();
+        for item in handoff {
+            let rendered =
+                session_rendering::render_handoff_items(std::slice::from_ref(&item), 2_000);
+            let content_id = format!("{}:{}", item.id, content_identifier(&rendered));
+            if self.sessions.claim_delivery(
+                &identity,
+                HANDOFF_DELIVERY_KIND,
+                &content_id,
+                &item.id.to_string(),
+                &item.state,
+                &rendered,
+            )? {
+                delivered_handoff.push(rendered);
+            }
         }
-        context.push_str(
-            "\nAdditional memory is available through recall.\nEND MENVANE MEMORY CONTEXT",
-        );
-        let handoff_content_id = content_identifier(&session_rendering::render_handoff_items(
-            &handoff,
-            usize::MAX,
-        ));
-        if self
-            .sessions
-            .claim_delivery(&identity, HANDOFF_DELIVERY_KIND, &handoff_content_id)?
-        {
-            Ok(context)
-        } else {
-            Ok(String::new())
+        if !identity_delivered && delivered_handoff.is_empty() {
+            return Ok(String::new());
         }
+        let mut context = historical_context_header();
+        if identity_delivered {
+            context.push_str(&format!("Project: {}\n", project.identity));
+        }
+        for rendered in delivered_handoff {
+            context.push_str("\nCurrent work in progress:\n");
+            context.push_str(&rendered);
+        }
+        context.push_str("\nEND HISTORICAL CONTEXT");
+        Ok(context)
     }
 
     pub fn prompt_context(&self, cwd: &Path, prompt: &str, session_key: &str) -> Result<String> {
@@ -991,27 +1004,39 @@ impl Menvane {
         diagnostics.handoff_match_terms.sort();
         diagnostics.handoff_required_match_count = required_match_count;
         let mut context = String::new();
-        let related_handoff = session_rendering::render_handoff_items(&related, 2_000);
-        let related_content_id = content_identifier(&session_rendering::render_handoff_items(
-            &related,
-            usize::MAX,
-        ));
         diagnostics.handoff_reason = if prompt_tokens.is_empty() {
             "no-meaningful-prompt-terms".to_owned()
         } else if !has_handoff_items {
             "no-current-handoff".to_owned()
         } else if related.is_empty() {
             "insufficient-overlap".to_owned()
-        } else if self.sessions.claim_delivery(
-            &identity,
-            HANDOFF_DELIVERY_KIND,
-            &related_content_id,
-        )? {
-            context.push_str("MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n[CURRENT HANDOFF]\n");
-            context.push_str(&related_handoff);
-            "delivered".to_owned()
         } else {
-            "already-delivered".to_owned()
+            let mut delivered = 0;
+            for item in &related {
+                let rendered =
+                    session_rendering::render_handoff_items(std::slice::from_ref(item), 2_000);
+                let content_id = format!("{}:{}", item.id, content_identifier(&rendered));
+                if self.sessions.claim_delivery(
+                    &identity,
+                    HANDOFF_DELIVERY_KIND,
+                    &content_id,
+                    &item.id.to_string(),
+                    &item.state,
+                    &rendered,
+                )? {
+                    if context.is_empty() {
+                        context.push_str(&historical_context_header());
+                    }
+                    context.push_str("\nCurrent work in progress:\n");
+                    context.push_str(&rendered);
+                    delivered += 1;
+                }
+            }
+            if delivered > 0 {
+                "delivered".to_owned()
+            } else {
+                "already-delivered".to_owned()
+            }
         };
         for result in &results {
             let entry = format!(
@@ -1021,10 +1046,21 @@ impl Menvane {
             if context.chars().count() + entry.chars().count() > 6_000 {
                 break;
             }
-            if self
-                .sessions
-                .claim_delivery(&identity, "memory", &result.id.to_string())?
-            {
+            let kind = match result.knowledge_type {
+                KnowledgeType::Memory => "memory",
+                KnowledgeType::Playbook => "playbook",
+            };
+            if self.sessions.claim_delivery(
+                &identity,
+                kind,
+                &result.id.to_string(),
+                &result.id.to_string(),
+                &result.title,
+                &result.excerpt,
+            )? {
+                if context.is_empty() {
+                    context.push_str(&historical_context_header());
+                }
                 context.push_str(&entry);
                 if result.knowledge_type == KnowledgeType::Memory {
                     self.record_memory_reinforcement(result.id, ReinforcementSignal::Injected)?;
@@ -1032,7 +1068,7 @@ impl Menvane {
             }
         }
         if !context.is_empty() {
-            context.push_str("\n\nEND MENVANE MEMORY CONTEXT");
+            context.push_str("\n\nEND HISTORICAL CONTEXT");
         }
         Ok((context, diagnostics))
     }
@@ -1615,6 +1651,7 @@ impl Menvane {
                 session.project_id.as_deref(),
             )?,
             related_memories: self.related_memories(&events, session.project_id.as_deref())?,
+            delivered_context: self.sessions.delivered_context(&session)?,
         };
         let prompt = self
             .config
@@ -1643,6 +1680,9 @@ impl Menvane {
         project_id: Option<&str>,
         result: &ConsolidationResult,
     ) -> Result<()> {
+        let session = self.sessions.session(session_id)?;
+        self.sessions
+            .record_context_evaluations(&session, &result.context_evaluations)?;
         for (index, operation) in result.handoff.iter().enumerate() {
             self.apply_handoff_operation(session_id, project_id, index, operation)?;
         }
@@ -2437,6 +2477,11 @@ fn automatically_eligible(result: &SearchResult, project: Option<&Project>) -> b
 
 fn content_identifier(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn historical_context_header() -> String {
+    "HISTORICAL CONTEXT\nUse only when relevant. Current user instructions and repository state are authoritative.\n"
+        .to_owned()
 }
 
 fn deterministic_uuid(session_id: Uuid, parts: &[String], discriminator: &[u8]) -> Uuid {
