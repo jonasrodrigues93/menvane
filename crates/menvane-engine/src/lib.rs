@@ -1,5 +1,6 @@
 mod decay;
 mod embeddings;
+mod github_copilot_provider;
 mod oauth_provider;
 mod project_resolver;
 mod providers;
@@ -39,6 +40,7 @@ use uuid::Uuid;
 
 pub use decay::{MemoryDecay, memory_decay};
 pub use embeddings::OpenAICompatibleEmbeddingProvider;
+pub use github_copilot_provider::GithubCopilotProvider;
 pub use menvane_store::{
     ConsolidationMarker, IngestResult, JobRecord as StoreJobRecord, MAX_HANDOFF_ITEM_BYTES,
     MAX_HANDOFF_LIST_LIMIT, RecallContext, SessionEvent, SessionRecord, conversation_key,
@@ -231,6 +233,10 @@ struct LlmConfiguration {
     oauth_issuer: String,
     #[serde(default = "default_oauth_endpoint")]
     oauth_endpoint: String,
+    #[serde(default = "default_github_oauth_issuer")]
+    github_oauth_issuer: String,
+    #[serde(default)]
+    github_client_id: String,
     #[serde(default)]
     consolidation_prompt: Option<String>,
     #[serde(default)]
@@ -247,6 +253,8 @@ impl Default for LlmConfiguration {
             reasoning_effort: Some("medium".to_owned()),
             oauth_issuer: default_oauth_issuer(),
             oauth_endpoint: default_oauth_endpoint(),
+            github_oauth_issuer: default_github_oauth_issuer(),
+            github_client_id: String::new(),
             consolidation_prompt: None,
             fallback: None,
         }
@@ -279,6 +287,12 @@ fn default_oauth_issuer() -> String {
 }
 fn default_oauth_endpoint() -> String {
     "https://chatgpt.com/backend-api/codex/responses".to_owned()
+}
+fn default_github_oauth_issuer() -> String {
+    "https://github.com".to_owned()
+}
+fn default_github_api_endpoint() -> String {
+    "https://api.githubcopilot.com".to_owned()
 }
 
 fn default_embedding_min_similarity() -> f64 {
@@ -1230,6 +1244,66 @@ impl Menvane {
         );
         llm.remove("base_url");
         llm.remove("api_key_env");
+        llm.remove("github_client_id");
+        llm.remove("github_oauth_issuer");
+        if let Some(value) = reasoning_effort {
+            llm.insert(
+                "reasoning_effort".to_owned(),
+                toml::Value::String(value.to_owned()),
+            );
+        }
+        atomic_replace(
+            &self.home.join("config.toml"),
+            toml::to_string_pretty(&configuration)?.as_bytes(),
+        )
+    }
+
+    pub fn configure_github_copilot(
+        &self,
+        model: &str,
+        reasoning_effort: Option<&str>,
+        client_id: &str,
+    ) -> Result<()> {
+        if model.trim().is_empty() {
+            bail!("GitHub Copilot model cannot be empty");
+        }
+        if client_id.trim().is_empty() {
+            bail!("GitHub OAuth client ID cannot be empty");
+        }
+        if reasoning_effort
+            .is_some_and(|value| !matches!(value, "minimal" | "low" | "medium" | "high" | "xhigh"))
+        {
+            bail!("reasoning effort must be minimal, low, medium, high, or xhigh");
+        }
+        let mut configuration: toml::Table = toml::from_str(&self.configuration_text()?)?;
+        let llm = configuration
+            .entry("llm")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("llm configuration must be a table")?;
+        llm.insert(
+            "provider".to_owned(),
+            toml::Value::String("github-copilot".to_owned()),
+        );
+        llm.insert(
+            "model".to_owned(),
+            toml::Value::String(model.trim().to_owned()),
+        );
+        llm.insert(
+            "github_client_id".to_owned(),
+            toml::Value::String(client_id.trim().to_owned()),
+        );
+        llm.insert(
+            "github_oauth_issuer".to_owned(),
+            toml::Value::String(default_github_oauth_issuer()),
+        );
+        llm.insert(
+            "base_url".to_owned(),
+            toml::Value::String(default_github_api_endpoint()),
+        );
+        llm.remove("api_key_env");
+        llm.remove("oauth_issuer");
+        llm.remove("oauth_endpoint");
         if let Some(value) = reasoning_effort {
             llm.insert(
                 "reasoning_effort".to_owned(),
@@ -1260,6 +1334,32 @@ impl Menvane {
             &self.home,
             &self.config.llm.model,
             self.config.llm.reasoning_effort.clone(),
+        )
+        .logout()
+        .map_err(anyhow::Error::new)
+    }
+
+    pub async fn login_github_copilot(&self) -> Result<()> {
+        GithubCopilotProvider::with_endpoints(
+            &self.home,
+            &self.config.llm.model,
+            self.config.llm.reasoning_effort.clone(),
+            &self.config.llm.github_client_id,
+            &self.config.llm.github_oauth_issuer,
+            &self.config.llm.base_url,
+        )
+        .login()
+        .await
+        .map_err(anyhow::Error::new)
+    }
+
+    pub fn logout_github_copilot(&self) -> Result<()> {
+        GithubCopilotProvider::new(
+            &self.home,
+            &self.config.llm.model,
+            self.config.llm.reasoning_effort.clone(),
+            &self.config.llm.github_client_id,
+            &self.config.llm.base_url,
         )
         .logout()
         .map_err(anyhow::Error::new)
@@ -2363,6 +2463,18 @@ fn provider_from_configuration(
             )
             .with_reasoning_effort(configuration.reasoning_effort.clone()),
         )),
+        "github-copilot" | "copilot" => Ok(Arc::new(GithubCopilotProvider::with_endpoints(
+            home,
+            &configuration.model,
+            configuration.reasoning_effort.clone(),
+            &configuration.github_client_id,
+            &configuration.github_oauth_issuer,
+            if configuration.base_url == default_api_url() {
+                default_github_api_endpoint()
+            } else {
+                configuration.base_url.clone()
+            },
+        ))),
         "openrouter" => {
             if configuration.model.trim().is_empty() || configuration.model == "default" {
                 bail!("OpenRouter requires an explicit model");

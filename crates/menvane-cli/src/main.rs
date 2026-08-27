@@ -131,6 +131,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_github_copilot_provider_commands() {
+        assert!(
+            Cli::try_parse_from([
+                "menvane",
+                "provider",
+                "configure",
+                "github-copilot",
+                "--model",
+                "gpt-4.1",
+                "--client-id",
+                "client-id"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["menvane", "provider", "login", "github-copilot"]).is_ok());
+    }
+
+    #[test]
     fn handoff_inspect_contract_is_versioned() {
         let value: Value = serde_json::json!({
             "project_id": "project",
@@ -174,11 +192,14 @@ struct ProviderConfigureArgs {
     model: String,
     #[arg(long, value_enum, default_value = "medium")]
     reasoning_effort: ReasoningEffort,
+    #[arg(long)]
+    client_id: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum ConfigurableProvider {
     Openai,
+    GithubCopilot,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -510,17 +531,39 @@ async fn main() -> Result<()> {
                         configuration.model
                     );
                 }
+                ConfigurableProvider::GithubCopilot => {
+                    let client_id = configuration.client_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("GitHub Copilot configuration requires --client-id")
+                    })?;
+                    menvane.configure_github_copilot(
+                        &configuration.model,
+                        Some(configuration.reasoning_effort.as_str()),
+                        client_id,
+                    )?;
+                    println!(
+                        "configured GitHub Copilot model {}; restart the daemon to apply",
+                        configuration.model
+                    );
+                }
             },
             ProviderCommand::Login(authentication) => match authentication.provider {
                 ConfigurableProvider::Openai => {
                     menvane.login_openai().await?;
                     println!("OpenAI ChatGPT authorization completed");
                 }
+                ConfigurableProvider::GithubCopilot => {
+                    menvane.login_github_copilot().await?;
+                    println!("GitHub Copilot authorization completed");
+                }
             },
             ProviderCommand::Logout(authentication) => match authentication.provider {
                 ConfigurableProvider::Openai => {
                     menvane.logout_openai()?;
                     println!("OpenAI ChatGPT authorization removed");
+                }
+                ConfigurableProvider::GithubCopilot => {
+                    menvane.logout_github_copilot()?;
+                    println!("GitHub Copilot authorization removed");
                 }
             },
         },

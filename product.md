@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 2.5.1
+Version: 2.5.2
 
 Menvane is a local persistent memory system for agents. Its central product is operational continuity between agents, sessions, and different days. It preserves four distinct layers:
 
@@ -140,6 +140,8 @@ The default provider is `openai`. It uses Menvane's native OpenAI OAuth Authoriz
 `menvane provider login openai` opens the system browser and waits up to five minutes for authorization. Menvane stores the resulting access token, refresh token, expiration, and optional ChatGPT account identifier in `~/.menvane/oauth/openai.json` with owner-only permissions on Unix. It refreshes expired access tokens automatically and atomically replaces the credential file. `menvane provider logout openai` removes Menvane's OpenAI credentials. Menvane never reads or modifies OpenCode or Codex credentials.
 
 `menvane provider configure openai --model <model>` selects the OAuth-backed model. `--reasoning-effort` selects `minimal`, `low`, `medium`, `high`, or `xhigh` and defaults to `medium`. The daemon must be restarted after configuration changes.
+
+The `github-copilot` provider requires a GitHub OAuth app with device flow enabled and a GitHub account with Copilot access. It uses GitHub's OAuth device authorization flow and the GitHub Copilot Chat Completions endpoint. `menvane provider configure github-copilot --model <model> --client-id <client-id>` stores the non-secret OAuth client ID and selects the provider; the daemon must be restarted after configuration changes. `menvane provider login github-copilot` displays GitHub's verification URL and user code, polls until authorization completes, verifies the GitHub identity, and stores Menvane-owned credentials at `~/.menvane/oauth/github-copilot.json` with owner-only permissions on Unix. Access tokens are refreshed when possible, and `menvane provider logout github-copilot` removes the stored credentials. Menvane never reads GitHub CLI or Copilot CLI credentials.
 
 The optional `codex` compatibility provider invokes the installed Codex CLI and uses existing local Codex authentication without reading or persisting credentials. Internal calls set `MENVANE_INTERNAL=1`, execute in an ephemeral temporary directory with a read-only sandbox, ignore user and project configuration, disable available tools and hooks, supply all evidence directly, and delete schema and response files afterward. Health distinguishes missing binary, missing authentication, unavailable explicit model, and ready state.
 
