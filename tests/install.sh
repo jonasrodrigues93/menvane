@@ -88,6 +88,7 @@ run_install() {
     architecture=$3
     mkdir -p "$test_home"
     HOME="$test_home" \
+    XDG_CONFIG_HOME="$test_home/.config" \
     MENVANE_TEST_PLATFORM="$platform" \
     MENVANE_TEST_ARCHITECTURE="$architecture" \
     PATH="$fake_bin:$PATH" \
@@ -118,6 +119,7 @@ grep -F '<string>serve</string>' "$mac_home/Library/LaunchAgents/com.jonasrodrig
 published_home=$test_root/published-home
 mkdir -p "$published_home"
 HOME="$published_home" \
+XDG_CONFIG_HOME="$published_home/.config" \
 MENVANE_TEST_PLATFORM=Linux \
 MENVANE_TEST_ARCHITECTURE=x86_64 \
 MENVANE_TEST_FIXTURE_ARCHIVE="$fixture_archive" \
@@ -129,6 +131,7 @@ PATH="$fake_bin:/usr/bin:/bin" \
 bad_home=$test_root/bad-home
 mkdir -p "$bad_home"
 if HOME="$bad_home" \
+XDG_CONFIG_HOME="$bad_home/.config" \
 MENVANE_TEST_PLATFORM=Linux \
 MENVANE_TEST_ARCHITECTURE=x86_64 \
 MENVANE_TEST_FIXTURE_ARCHIVE="$fixture_archive" \
@@ -145,6 +148,7 @@ source_home=$test_root/source-home
 source_marker=$test_root/cargo-was-used
 mkdir -p "$source_home"
 HOME="$source_home" \
+XDG_CONFIG_HOME="$source_home/.config" \
 MENVANE_TEST_PLATFORM=Linux \
 MENVANE_TEST_ARCHITECTURE=x86_64 \
 MENVANE_TEST_DOWNLOAD_FAILURE=1 \
