@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 2.5.1
+Version: 2.5.2
 
 Menvane is a local persistent memory system for agents. Its central product is operational continuity between agents, sessions, and different days. It preserves four distinct layers:
 
@@ -191,7 +191,7 @@ REST endpoints under `/api/v1` cover health, projects, memories, sessions, impor
 
 ## Backup, Restore, And Distribution
 
-The repository `install.sh` builds Menvane with Cargo by default, or accepts a prebuilt executable through `--binary`, and installs it at `~/.local/bin/menvane`. On Linux it also installs a user-scoped `menvane.service`, enables it for the user's default target, and requests an immediate non-blocking start. The service runs independently of the system boot critical path, restarts after failures, and serves both the daemon API and local UI. On macOS it installs and loads a user-scoped LaunchAgent that starts at login and restarts after failures. Reinstalling updates the executable and startup definition idempotently. On other supported platforms, the script installs the executable without configuring automatic startup.
+The repository `install.sh` installs the latest compatible published binary after verifying its SHA-256 checksum, accepts a specific release through `--version`, accepts a prebuilt executable through `--binary`, and falls back to a Cargo source build for an unpinned install when no published binary can be downloaded. A requested release that cannot be downloaded fails without selecting a different version. It installs the executable at `~/.local/bin/menvane`. On Linux it also installs a user-scoped `menvane.service`, enables it for the user's default target, and requests an immediate non-blocking start. The service runs independently of the system boot critical path, restarts after failures, and serves both the daemon API and local UI. On macOS it installs and loads a user-scoped LaunchAgent that starts at login and restarts after failures. Reinstalling updates the executable and startup definition idempotently. On other supported platforms, the script installs the executable without configuring automatic startup.
 
 `menvane backup <path>` creates a new backup directory containing the complete Markdown memory repository, non-secret configuration, consistent SQLite online backups of both `index.sqlite` and `state.sqlite`, and a checksummed manifest. Existing destinations are never overwritten. `menvane restore <path> --confirm` verifies every checksum, configuration, Markdown frontmatter, and both SQLite databases independently before staging and replacing current state. Restore refuses to run while a daemon PID is present and never replaces state without explicit confirmation. Backup and restore are capabilities independent of the product model and follow the current schema.
 

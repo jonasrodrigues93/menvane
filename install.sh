@@ -2,15 +2,21 @@
 set -eu
 
 usage() {
-    printf '%s\n' "Usage: ./install.sh [--binary PATH]"
+    printf '%s\n' "Usage: ./install.sh [--binary PATH] [--version VERSION]"
 }
 
 binary=
+version=latest
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --binary)
             [ "$#" -ge 2 ] || { usage >&2; exit 2; }
             binary=$2
+            shift 2
+            ;;
+        --version)
+            [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+            version=$2
             shift 2
             ;;
         -h|--help)
@@ -24,14 +30,149 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+case "$version" in
+    latest) ;;
+    ''|*[!A-Za-z0-9._-]*)
+        printf '%s\n' "version must contain only letters, numbers, dots, underscores, and hyphens" >&2
+        exit 2
+        ;;
+esac
+
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-if [ -z "$binary" ]; then
+release_repository=https://github.com/jonasrodrigues93/menvane
+temporary_dir=
+temporary_unit=
+temporary_agent=
+cleanup() {
+    if [ -n "$temporary_dir" ] && [ -d "$temporary_dir" ]; then
+        rm -r -- "$temporary_dir"
+    fi
+    if [ -n "$temporary_unit" ]; then
+        rm -f "$temporary_unit"
+    fi
+    if [ -n "$temporary_agent" ]; then
+        rm -f "$temporary_agent"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+build_from_source() {
     command -v cargo >/dev/null 2>&1 || {
-        printf '%s\n' "cargo is required to build Menvane" >&2
+        printf '%s\n' "no compatible published binary was found and cargo is required to build Menvane" >&2
         exit 1
     }
     cargo build --release --locked --manifest-path "$script_dir/Cargo.toml"
     binary=$script_dir/target/release/menvane
+}
+
+platform=$(uname -s)
+architecture=$(uname -m)
+release_target=
+case "$platform:$architecture" in
+    Linux:x86_64|Linux:amd64)
+        release_target=x86_64-unknown-linux-gnu
+        ;;
+    Linux:aarch64|Linux:arm64)
+        release_target=aarch64-unknown-linux-gnu
+        ;;
+    Darwin:x86_64|Darwin:amd64)
+        release_target=x86_64-apple-darwin
+        ;;
+    Darwin:arm64|Darwin:aarch64)
+        release_target=aarch64-apple-darwin
+        ;;
+esac
+
+downloader=
+if command -v curl >/dev/null 2>&1; then
+    downloader=curl
+elif command -v wget >/dev/null 2>&1; then
+    downloader=wget
+fi
+
+fetch() {
+    case "$downloader" in
+        curl)
+            curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --output "$2" "$1"
+            ;;
+        wget)
+            wget --https-only --quiet --output-document="$2" "$1"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+download_binary() {
+    archive_name=menvane-$release_target.tar.gz
+    if [ "$version" = latest ]; then
+        release_path=$release_repository/releases/latest/download
+    else
+        release_tag=$version
+        case "$release_tag" in
+            v*) ;;
+            *) release_tag=v$release_tag ;;
+        esac
+        release_path=$release_repository/releases/download/$release_tag
+    fi
+
+    temporary_dir=$(mktemp -d "${TMPDIR:-/tmp}/menvane-install.XXXXXX")
+    archive_path=$temporary_dir/$archive_name
+    checksums_path=$temporary_dir/SHA256SUMS
+    if ! fetch "$release_path/SHA256SUMS" "$checksums_path"; then
+        return 1
+    fi
+    if ! fetch "$release_path/$archive_name" "$archive_path"; then
+        return 1
+    fi
+
+    expected_checksum=$(awk -v name="$archive_name" '$2 == name { value = $1; count++ } END { if (count == 1) print value }' "$checksums_path")
+    actual_checksum=
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_checksum=$(sha256sum "$archive_path" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual_checksum=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+    else
+        printf '%s\n' "sha256sum or shasum is required to verify a published binary" >&2
+        return 2
+    fi
+    if [ -z "$expected_checksum" ] || [ "$expected_checksum" != "$actual_checksum" ]; then
+        printf 'Checksum verification failed for %s\n' "$archive_name" >&2
+        return 2
+    fi
+
+    extract_dir=$temporary_dir/extracted
+    install -d "$extract_dir"
+    if [ "$(tar -tzf "$archive_path")" != menvane ]; then
+        printf '%s\n' "published binary archive has an unexpected layout" >&2
+        return 2
+    fi
+    if ! tar -xzf "$archive_path" -C "$extract_dir" menvane; then
+        printf '%s\n' "could not extract the published binary archive" >&2
+        return 2
+    fi
+    binary=$extract_dir/menvane
+    if [ ! -f "$binary" ] || [ -L "$binary" ]; then
+        printf '%s\n' "published binary archive does not contain a regular menvane executable" >&2
+        return 2
+    fi
+}
+
+if [ -z "$binary" ]; then
+    release_status=1
+    if [ -n "$release_target" ] && [ -n "$downloader" ] && command -v tar >/dev/null 2>&1; then
+        download_binary || release_status=$?
+    fi
+    if [ -z "$binary" ]; then
+        if [ "$release_status" -eq 2 ] || [ "$version" != latest ]; then
+            if [ "$release_status" -ne 2 ]; then
+                printf 'Could not download requested release %s\n' "$version" >&2
+            fi
+            exit 1
+        fi
+        build_from_source
+    fi
 fi
 
 [ -f "$binary" ] || {
@@ -44,7 +185,6 @@ install_dir=$home/.local/bin
 installed_binary=$install_dir/menvane
 install -d "$install_dir"
 
-platform=$(uname -s)
 if [ "$platform" = Linux ]; then
     command -v systemctl >/dev/null 2>&1 || {
         printf '%s\n' "systemctl is required for automatic startup on Linux" >&2
@@ -56,7 +196,6 @@ if [ "$platform" = Linux ]; then
     install -d "$unit_dir"
     escaped_binary=$(printf '%s' "$installed_binary" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')
     temporary_unit=$unit.tmp.$$
-    trap 'rm -f "$temporary_unit"' EXIT HUP INT TERM
     printf '%s\n' \
         '[Unit]' \
         'Description=Menvane local memory daemon and UI' \
@@ -72,7 +211,7 @@ if [ "$platform" = Linux ]; then
         'WantedBy=default.target' > "$temporary_unit"
     chmod 644 "$temporary_unit"
     mv "$temporary_unit" "$unit"
-    trap - EXIT HUP INT TERM
+    temporary_unit=
 
     systemctl --user daemon-reload
     systemctl --user enable menvane.service
@@ -93,7 +232,6 @@ elif [ "$platform" = Darwin ]; then
     escaped_binary=$(printf '%s' "$installed_binary" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g; s/"/\\&quot;/g; s/'"'"'/\\&apos;/g')
     escaped_log_dir=$(printf '%s' "$log_dir" | sed 's/&/\\&amp;/g; s/</\\&lt;/g; s/>/\\&gt;/g; s/"/\\&quot;/g; s/'"'"'/\\&apos;/g')
     temporary_agent=$launch_agent.tmp.$$
-    trap 'rm -f "$temporary_agent"' EXIT HUP INT TERM
     printf '%s\n' \
         '<?xml version="1.0" encoding="UTF-8"?>' \
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -118,7 +256,7 @@ elif [ "$platform" = Darwin ]; then
         '</plist>' > "$temporary_agent"
     chmod 644 "$temporary_agent"
     mv "$temporary_agent" "$launch_agent"
-    trap - EXIT HUP INT TERM
+    temporary_agent=
     launch_domain="gui/$(id -u)"
     launchctl bootout "$launch_domain" "$launch_agent" >/dev/null 2>&1 || true
     launchctl bootstrap "$launch_domain" "$launch_agent"
