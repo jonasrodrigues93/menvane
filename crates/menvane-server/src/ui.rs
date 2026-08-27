@@ -407,7 +407,7 @@ async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
                 .unwrap_or_else(|| fallback.to_owned())
         };
         format!(
-            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
+            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>GitHub OAuth client ID<input name='github_client_id' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
             page_head("Settings", "Observable runtime configuration."),
             get("capture", "max_prompt_bytes", "16384"),
             get("capture", "max_tool_input_bytes", "4096"),
@@ -420,6 +420,7 @@ async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
             reasoning_options(&get("llm", "reasoning_effort", "medium")),
             escape_attribute(&get("llm", "base_url", "https://api.openai.com/v1")),
             escape_attribute(&get("llm", "api_key_env", "OPENAI_API_KEY")),
+            escape_attribute(&get("llm", "github_client_id", "")),
             escape(&get("llm", "consolidation_prompt", "")),
         )
     });
@@ -451,6 +452,8 @@ struct SettingsEdit {
     reasoning_effort: String,
     base_url: String,
     api_key_env: String,
+    #[serde(default)]
+    github_client_id: Option<String>,
     consolidation_prompt: String,
 }
 
@@ -528,6 +531,17 @@ async fn update_settings(
                 .as_table_mut()
                 .ok_or_else(|| anyhow::anyhow!("{section} configuration must be a table"))?
                 .insert(key.to_owned(), value);
+        }
+        if let Some(client_id) = edit.github_client_id {
+            configuration
+                .entry("llm")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .ok_or_else(|| anyhow::anyhow!("llm configuration must be a table"))?
+                .insert(
+                    "github_client_id".to_owned(),
+                    toml::Value::String(client_id.trim().to_owned()),
+                );
         }
         menvane.update_configuration_text(&toml::to_string_pretty(&configuration)?)
     })();

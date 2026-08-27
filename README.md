@@ -174,6 +174,19 @@ menvane provider status
 
 Authorization opens OpenAI in the system browser. Menvane stores its own refreshable credentials under `~/.menvane/oauth/` and never reads credentials from OpenCode or Codex.
 
+GitHub Copilot can be enabled with GitHub's OAuth device flow:
+
+Prerequisites: a GitHub OAuth app with device flow enabled and a GitHub account with Copilot access. Use the app's client ID; no client secret is required.
+
+```bash
+menvane provider configure github-copilot --model gpt-4.1 --client-id <github-oauth-client-id>
+menvane provider login github-copilot
+menvane daemon restart
+menvane provider status
+```
+
+The login command prints a GitHub verification URL and user code. Menvane stores its own refreshable credentials under `~/.menvane/oauth/github-copilot.json` and never reads GitHub CLI or Copilot CLI credentials.
+
 ## Integrations
 
 | Client | Connect command | Captured lifecycle |

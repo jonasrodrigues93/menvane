@@ -174,6 +174,19 @@ menvane provider status
 
 A autorização abre o OpenAI no navegador do sistema. O Menvane armazena suas próprias credenciais renováveis em `~/.menvane/oauth/` e nunca lê credenciais do OpenCode ou Codex.
 
+O GitHub Copilot pode ser ativado com o fluxo de dispositivo OAuth do GitHub:
+
+Pré-requisitos: uma aplicação OAuth do GitHub com o fluxo de dispositivo ativado e uma conta do GitHub com acesso ao Copilot. Use o client ID da aplicação; nenhum client secret é necessário.
+
+```bash
+menvane provider configure github-copilot --model gpt-4.1 --client-id <github-oauth-client-id>
+menvane provider login github-copilot
+menvane daemon restart
+menvane provider status
+```
+
+O comando de login exibe uma URL de verificação do GitHub e um código de usuário. O Menvane armazena suas próprias credenciais renováveis em `~/.menvane/oauth/github-copilot.json` e nunca lê credenciais do GitHub CLI ou Copilot CLI.
+
 ## Integrações
 
 | Cliente | Comando de conexão | Ciclo de vida capturado |
