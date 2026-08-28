@@ -407,8 +407,7 @@ async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
                 .unwrap_or_else(|| fallback.to_owned())
         };
         format!(
-            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Open-session inactivity seconds<input name='open_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
-            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Open-session inactivity seconds<input name='open_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>GitHub OAuth client ID<input name='github_client_id' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
+            "{}<section class='panel callout'><p>Configure behavior using the fields below. Secret values remain environment-only. Restart the daemon after changes.</p></section><form class='settings-form panel' method='post'><fieldset><legend>Capture</legend><label>Maximum prompt bytes<input name='max_prompt_bytes' type='number' min='1' value='{}'></label><label>Maximum tool input bytes<input name='max_tool_input_bytes' type='number' min='1' value='{}'></label><label>Maximum tool output bytes<input name='max_tool_output_bytes' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Sessions and jobs</legend><label>Idle finalization seconds<input name='idle_finalize_seconds' type='number' min='1' value='{}'></label><label>Open-session inactivity seconds<input name='open_finalize_seconds' type='number' min='1' value='{}'></label><label>Job lease timeout seconds<input name='lease_timeout_seconds' type='number' min='1' value='{}'></label><label>Memory lifetime in days<input name='memory_lifetime_days' type='number' min='1' value='{}'></label></fieldset><fieldset><legend>Automatic recall</legend><label>Minimum match confidence<input name='min_match_confidence' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Minimum knowledge confidence<input name='min_knowledge_confidence' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Minimum observed utility<input name='min_utility' type='number' min='0' max='1' step='0.01' value='{}'></label><label>Maximum cards<input name='max_cards' type='number' min='1' max='3' value='{}'></label></fieldset><fieldset><legend>Language model</legend><label>Provider<input name='provider' value='{}'></label><label>Model<input name='model' value='{}'></label><label>Reasoning effort<select name='reasoning_effort'>{}</select></label><label>Base URL<input name='base_url' type='url' value='{}'></label><label>API key environment variable<input name='api_key_env' value='{}'></label><label>GitHub OAuth client ID<input name='github_client_id' value='{}'></label><label>Consolidation prompt<textarea name='consolidation_prompt' rows='8'>{}</textarea></label></fieldset><div class='editor-actions'><button>Validate and save</button><a class='quiet-link' href='/'>Cancel</a></div></form>",
             page_head("Settings", "Observable runtime configuration."),
             get("capture", "max_prompt_bytes", "16384"),
             get("capture", "max_tool_input_bytes", "4096"),
@@ -417,6 +416,10 @@ async fn settings(State(menvane): State<Arc<Menvane>>) -> Response {
             get("sessions", "open_finalize_seconds", "1800"),
             get("jobs", "lease_timeout_seconds", "300"),
             get("decay", "memory_lifetime_days", "90"),
+            get("recall", "min_match_confidence", "0.45"),
+            get("recall", "min_knowledge_confidence", "0.55"),
+            get("recall", "min_utility", "0.55"),
+            get("recall", "max_cards", "3"),
             get("llm", "provider", "openai"),
             get("llm", "model", "gpt-5.6-luna"),
             reasoning_options(&get("llm", "reasoning_effort", "medium")),
@@ -450,6 +453,10 @@ struct SettingsEdit {
     open_finalize_seconds: u64,
     lease_timeout_seconds: u64,
     memory_lifetime_days: u64,
+    min_match_confidence: f64,
+    min_knowledge_confidence: f64,
+    min_utility: f64,
+    max_cards: u64,
     provider: String,
     model: String,
     reasoning_effort: String,
@@ -501,6 +508,26 @@ async fn update_settings(
                 "decay",
                 "memory_lifetime_days",
                 toml::Value::Integer(edit.memory_lifetime_days as i64),
+            ),
+            (
+                "recall",
+                "min_match_confidence",
+                toml::Value::Float(edit.min_match_confidence),
+            ),
+            (
+                "recall",
+                "min_knowledge_confidence",
+                toml::Value::Float(edit.min_knowledge_confidence),
+            ),
+            (
+                "recall",
+                "min_utility",
+                toml::Value::Float(edit.min_utility),
+            ),
+            (
+                "recall",
+                "max_cards",
+                toml::Value::Integer(edit.max_cards as i64),
             ),
             (
                 "llm",

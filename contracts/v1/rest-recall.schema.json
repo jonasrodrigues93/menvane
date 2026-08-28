@@ -34,6 +34,11 @@
             "delivered",
             "already-delivered"
           ]
+        },
+        "candidates_considered": { "type": "integer", "minimum": 0 },
+        "abstention_reason": {
+          "type": "string",
+          "enum": ["none", "insufficient-intent", "below-confidence"]
         }
       },
       "required": [
@@ -42,7 +47,9 @@
         "handoff_scope",
         "handoff_match_terms",
         "handoff_required_match_count",
-        "handoff_reason"
+        "handoff_reason",
+        "candidates_considered",
+        "abstention_reason"
       ],
       "additionalProperties": false
     }
