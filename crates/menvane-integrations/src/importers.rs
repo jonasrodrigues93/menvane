@@ -141,8 +141,7 @@ impl JsonlImporter {
                 normalize_codex_record(&record, &mut codex_tool_calls)
                     .unwrap_or_else(|| normalize_record(&record))
             } else if self.client == "antigravity" {
-                normalize_antigravity_record(&record)
-                    .unwrap_or_else(|| normalize_record(&record))
+                normalize_antigravity_record(&record).unwrap_or_else(|| normalize_record(&record))
             } else {
                 normalize_record(&record)
             };
@@ -360,28 +359,28 @@ fn normalize_antigravity_record(record: &Value) -> Option<Option<ImportedEvent>>
         }
         "PLANNER_RESPONSE" => {
             let tool_calls = record.get("tool_calls").and_then(Value::as_array);
-            if let Some(tool_calls) = tool_calls {
-                if let Some(tool) = tool_calls.first() {
-                    let tool_name = tool
-                        .get("name")
-                        .or_else(|| tool.get("tool_name"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    let input = tool
-                        .get("args")
-                        .or_else(|| tool.get("arguments"))
-                        .map(value_text);
-                    let output = record.get("content").map(value_text);
-                    return Some(Some((
-                        NormalizedEventKind::ToolCompleted,
-                        input,
-                        output,
-                        tool_name,
-                        Some(true),
-                        NormalizedEventOrigin::Tool,
-                        NormalizedEventRole::ToolActivity,
-                    )));
-                }
+            if let Some(tool_calls) = tool_calls
+                && let Some(tool) = tool_calls.first()
+            {
+                let tool_name = tool
+                    .get("name")
+                    .or_else(|| tool.get("tool_name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let input = tool
+                    .get("args")
+                    .or_else(|| tool.get("arguments"))
+                    .map(value_text);
+                let output = record.get("content").map(value_text);
+                return Some(Some((
+                    NormalizedEventKind::ToolCompleted,
+                    input,
+                    output,
+                    tool_name,
+                    Some(true),
+                    NormalizedEventOrigin::Tool,
+                    NormalizedEventRole::ToolActivity,
+                )));
             }
             Some(None)
         }

@@ -438,8 +438,10 @@ async fn main() -> Result<()> {
                 );
             }
             ConnectClient::Antigravity => {
-                let installer =
-                    AntigravityInstaller::new(AntigravityPaths::discover()?, std::env::current_exe()?);
+                let installer = AntigravityInstaller::new(
+                    AntigravityPaths::discover()?,
+                    std::env::current_exe()?,
+                );
                 let changed = installer.connect()?;
                 menvane.set_integration_connected("antigravity", true)?;
                 println!(
@@ -507,8 +509,10 @@ async fn main() -> Result<()> {
                 );
             }
             Client::Antigravity => {
-                let installer =
-                    AntigravityInstaller::new(AntigravityPaths::discover()?, std::env::current_exe()?);
+                let installer = AntigravityInstaller::new(
+                    AntigravityPaths::discover()?,
+                    std::env::current_exe()?,
+                );
                 let changed = installer.disconnect()?;
                 menvane.set_integration_connected("antigravity", false)?;
                 println!(

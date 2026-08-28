@@ -6,8 +6,8 @@ use axum::extract::{Form, Path, Query, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use menvane_domain::{
-    Applicability, HandoffItem, HandoffItemKind, KnowledgeRecord, KnowledgeType,
-    NormalizedEvent, NormalizedEventKind, Project, ProviderHealth,
+    Applicability, HandoffItem, HandoffItemKind, KnowledgeRecord, KnowledgeType, NormalizedEvent,
+    NormalizedEventKind, Project, ProviderHealth,
 };
 use menvane_engine::{Menvane, ScopeSelection};
 use serde::Deserialize;
@@ -253,14 +253,46 @@ async fn memories(
             ),
             icon_search(),
             escape_attribute(filters.q.as_deref().unwrap_or_default()),
-            if selected_type == "memory" { " selected" } else { "" },
-            if selected_type == "playbook" { " selected" } else { "" },
-            if selected_scope == "project" { " selected" } else { "" },
-            if selected_scope == "global" { " selected" } else { "" },
-            if selected_status == "active" { " selected" } else { "" },
-            if selected_status == "candidate" { " selected" } else { "" },
-            if selected_status == "quarantined" { " selected" } else { "" },
-            if selected_status == "forgotten" { " selected" } else { "" },
+            if selected_type == "memory" {
+                " selected"
+            } else {
+                ""
+            },
+            if selected_type == "playbook" {
+                " selected"
+            } else {
+                ""
+            },
+            if selected_scope == "project" {
+                " selected"
+            } else {
+                ""
+            },
+            if selected_scope == "global" {
+                " selected"
+            } else {
+                ""
+            },
+            if selected_status == "active" {
+                " selected"
+            } else {
+                ""
+            },
+            if selected_status == "candidate" {
+                " selected"
+            } else {
+                ""
+            },
+            if selected_status == "quarantined" {
+                " selected"
+            } else {
+                ""
+            },
+            if selected_status == "forgotten" {
+                " selected"
+            } else {
+                ""
+            },
             filtered.len(),
             memory_list(&filtered, &names, &menvane)
         ))
@@ -423,11 +455,21 @@ fn summary_section(summary: Option<&menvane_domain::EpisodicSummary>) -> String 
     };
 
     let outcome_pill = match summary.outcome {
-        menvane_domain::SummaryOutcome::Completed => "<span class='status-pill success'>Completed</span>",
-        menvane_domain::SummaryOutcome::Advanced => "<span class='status-pill info'>Advanced</span>",
-        menvane_domain::SummaryOutcome::Blocked => "<span class='status-pill warning'>Blocked</span>",
-        menvane_domain::SummaryOutcome::Abandoned => "<span class='status-pill danger'>Abandoned</span>",
-        menvane_domain::SummaryOutcome::Inconclusive => "<span class='status-pill neutral'>Inconclusive</span>",
+        menvane_domain::SummaryOutcome::Completed => {
+            "<span class='status-pill success'>Completed</span>"
+        }
+        menvane_domain::SummaryOutcome::Advanced => {
+            "<span class='status-pill info'>Advanced</span>"
+        }
+        menvane_domain::SummaryOutcome::Blocked => {
+            "<span class='status-pill warning'>Blocked</span>"
+        }
+        menvane_domain::SummaryOutcome::Abandoned => {
+            "<span class='status-pill danger'>Abandoned</span>"
+        }
+        menvane_domain::SummaryOutcome::Inconclusive => {
+            "<span class='status-pill neutral'>Inconclusive</span>"
+        }
     };
 
     format!(
@@ -452,12 +494,15 @@ fn consolidation_section(consolidation: Option<&menvane_engine::ConsolidationMar
         execution.latency_ms,
         execution.attempts,
         match (execution.input_tokens, execution.output_tokens) {
-            (Some(input), Some(output)) => format!("<span class='badge' style='background:var(--bg-muted);'>{input} in</span> <span class='badge' style='background:var(--bg-muted);'>{output} out</span>"),
+            (Some(input), Some(output)) => format!(
+                "<span class='badge' style='background:var(--bg-muted);'>{input} in</span> <span class='badge' style='background:var(--bg-muted);'>{output} out</span>"
+            ),
             _ => "<span class='text-muted'>Not reported</span>".to_owned(),
         },
-        execution
-            .credits
-            .map_or_else(|| "<span class='text-muted'>Not reported</span>".to_owned(), |credits| credits.to_string()),
+        execution.credits.map_or_else(
+            || "<span class='text-muted'>Not reported</span>".to_owned(),
+            |credits| credits.to_string()
+        ),
     )
 }
 
@@ -507,7 +552,10 @@ async fn handoff_detail(
         .map(|handoff| {
             format!(
                 "{}<section class='panel'>{}</section>",
-                page_head("Current Handoff", "Live work fronts preserving continuity across sessions."),
+                page_head(
+                    "Current Handoff",
+                    "Live work fronts preserving continuity across sessions."
+                ),
                 handoff_sections(handoff.as_ref())
             )
         });
@@ -876,8 +924,12 @@ fn metric(icon: String, label: &str, value: usize, detail: &str) -> String {
 fn session_row(session: &menvane_engine::SessionRecord) -> String {
     let outcome_badge = match session.summary_status {
         menvane_domain::SummaryStatus::Ready => "<span class='status-pill success'>Ready</span>",
-        menvane_domain::SummaryStatus::Pending => "<span class='status-pill warning'>Pending</span>",
-        menvane_domain::SummaryStatus::Skipped => "<span class='status-pill neutral'>Skipped</span>",
+        menvane_domain::SummaryStatus::Pending => {
+            "<span class='status-pill warning'>Pending</span>"
+        }
+        menvane_domain::SummaryStatus::Skipped => {
+            "<span class='status-pill neutral'>Skipped</span>"
+        }
     };
     let state_class = match session.state {
         menvane_domain::SessionState::Open => "open",
@@ -920,19 +972,34 @@ fn technologies(project: &Project) -> String {
 fn render_tech_chips(technologies: &menvane_domain::ProjectTechnologies) -> String {
     let mut chips = Vec::new();
     for item in &technologies.languages {
-        chips.push(format!("<span class='tech-chip lang'>{}</span>", escape(item)));
+        chips.push(format!(
+            "<span class='tech-chip lang'>{}</span>",
+            escape(item)
+        ));
     }
     for item in &technologies.frameworks {
-        chips.push(format!("<span class='tech-chip framework'>{}</span>", escape(item)));
+        chips.push(format!(
+            "<span class='tech-chip framework'>{}</span>",
+            escape(item)
+        ));
     }
     for item in &technologies.tools {
-        chips.push(format!("<span class='tech-chip tool'>{}</span>", escape(item)));
+        chips.push(format!(
+            "<span class='tech-chip tool'>{}</span>",
+            escape(item)
+        ));
     }
     for item in &technologies.databases {
-        chips.push(format!("<span class='tech-chip db'>{}</span>", escape(item)));
+        chips.push(format!(
+            "<span class='tech-chip db'>{}</span>",
+            escape(item)
+        ));
     }
     for item in &technologies.platforms {
-        chips.push(format!("<span class='tech-chip platform'>{}</span>", escape(item)));
+        chips.push(format!(
+            "<span class='tech-chip platform'>{}</span>",
+            escape(item)
+        ));
     }
     if chips.is_empty() {
         "<span class='text-muted'>Standard environment</span>".to_owned()
@@ -947,19 +1014,54 @@ fn render_applicability_chips(applicability: &Applicability) -> String {
     }
     let mut parts = Vec::new();
     if !applicability.languages.is_empty() {
-        parts.push(format!("<div class='applies-row'><span>Languages:</span> {}</div>", applicability.languages.iter().map(|l| format!("<span class='tag-chip'>{}</span>", escape(l))).collect::<String>()));
+        parts.push(format!(
+            "<div class='applies-row'><span>Languages:</span> {}</div>",
+            applicability
+                .languages
+                .iter()
+                .map(|l| format!("<span class='tag-chip'>{}</span>", escape(l)))
+                .collect::<String>()
+        ));
     }
     if !applicability.frameworks.is_empty() {
-        parts.push(format!("<div class='applies-row'><span>Frameworks:</span> {}</div>", applicability.frameworks.iter().map(|f| format!("<span class='tag-chip'>{}</span>", escape(f))).collect::<String>()));
+        parts.push(format!(
+            "<div class='applies-row'><span>Frameworks:</span> {}</div>",
+            applicability
+                .frameworks
+                .iter()
+                .map(|f| format!("<span class='tag-chip'>{}</span>", escape(f)))
+                .collect::<String>()
+        ));
     }
     if !applicability.tools.is_empty() {
-        parts.push(format!("<div class='applies-row'><span>Tools:</span> {}</div>", applicability.tools.iter().map(|t| format!("<span class='tag-chip'>{}</span>", escape(t))).collect::<String>()));
+        parts.push(format!(
+            "<div class='applies-row'><span>Tools:</span> {}</div>",
+            applicability
+                .tools
+                .iter()
+                .map(|t| format!("<span class='tag-chip'>{}</span>", escape(t)))
+                .collect::<String>()
+        ));
     }
     if !applicability.databases.is_empty() {
-        parts.push(format!("<div class='applies-row'><span>Databases:</span> {}</div>", applicability.databases.iter().map(|d| format!("<span class='tag-chip'>{}</span>", escape(d))).collect::<String>()));
+        parts.push(format!(
+            "<div class='applies-row'><span>Databases:</span> {}</div>",
+            applicability
+                .databases
+                .iter()
+                .map(|d| format!("<span class='tag-chip'>{}</span>", escape(d)))
+                .collect::<String>()
+        ));
     }
     if !applicability.platforms.is_empty() {
-        parts.push(format!("<div class='applies-row'><span>Platforms:</span> {}</div>", applicability.platforms.iter().map(|p| format!("<span class='tag-chip'>{}</span>", escape(p))).collect::<String>()));
+        parts.push(format!(
+            "<div class='applies-row'><span>Platforms:</span> {}</div>",
+            applicability
+                .platforms
+                .iter()
+                .map(|p| format!("<span class='tag-chip'>{}</span>", escape(p)))
+                .collect::<String>()
+        ));
     }
     parts.join("")
 }
@@ -1123,16 +1225,38 @@ fn handoff_kind(kind: menvane_domain::HandoffItemKind) -> &'static str {
 
 fn session_evidence_row(event: &NormalizedEvent) -> String {
     let (icon, role_badge) = match event.kind {
-        NormalizedEventKind::SessionStarted => (icon_session(), "<span class='badge' style='background:var(--color-primary-subtle);color:var(--color-primary);'>Session Started</span>"),
-        NormalizedEventKind::UserPrompt => (icon_terminal(), "<span class='badge' style='background:var(--color-success-subtle);color:var(--color-success-text);'>User Prompt</span>"),
-        NormalizedEventKind::ToolCompleted => (icon_tool(), "<span class='badge' style='background:var(--bg-muted);color:var(--text-body);'>Tool Executed</span>"),
-        NormalizedEventKind::ContextCompacted => (icon_import(), "<span class='badge' style='background:var(--color-warning-subtle);color:var(--color-warning-text);'>Compacted</span>"),
-        NormalizedEventKind::TurnStopped => (icon_pause(), "<span class='badge' style='background:var(--bg-muted);color:var(--text-muted);'>Turn Stopped</span>"),
-        NormalizedEventKind::SessionEnded => (icon_check(), "<span class='badge' style='background:var(--color-danger-subtle);color:var(--color-danger-text);'>Session Ended</span>"),
+        NormalizedEventKind::SessionStarted => (
+            icon_session(),
+            "<span class='badge' style='background:var(--color-primary-subtle);color:var(--color-primary);'>Session Started</span>",
+        ),
+        NormalizedEventKind::UserPrompt => (
+            icon_terminal(),
+            "<span class='badge' style='background:var(--color-success-subtle);color:var(--color-success-text);'>User Prompt</span>",
+        ),
+        NormalizedEventKind::ToolCompleted => (
+            icon_tool(),
+            "<span class='badge' style='background:var(--bg-muted);color:var(--text-body);'>Tool Executed</span>",
+        ),
+        NormalizedEventKind::ContextCompacted => (
+            icon_import(),
+            "<span class='badge' style='background:var(--color-warning-subtle);color:var(--color-warning-text);'>Compacted</span>",
+        ),
+        NormalizedEventKind::TurnStopped => (
+            icon_pause(),
+            "<span class='badge' style='background:var(--bg-muted);color:var(--text-muted);'>Turn Stopped</span>",
+        ),
+        NormalizedEventKind::SessionEnded => (
+            icon_check(),
+            "<span class='badge' style='background:var(--color-danger-subtle);color:var(--color-danger-text);'>Session Ended</span>",
+        ),
     };
 
     let path_html = event.attributed_path.as_deref().map_or(String::new(), |p| {
-        format!("<span class='evidence-path'>{} {}</span>", icon_folder(), escape(p))
+        format!(
+            "<span class='evidence-path'>{} {}</span>",
+            icon_folder(),
+            escape(p)
+        )
     });
 
     let payload = event
@@ -1216,7 +1340,11 @@ fn page_head(title: &str, subtitle: &str) -> String {
 }
 
 fn empty_state(message: &str) -> String {
-    format!("<div class='empty-state'><span class='empty-icon' aria-hidden='true'>{}</span><p>{}</p></div>", icon_empty(), escape(message))
+    format!(
+        "<div class='empty-state'><span class='empty-icon' aria-hidden='true'>{}</span><p>{}</p></div>",
+        icon_empty(),
+        escape(message)
+    )
 }
 
 fn truncate_text(value: &str, limit: usize) -> String {
@@ -1297,7 +1425,10 @@ fn render_markdown(markdown: &str) -> String {
                 in_list = false;
             }
             html.push_str(&format!("<h1>{}</h1>\n", escape(heading)));
-        } else if let Some(item) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             if !in_list {
                 html.push_str("<ul class='rendered-list'>\n");
                 in_list = true;

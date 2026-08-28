@@ -329,9 +329,17 @@ fn normalize_antigravity_event(event_name: &str, payload: &Value) -> Result<Norm
     ));
 
     let (origin, role) = match kind {
-        NormalizedEventKind::UserPrompt => (NormalizedEventOrigin::User, NormalizedEventRole::UserPrompt),
-        NormalizedEventKind::ToolCompleted => (NormalizedEventOrigin::Tool, NormalizedEventRole::ToolActivity),
-        _ => (NormalizedEventOrigin::System, NormalizedEventRole::Lifecycle),
+        NormalizedEventKind::UserPrompt => {
+            (NormalizedEventOrigin::User, NormalizedEventRole::UserPrompt)
+        }
+        NormalizedEventKind::ToolCompleted => (
+            NormalizedEventOrigin::Tool,
+            NormalizedEventRole::ToolActivity,
+        ),
+        _ => (
+            NormalizedEventOrigin::System,
+            NormalizedEventRole::Lifecycle,
+        ),
     };
 
     Ok(NormalizedEvent {
@@ -349,7 +357,11 @@ fn normalize_antigravity_event(event_name: &str, payload: &Value) -> Result<Norm
         bounded_output,
         attributed_path,
         success,
-        model: payload.get("modelName").or_else(|| payload.get("model")).and_then(Value::as_str).map(str::to_owned),
+        model: payload
+            .get("modelName")
+            .or_else(|| payload.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         harness_injected: false,
     })
 }
@@ -360,12 +372,11 @@ fn read_last_user_prompt(payload: &Value) -> Option<String> {
     let reader = BufReader::new(file);
     let mut last_prompt = None;
     for line in reader.lines().map_while(Result::ok) {
-        if let Ok(item) = serde_json::from_str::<Value>(&line) {
-            if item.get("type").and_then(Value::as_str) == Some("USER_INPUT") {
-                if let Some(content) = item.get("content").and_then(Value::as_str) {
-                    last_prompt = Some(content.to_owned());
-                }
-            }
+        if let Ok(item) = serde_json::from_str::<Value>(&line)
+            && item.get("type").and_then(Value::as_str) == Some("USER_INPUT")
+            && let Some(content) = item.get("content").and_then(Value::as_str)
+        {
+            last_prompt = Some(content.to_owned());
         }
     }
     last_prompt
@@ -531,7 +542,10 @@ mod tests {
         assert_eq!(prompt_event.external_session_id, "c-1234");
         assert_eq!(prompt_event.cwd, "/workspace/project");
         assert_eq!(prompt_event.kind, NormalizedEventKind::UserPrompt);
-        assert_eq!(prompt_event.bounded_input.as_deref(), Some("implement feature x"));
+        assert_eq!(
+            prompt_event.bounded_input.as_deref(),
+            Some("implement feature x")
+        );
         assert_eq!(prompt_event.model.as_deref(), Some("gemini-2.5-pro"));
 
         let tool_event = normalize_antigravity_event(
