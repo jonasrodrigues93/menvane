@@ -57,6 +57,7 @@ async fn dashboard(State(menvane): State<Arc<Menvane>>) -> Response {
             .collect::<String>();
 
         let connections_list = [
+            ("Google Antigravity", "antigravity", "Native hooks &amp; stdio MCP server"),
             ("Claude Code", "claude-code", "CLI hooks &amp; MCP server"),
             ("Codex Agent", "codex", "CLI &amp; IDE hook integration"),
             ("OpenCode", "opencode", "Plugin &amp; MCP memory server"),
@@ -554,6 +555,7 @@ async fn render_unified_settings(menvane: &Menvane, active_tab: &str) -> Respons
 
         let integrations_data = menvane.integrations().unwrap_or_default();
         let clients = [
+            ("Google Antigravity", "antigravity", "Native lifecycle hooks (PreInvocation, PostToolUse, Stop) and stdio MCP server for memory tools.", "menvane connect antigravity"),
             ("Claude Code", "claude-code", "Lifecycle hooks (session start, user prompt, tool execution) and dedicated MCP memory tools.", "menvane connect claude"),
             ("Codex Agent", "codex", "Native MCP configuration and lifecycle hooks merged into ~/.codex/config.toml.", "menvane connect codex"),
             ("OpenCode", "opencode", "Vanilla JavaScript plugin and local MCP server registered in OpenCode config.", "menvane connect opencode"),

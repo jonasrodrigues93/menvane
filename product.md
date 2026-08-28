@@ -1,6 +1,6 @@
 # Menvane
 
-Version: 2.10.0
+Version: 2.11.0
 
 Menvane is a local persistent memory system for agents. Its central product is operational continuity between agents, sessions, and different days. It preserves four distinct layers:
 
@@ -171,6 +171,16 @@ Codex session start, user prompt, completed tool, pre- and post-compaction, stop
 
 The plugin only forwards session, message, compaction, and completed-tool activity to `menvane hook opencode`, appends returned session-start and prompt context before model dispatch, and contains no ranking, applicability, consolidation, or memory-domain logic. OpenCode payloads normalize into the same domain vocabulary and use the same daemon capture, retrieval, sanitization, trust boundary, and identity-aware delivery as Claude Code and Codex.
 
+## Google Antigravity Integration
+
+`menvane connect antigravity` installs a user-scoped Menvane MCP server in the Antigravity MCP configuration and command hooks for PreInvocation, PostToolUse, and Stop lifecycle events in the Antigravity hooks configuration. The default configuration directory is `~/.gemini/config`, overridable by `ANTIGRAVITY_CONFIG_DIR`. It preserves unrelated configuration, creates timestamped backups before changes, and is idempotent. `menvane disconnect antigravity` removes only entries whose command and MCP definition are owned by the current Menvane executable. Menvane does not create or modify Antigravity skills, rules, or `AGENTS.md`.
+
+Antigravity hooks normalize client payloads before domain ingestion and ensure the daemon is running. Hooks originating from `MENVANE_INTERNAL=1` are ignored. Reliably attributed ignored paths are dropped and all capture is sanitized before local daemon transport. The hook reads the conversation ID from `conversationId` or `conversation_id`, workspace paths from `workspacePaths`, user messages from `userMessage`, tool calls from `toolCall`, and model name from `modelName`. When the user prompt is not directly available in the payload, the hook reads the last `USER_INPUT` entry from the transcript file referenced in `transcriptPath`.
+
+PreInvocation hooks inject relevant recalled context as ephemeral messages using the `injectSteps` response format. PostToolUse hooks capture tool activity without injection. Stop hooks return an allow decision. Project-scoped hooks use the same bounded automatic recall, relevance, deduplication, and trust boundary as Claude Code, Codex, and OpenCode; global session start injects nothing.
+
+`menvane import antigravity` recursively discovers JSONL transcript files under `~/.gemini/antigravity-cli/brain`, `~/.gemini/antigravity/brain`, and `~/.gemini/antigravity-ide/brain`. Readers stream line by line with a ten-megabyte record bound. Antigravity transcript records of type `USER_INPUT` become user prompts and records of type `PLANNER_RESPONSE` with tool calls become tool-completed events; other record types are skipped. Import uses the same idempotent session pipeline as other clients.
+
 ## Maintenance
 
 Memories have configurable temporal decay with a default lifetime of 90 days; playbooks have no temporal decay. The score uses exponential time decay normalized to zero at the configured lifetime plus a logarithmic reinforcement bonus whose effect also decays over time. Only MCP reads and actual agent injection count as reinforcement. At score zero, an active memory becomes `forgotten`, leaves automatic recall and injection, and remains inspectable through explicit MCP access. An MCP read can revive a memory forgotten by decay when the resulting score becomes positive. A manually forgotten memory is not revived implicitly.
@@ -179,7 +189,7 @@ Menvane records retrieved, injected, MCP-read, successfully applied, and failed 
 
 ## Historical Import
 
-`menvane import claude` and `menvane import codex` recursively discover supported JSONL session files under configured client homes. Readers stream line by line, enforce a one-megabyte record bound, skip and count malformed records, ignore unknown event types, and retain only useful user and tool evidence. Codex checks both active and archived session directories and pairs supported tool-call records with their output records into one normalized tool-completed event while excluding assistant reasoning and messages. `menvane import opencode` uses the configured local OpenCode HTTP API rather than scraping private storage. An optional positional window such as `7d` imports only sessions with activity in the last seven days; only day-based windows are supported.
+`menvane import claude`, `menvane import codex`, and `menvane import antigravity` recursively discover supported JSONL session files under configured client homes. Readers stream line by line, enforce a configurable record bound, skip and count malformed records, ignore unknown event types, and retain only useful user and tool evidence. Codex checks both active and archived session directories and pairs supported tool-call records with their output records into one normalized tool-completed event while excluding assistant reasoning and messages. Antigravity readers parse transcript JSONL, mapping `USER_INPUT` records to user prompts and `PLANNER_RESPONSE` records with tool calls to tool-completed events. `menvane import opencode` uses the configured local OpenCode HTTP API rather than scraping private storage. An optional positional window such as `7d` imports only sessions with activity in the last seven days; only day-based windows are supported.
 
 All importers produce client-independent normalized sessions and pass them through the normal session pipeline; they never create consolidated knowledge directly. External formats are treated as versioned best-effort input. Reimport uses client plus external session identifier and is idempotent: importing the same session twice never duplicates the session, its summary, handoff items, or knowledge.
 

@@ -66,6 +66,21 @@ impl JsonlImporter {
         })
     }
 
+    pub fn antigravity() -> Result<Self, String> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_owned())?;
+        Ok(Self {
+            client: "antigravity".to_owned(),
+            roots: vec![
+                home.join(".gemini/antigravity-cli/brain"),
+                home.join(".gemini/antigravity/brain"),
+                home.join(".gemini/antigravity-ide/brain"),
+            ],
+            max_line_bytes: 10_485_760,
+        })
+    }
+
     pub fn with_roots(client: impl Into<String>, roots: Vec<PathBuf>) -> Self {
         Self {
             client: client.into(),
@@ -124,6 +139,9 @@ impl JsonlImporter {
             cwd = cwd.or_else(|| find_string(&record, &["cwd"]).map(str::to_owned));
             let normalized = if self.client == "codex" {
                 normalize_codex_record(&record, &mut codex_tool_calls)
+                    .unwrap_or_else(|| normalize_record(&record))
+            } else if self.client == "antigravity" {
+                normalize_antigravity_record(&record)
                     .unwrap_or_else(|| normalize_record(&record))
             } else {
                 normalize_record(&record)
@@ -319,6 +337,55 @@ fn normalize_codex_record(
             )))
         }
         _ => Some(None),
+    }
+}
+
+fn normalize_antigravity_record(record: &Value) -> Option<Option<ImportedEvent>> {
+    let step_type = record.get("type").and_then(Value::as_str)?;
+    match step_type {
+        "USER_INPUT" => {
+            let content = record
+                .get("content")
+                .and_then(content_text)
+                .or_else(|| record.get("userMessage").and_then(content_text));
+            Some(Some((
+                NormalizedEventKind::UserPrompt,
+                content,
+                None,
+                None,
+                None,
+                NormalizedEventOrigin::User,
+                NormalizedEventRole::UserPrompt,
+            )))
+        }
+        "PLANNER_RESPONSE" => {
+            let tool_calls = record.get("tool_calls").and_then(Value::as_array);
+            if let Some(tool_calls) = tool_calls {
+                if let Some(tool) = tool_calls.first() {
+                    let tool_name = tool
+                        .get("name")
+                        .or_else(|| tool.get("tool_name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let input = tool
+                        .get("args")
+                        .or_else(|| tool.get("arguments"))
+                        .map(value_text);
+                    let output = record.get("content").map(value_text);
+                    return Some(Some((
+                        NormalizedEventKind::ToolCompleted,
+                        input,
+                        output,
+                        tool_name,
+                        Some(true),
+                        NormalizedEventOrigin::Tool,
+                        NormalizedEventRole::ToolActivity,
+                    )));
+                }
+            }
+            Some(None)
+        }
+        _ => None,
     }
 }
 
@@ -1297,5 +1364,40 @@ mod tests {
         assert_eq!(scan.sessions.len(), 1);
         assert_eq!(scan.sessions[0].external_session_id, "recent");
         assert_eq!(scan.estimated_bytes, 20);
+    }
+
+    #[test]
+    fn antigravity_transcript_records_become_user_prompts_and_tools() {
+        let user_record = serde_json::json!({
+            "step_index": 1,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "created_at": "2026-08-28T14:00:00Z",
+            "content": "Please run test suite"
+        });
+        let normalized_user = normalize_antigravity_record(&user_record).unwrap().unwrap();
+        assert_eq!(normalized_user.0, NormalizedEventKind::UserPrompt);
+        assert_eq!(normalized_user.1.as_deref(), Some("Please run test suite"));
+        assert_eq!(normalized_user.5, NormalizedEventOrigin::User);
+
+        let tool_record = serde_json::json!({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "created_at": "2026-08-28T14:00:05Z",
+            "content": "Running test...",
+            "tool_calls": [
+                {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": "cargo test"
+                    }
+                }
+            ]
+        });
+        let normalized_tool = normalize_antigravity_record(&tool_record).unwrap().unwrap();
+        assert_eq!(normalized_tool.0, NormalizedEventKind::ToolCompleted);
+        assert_eq!(normalized_tool.3.as_deref(), Some("run_command"));
+        assert_eq!(normalized_tool.5, NormalizedEventOrigin::Tool);
     }
 }

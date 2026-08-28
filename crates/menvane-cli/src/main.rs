@@ -7,8 +7,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use menvane_domain::{Applicability, KnowledgeType, Scope};
 use menvane_engine::{Menvane, ScopeSelection, WriteMemory};
 use menvane_integrations::{
-    ClaudeHook, ClaudeInstaller, ClaudePaths, CodexHook, CodexInstaller, CodexPaths, JsonlImporter,
-    McpServer, OpenCodeHook, OpenCodeImporter, OpenCodeInstaller, OpenCodePaths,
+    AntigravityHook, AntigravityInstaller, AntigravityPaths, ClaudeHook, ClaudeInstaller,
+    ClaudePaths, CodexHook, CodexInstaller, CodexPaths, JsonlImporter, McpServer, OpenCodeHook,
+    OpenCodeImporter, OpenCodeInstaller, OpenCodePaths,
 };
 use menvane_server::{
     DEFAULT_ADDRESS, DEFAULT_PORT, daemon_running, home_from_environment, serve, start_daemon,
@@ -149,6 +150,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_antigravity_commands() {
+        assert!(Cli::try_parse_from(["menvane", "connect", "antigravity"]).is_ok());
+        assert!(Cli::try_parse_from(["menvane", "disconnect", "antigravity"]).is_ok());
+        assert!(Cli::try_parse_from(["menvane", "hook", "antigravity", "PreInvocation"]).is_ok());
+        assert!(Cli::try_parse_from(["menvane", "import", "antigravity", "7d"]).is_ok());
+    }
+
+    #[test]
     fn handoff_inspect_contract_is_versioned() {
         let value: Value = serde_json::json!({
             "project_id": "project",
@@ -240,6 +249,7 @@ enum ConnectClient {
     Claude,
     Codex,
     Opencode,
+    Antigravity,
     All,
 }
 
@@ -255,6 +265,7 @@ enum Client {
     Claude,
     Codex,
     Opencode,
+    Antigravity,
 }
 
 #[derive(Args)]
@@ -426,12 +437,27 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            ConnectClient::Antigravity => {
+                let installer =
+                    AntigravityInstaller::new(AntigravityPaths::discover()?, std::env::current_exe()?);
+                let changed = installer.connect()?;
+                menvane.set_integration_connected("antigravity", true)?;
+                println!(
+                    "Antigravity integration {}",
+                    if changed {
+                        "connected"
+                    } else {
+                        "already connected"
+                    }
+                );
+            }
             ConnectClient::All => {
                 let executable = std::env::current_exe()?;
                 ClaudeInstaller::new(ClaudePaths::discover()?, &executable).connect()?;
                 CodexInstaller::new(CodexPaths::discover()?, &executable).connect()?;
                 OpenCodeInstaller::new(OpenCodePaths::discover()?, &executable).connect()?;
-                for client in ["claude-code", "codex", "opencode"] {
+                AntigravityInstaller::new(AntigravityPaths::discover()?, &executable).connect()?;
+                for client in ["claude-code", "codex", "opencode", "antigravity"] {
                     menvane.set_integration_connected(client, true)?;
                 }
                 println!("all integrations connected");
@@ -480,6 +506,20 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            Client::Antigravity => {
+                let installer =
+                    AntigravityInstaller::new(AntigravityPaths::discover()?, std::env::current_exe()?);
+                let changed = installer.disconnect()?;
+                menvane.set_integration_connected("antigravity", false)?;
+                println!(
+                    "Antigravity integration {}",
+                    if changed {
+                        "disconnected"
+                    } else {
+                        "not connected"
+                    }
+                );
+            }
         },
         Command::Hook(arguments) => match arguments.client {
             Client::Claude => {
@@ -503,6 +543,14 @@ async fn main() -> Result<()> {
                 std::io::stdin().read_to_string(&mut input)?;
                 let payload = serde_json::from_str(&input)?;
                 let output = OpenCodeHook::new(&menvane, std::env::current_exe()?)
+                    .handle(&arguments.event, payload)?;
+                println!("{}", serde_json::to_string(&output)?);
+            }
+            Client::Antigravity => {
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let payload = serde_json::from_str(&input)?;
+                let output = AntigravityHook::new(&menvane, std::env::current_exe()?)
                     .handle(&arguments.event, payload)?;
                 println!("{}", serde_json::to_string(&output)?);
             }
@@ -580,6 +628,10 @@ async fn main() -> Result<()> {
                 Client::Opencode => OpenCodeImporter::new(arguments.url)
                     .scan()
                     .await
+                    .map_err(anyhow::Error::msg)?,
+                Client::Antigravity => JsonlImporter::antigravity()
+                    .map_err(anyhow::Error::msg)?
+                    .scan()
                     .map_err(anyhow::Error::msg)?,
             };
             let mut scan = scan;
