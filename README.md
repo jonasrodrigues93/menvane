@@ -82,27 +82,23 @@ Menvane captures bounded normalized events, removes sensitive data and ignored p
 ### Install And Connect
 
 Requirements: macOS or Linux with a POSIX shell, `install`, and `curl` or
-`wget` plus `tar` for published binaries. Cargo is only needed when no
-compatible release can be downloaded or when building from source. Linux
-automatic startup additionally requires a user systemd session and
-`systemctl --user`; WSL requires systemd to be enabled. Native Windows is not
-currently a release target.
+`wget` plus `tar` for published binaries. Linux automatic startup additionally
+requires a user systemd session and `systemctl --user`; WSL requires systemd to
+be enabled. Native Windows is not currently a release target.
 
 ```bash
-git clone https://github.com/jonasrodrigues93/menvane.git
-cd menvane
-./install.sh
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh
 
 menvane doctor
 menvane connect claude
 ```
 
 The script downloads and verifies the latest compatible release, then installs
-it at `~/.local/bin/menvane`. Use `--version <version>` for a pinned release
-or `--binary <path>` to install an existing executable. If no compatible
-release is available, an unpinned install falls back to a Cargo source build.
-A requested version that is unavailable fails without installing a different
-version. Make sure `~/.local/bin` is in your `PATH`.
+it at `~/.local/bin/menvane`. Use a checkout's `./install.sh --version
+<version>` for a pinned release or `./install.sh --binary <path>` to install an
+existing executable. If no compatible release is available, installation fails
+instead of compiling from source. Make sure `~/.local/bin` is in your `PATH`.
 
 On Linux, installation enables and starts a user-scoped `menvane.service`.
 The daemon and local UI then start automatically with the user session. On
@@ -160,6 +156,19 @@ install -m 755 menvane "$HOME/.local/bin/menvane"
 The release workflow runs for `v*` tags, packages one executable per asset,
 and publishes the `SHA256SUMS` manifest with the GitHub release. Native
 Windows is not a release target.
+
+### Automatic Versioning
+
+Release automation follows [Conventional Commits](https://www.conventionalcommits.org/):
+
+- `fix:` creates a patch release.
+- `feat:` creates a minor release.
+- `BREAKING CHANGE` or `!` creates a major release.
+
+After changes reach `master`, GitHub Actions opens or updates a release PR.
+Merging it updates the Cargo workspace version, creates a `vX.Y.Z` tag, and
+publishes the platform binaries automatically. The binary workflow can also be
+run directly by pushing a `vX.Y.Z` tag.
 
 ### Enable Memory Compilation
 

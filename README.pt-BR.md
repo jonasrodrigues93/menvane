@@ -82,16 +82,13 @@ O Menvane captura eventos normalizados e limitados, remove dados sensíveis e ca
 ### Instale e conecte um agente
 
 Requisitos: macOS ou Linux com shell POSIX, `install`, e `curl` ou `wget` com
-`tar` para binários publicados. Cargo só é necessário quando não houver um
-release compatível para baixar ou quando for preciso compilar da fonte. A
-inicialização automática no Linux também exige uma sessão systemd do usuário e
-`systemctl --user`; no WSL, o systemd precisa estar habilitado. Windows nativo
-ainda não é um alvo de release.
+`tar` para binários publicados. A inicialização automática no Linux também
+exige uma sessão systemd do usuário e `systemctl --user`; no WSL, o systemd
+precisa estar habilitado. Windows nativo ainda não é um alvo de release.
 
 ```bash
-git clone https://github.com/jonasrodrigues93/menvane.git
-cd menvane
-./install.sh
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh
 
 menvane doctor
 menvane connect claude
@@ -100,9 +97,9 @@ menvane connect claude
 O script baixa e verifica o release compatível mais recente e o instala em
 `~/.local/bin/menvane`. Use `--version <versão>` para fixar um release ou
 `--binary <caminho>` para instalar um executável existente. Se não houver um
-release compatível, uma instalação sem versão fixada retorna ao build com
-Cargo. Uma versão solicitada que não esteja disponível falha sem instalar uma
-versão diferente. Garanta que `~/.local/bin` esteja no seu `PATH`.
+release compatível, a instalação falha em vez de compilar da fonte. Uma versão
+solicitada que não esteja disponível falha sem instalar uma versão diferente.
+Garanta que `~/.local/bin` esteja no seu `PATH`.
 
 No Linux, a instalação habilita e inicia um `menvane.service` no escopo do
 usuário. O daemon e a UI local passam a iniciar automaticamente com a sessão
@@ -160,6 +157,20 @@ install -m 755 menvane "$HOME/.local/bin/menvane"
 O workflow de release é executado para tags `v*`, empacota um executável por
 asset e publica o manifesto `SHA256SUMS` com o release do GitHub. Windows
 nativo não é um alvo de release.
+
+### Versionamento automático
+
+A automação de release segue [Conventional Commits](https://www.conventionalcommits.org/):
+
+- `fix:` cria um release patch.
+- `feat:` cria um release minor.
+- `BREAKING CHANGE` ou `!` cria um release major.
+
+Depois que as mudanças chegam à branch `master`, o GitHub Actions abre ou
+atualiza um PR de release. Ao fazer merge, ele atualiza a versão do workspace
+Cargo, cria uma tag `vX.Y.Z` e publica automaticamente os binários das
+plataformas. O workflow de binários também pode ser executado diretamente ao
+enviar uma tag `vX.Y.Z`.
 
 ### Ative a compilação de memória
 

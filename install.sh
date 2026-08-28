@@ -38,7 +38,6 @@ case "$version" in
         ;;
 esac
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 release_repository=https://github.com/jonasrodrigues93/menvane
 temporary_dir=
 temporary_unit=
@@ -55,15 +54,6 @@ cleanup() {
     fi
 }
 trap cleanup EXIT HUP INT TERM
-
-build_from_source() {
-    command -v cargo >/dev/null 2>&1 || {
-        printf '%s\n' "no compatible published binary was found and cargo is required to build Menvane" >&2
-        exit 1
-    }
-    cargo build --release --locked --manifest-path "$script_dir/Cargo.toml"
-    binary=$script_dir/target/release/menvane
-}
 
 platform=$(uname -s)
 architecture=$(uname -m)
@@ -160,19 +150,22 @@ download_binary() {
 }
 
 if [ -z "$binary" ]; then
-    release_status=1
-    if [ -n "$release_target" ] && [ -n "$downloader" ] && command -v tar >/dev/null 2>&1; then
-        download_binary || release_status=$?
-    fi
-    if [ -z "$binary" ]; then
-        if [ "$release_status" -eq 2 ] || [ "$version" != latest ]; then
-            if [ "$release_status" -ne 2 ]; then
-                printf 'Could not download requested release %s\n' "$version" >&2
-            fi
-            exit 1
-        fi
-        build_from_source
-    fi
+    [ -n "$release_target" ] || {
+        printf '%s\n' "no published Menvane binary is available for this platform" >&2
+        exit 1
+    }
+    [ -n "$downloader" ] || {
+        printf '%s\n' "curl or wget is required to download a published Menvane binary" >&2
+        exit 1
+    }
+    command -v tar >/dev/null 2>&1 || {
+        printf '%s\n' "tar is required to extract a published Menvane binary" >&2
+        exit 1
+    }
+    download_binary || {
+        printf 'Could not download requested release %s\n' "$version" >&2
+        exit 1
+    }
 fi
 
 [ -f "$binary" ] || {

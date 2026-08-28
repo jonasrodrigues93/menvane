@@ -125,7 +125,7 @@ MENVANE_TEST_ARCHITECTURE=x86_64 \
 MENVANE_TEST_FIXTURE_ARCHIVE="$fixture_archive" \
 MENVANE_TEST_FIXTURE_CHECKSUMS="$fixture_dir/SHA256SUMS" \
 PATH="$fake_bin:/usr/bin:/bin" \
-    "$script_dir/install.sh" --version 0.1.0
+    sh -s -- --version 0.1.0 < "$script_dir/install.sh"
 [ -x "$published_home/.local/bin/menvane" ]
 
 bad_home=$test_root/bad-home
@@ -147,13 +147,16 @@ fi
 source_home=$test_root/source-home
 source_marker=$test_root/cargo-was-used
 mkdir -p "$source_home"
-HOME="$source_home" \
-XDG_CONFIG_HOME="$source_home/.config" \
-MENVANE_TEST_PLATFORM=Linux \
-MENVANE_TEST_ARCHITECTURE=x86_64 \
-MENVANE_TEST_DOWNLOAD_FAILURE=1 \
-MENVANE_TEST_CARGO_MARKER="$source_marker" \
-PATH="$source_bin:$fake_bin:/usr/bin:/bin" \
-    "$script_dir/install.sh"
-[ -x "$source_home/.local/bin/menvane" ]
-[ -f "$source_marker" ]
+if HOME="$source_home" \
+    XDG_CONFIG_HOME="$source_home/.config" \
+    MENVANE_TEST_PLATFORM=Linux \
+    MENVANE_TEST_ARCHITECTURE=x86_64 \
+    MENVANE_TEST_DOWNLOAD_FAILURE=1 \
+    MENVANE_TEST_CARGO_MARKER="$source_marker" \
+    PATH="$source_bin:$fake_bin:/usr/bin:/bin" \
+        "$script_dir/install.sh"; then
+    printf '%s\n' "installer unexpectedly succeeded without a published binary" >&2
+    exit 1
+fi
+[ ! -e "$source_home/.local/bin/menvane" ]
+[ ! -e "$source_marker" ]
