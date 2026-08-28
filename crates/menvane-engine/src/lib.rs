@@ -22,12 +22,12 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use fs2::FileExt;
 use menvane_domain::{
-    Applicability, ConsolidationPacket, ConsolidationResult, EmbeddingProvider, EpisodicSummary,
-    HandoffItem, HandoffItemOperation, HandoffItemSource, JsonSchema, KnowledgeContent,
-    KnowledgeMetadata, KnowledgeOperation, KnowledgeOperationKind, KnowledgeRecord, KnowledgeType,
-    LlmError, LlmProvider, LlmRequest, MemoryStatus, NormalizedEvent, NormalizedEventKind,
-    NormalizedSession, Project, ProviderHealth, ReinforcementSignal, Scope, SessionMetadata,
-    SessionState, SummaryStatus,
+    Applicability, ConsolidationPacket, ConsolidationResult, ContextEvaluation, ContextUtility,
+    DeliveredContextKind, EmbeddingProvider, EpisodicSummary, HandoffItem, HandoffItemOperation,
+    HandoffItemSource, JsonSchema, KnowledgeContent, KnowledgeMetadata, KnowledgeOperation,
+    KnowledgeOperationKind, KnowledgeRecord, KnowledgeType, LlmError, LlmProvider, LlmRequest,
+    MemoryStatus, NormalizedEvent, NormalizedEventKind, NormalizedSession, Project, ProviderHealth,
+    ReinforcementSignal, Scope, SessionMetadata, SessionState, SummaryStatus,
 };
 use menvane_store::{
     IndexStore, InjectionIdentity, IntegrationRecord, JobRecord, MAX_SUMMARY_SELECTION_BYTES,
@@ -42,8 +42,9 @@ pub use decay::{MemoryDecay, memory_decay};
 pub use embeddings::OpenAICompatibleEmbeddingProvider;
 pub use github_copilot_provider::GithubCopilotProvider;
 pub use menvane_store::{
-    ConsolidationMarker, IngestResult, JobRecord as StoreJobRecord, MAX_HANDOFF_ITEM_BYTES,
-    MAX_HANDOFF_LIST_LIMIT, RecallContext, SessionEvent, SessionRecord, conversation_key,
+    ConsolidationMarker, DeliveryAudit, IngestResult, JobRecord as StoreJobRecord,
+    MAX_HANDOFF_ITEM_BYTES, MAX_HANDOFF_LIST_LIMIT, RecallContext, SessionEvent, SessionRecord,
+    conversation_key,
 };
 pub use oauth_provider::OpenAiOAuthProvider;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
@@ -63,6 +64,7 @@ pub const GLOBAL_SCOPE_CONFIDENCE_THRESHOLD: f64 = 0.9;
 pub const MAX_RELATED_MEMORIES: usize = 5;
 
 const HANDOFF_DELIVERY_KIND: &str = "handoff";
+const PROJECT_IDENTITY_DELIVERY_KIND: &str = "project-identity";
 const GENERIC_HANDOFF_TERMS: [&str; 10] = [
     "arquivo",
     "config",
@@ -97,6 +99,7 @@ struct HybridRecallCandidate {
     result: SearchResult,
     lexical_rank: Option<usize>,
     embedding_rank: Option<usize>,
+    match_confidence: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,6 +110,8 @@ pub struct RecallDiagnostics {
     pub handoff_match_terms: Vec<String>,
     pub handoff_required_match_count: usize,
     pub handoff_reason: String,
+    pub candidates_considered: usize,
+    pub abstention_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +153,31 @@ struct MenvaneConfig {
     embeddings: EmbeddingConfiguration,
     #[serde(default)]
     decay: DecayConfiguration,
+    #[serde(default)]
+    recall: RecallConfiguration,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct RecallConfiguration {
+    #[serde(default = "default_min_match_confidence")]
+    min_match_confidence: f64,
+    #[serde(default = "default_min_knowledge_confidence")]
+    min_knowledge_confidence: f64,
+    #[serde(default = "default_min_utility")]
+    min_utility: f64,
+    #[serde(default = "default_max_cards")]
+    max_cards: usize,
+}
+
+impl Default for RecallConfiguration {
+    fn default() -> Self {
+        Self {
+            min_match_confidence: default_min_match_confidence(),
+            min_knowledge_confidence: default_min_knowledge_confidence(),
+            min_utility: default_min_utility(),
+            max_cards: default_max_cards(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -193,12 +223,15 @@ impl Default for EmbeddingConfiguration {
 struct SessionConfiguration {
     #[serde(default = "default_idle_finalize_seconds")]
     idle_finalize_seconds: u64,
+    #[serde(default = "default_open_finalize_seconds")]
+    open_finalize_seconds: u64,
 }
 
 impl Default for SessionConfiguration {
     fn default() -> Self {
         Self {
             idle_finalize_seconds: default_idle_finalize_seconds(),
+            open_finalize_seconds: default_open_finalize_seconds(),
         }
     }
 }
@@ -264,11 +297,44 @@ impl Default for LlmConfiguration {
 fn default_idle_finalize_seconds() -> u64 {
     120
 }
+fn default_open_finalize_seconds() -> u64 {
+    1_800
+}
 fn default_job_lease_timeout_seconds() -> u64 {
     300
 }
 fn default_memory_lifetime_days() -> u64 {
     decay::DEFAULT_MEMORY_LIFETIME_DAYS as u64
+}
+fn default_min_match_confidence() -> f64 {
+    0.45
+}
+fn default_min_knowledge_confidence() -> f64 {
+    0.55
+}
+fn default_min_utility() -> f64 {
+    0.55
+}
+fn default_max_cards() -> usize {
+    3
+}
+fn validate_recall_configuration(configuration: RecallConfiguration) -> Result<()> {
+    for (name, value) in [
+        ("min_match_confidence", configuration.min_match_confidence),
+        (
+            "min_knowledge_confidence",
+            configuration.min_knowledge_confidence,
+        ),
+        ("min_utility", configuration.min_utility),
+    ] {
+        if !(0.0..=1.0).contains(&value) {
+            bail!("recall.{name} must be between 0 and 1")
+        }
+    }
+    if !(1..=3).contains(&configuration.max_cards) {
+        bail!("recall.max_cards must be between 1 and 3")
+    }
+    Ok(())
 }
 fn default_llm_provider() -> String {
     "openai".to_owned()
@@ -339,6 +405,7 @@ impl Menvane {
         if config.decay.memory_lifetime_days < 1 {
             bail!("decay.memory_lifetime_days must be at least 1");
         }
+        validate_recall_configuration(config.recall)?;
         let menvane = Self {
             home,
             markdown,
@@ -405,7 +472,7 @@ impl Menvane {
             title: request.title.trim().to_owned(),
             body: request.body.trim().to_owned(),
         };
-        if self.duplicate_memory(&memory.metadata, &memory.title, &memory.body)? {
+        if self.similar_memory(&memory.metadata, &memory.title, &memory.body)? {
             bail!("equivalent memory already exists");
         }
         let path = self.markdown.write_memory(&memory, project.as_ref())?;
@@ -490,6 +557,7 @@ impl Menvane {
         prompt: &str,
         limit: usize,
     ) -> Result<PromptRecall> {
+        let limit = limit.min(self.config.recall.max_cards);
         let sanitizer = CaptureSanitizer::new(self.config.capture.clone())?;
         let prompt = sanitizer.sanitize_prompt(prompt);
         let project = self.ensure_project(cwd)?;
@@ -501,7 +569,7 @@ impl Menvane {
         if prompt.trim().is_empty() {
             return Ok(PromptRecall {
                 results: Vec::new(),
-                diagnostics: recall_diagnostics(String::new(), 0),
+                diagnostics: recall_diagnostics(String::new(), 0, 0, "insufficient-intent"),
                 identity,
             });
         }
@@ -513,7 +581,7 @@ impl Menvane {
         if query.is_empty() {
             return Ok(PromptRecall {
                 results: Vec::new(),
-                diagnostics: recall_diagnostics(String::new(), 0),
+                diagnostics: recall_diagnostics(String::new(), 0, 0, "insufficient-intent"),
                 identity,
             });
         }
@@ -530,14 +598,19 @@ impl Menvane {
                 continue;
             }
             let memory = self.read_without_recording(result.id)?;
+            if !knowledge_is_confident(&memory, self.config.recall) {
+                continue;
+            }
             let memory_tokens = lexical_tokens(&format!("{} {}", memory.title, memory.body));
             if meaningful_lexical_overlap(&prompt_tokens, &memory_tokens) {
+                let match_confidence = lexical_match_confidence(&prompt_tokens, &memory_tokens);
                 candidates.insert(
                     result.id,
                     HybridRecallCandidate {
                         result,
                         lexical_rank: Some(index + 1),
                         embedding_rank: None,
+                        match_confidence,
                     },
                 );
             }
@@ -558,27 +631,41 @@ impl Menvane {
                 limit.saturating_mul(16).max(64),
             ) {
                 for (index, result) in embedding_candidates.into_iter().enumerate() {
+                    let similarity = result.score;
                     if result.score < self.config.embeddings.min_similarity
                         || !automatically_eligible(&result, project.as_ref())
                     {
                         continue;
                     }
+                    let memory = self.read_without_recording(result.id)?;
+                    if !knowledge_is_confident(&memory, self.config.recall) {
+                        continue;
+                    }
                     candidates
                         .entry(result.id)
-                        .and_modify(|candidate| candidate.embedding_rank = Some(index + 1))
+                        .and_modify(|candidate| {
+                            candidate.embedding_rank = Some(index + 1);
+                            candidate.match_confidence = candidate.match_confidence.max(similarity);
+                        })
                         .or_insert(HybridRecallCandidate {
                             result,
                             lexical_rank: None,
                             embedding_rank: Some(index + 1),
+                            match_confidence: similarity,
                         });
                 }
             }
         }
+        let candidates_considered = candidates.len();
         let mut results = candidates
             .into_values()
+            .filter(|candidate| {
+                candidate.match_confidence >= self.config.recall.min_match_confidence
+            })
             .map(|mut candidate| {
                 candidate.result.score =
-                    reciprocal_rank_fusion(candidate.lexical_rank, candidate.embedding_rank);
+                    reciprocal_rank_fusion(candidate.lexical_rank, candidate.embedding_rank)
+                        * candidate.match_confidence;
                 candidate.result.fts_rank = candidate.lexical_rank.unwrap_or_default();
                 candidate.result
             })
@@ -589,13 +676,46 @@ impl Menvane {
                 .total_cmp(&left.score)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        results.truncate(limit);
+        let mut diverse = Vec::new();
+        for result in results {
+            let memory = self.read_without_recording(result.id)?;
+            let tokens = lexical_tokens(&format!("{} {}", memory.title, memory.body));
+            let redundant = diverse.iter().any(|selected: &SearchResult| {
+                self.read_without_recording(selected.id)
+                    .map(|selected_memory| {
+                        semantic_token_similarity(
+                            &tokens,
+                            &lexical_tokens(&format!(
+                                "{} {}",
+                                selected_memory.title, selected_memory.body
+                            )),
+                        ) >= 0.8
+                    })
+                    .unwrap_or(false)
+            });
+            if !redundant {
+                diverse.push(result);
+            }
+            if diverse.len() == limit {
+                break;
+            }
+        }
+        let results = diverse;
         for result in &results {
             self.sessions
                 .record_access(result.id, ReinforcementSignal::Retrieved)?;
         }
         Ok(PromptRecall {
-            diagnostics: recall_diagnostics(query, results.len()),
+            diagnostics: recall_diagnostics(
+                query,
+                results.len(),
+                candidates_considered,
+                if results.is_empty() {
+                    "below-confidence"
+                } else {
+                    "none"
+                },
+            ),
             results,
             identity,
         })
@@ -671,7 +791,10 @@ impl Menvane {
     }
 
     pub fn finalize_idle_sessions(&self) -> Result<usize> {
-        SessionEngine::new(self).finalize_idle(self.config.sessions.idle_finalize_seconds)
+        SessionEngine::new(self).finalize_inactive(
+            self.config.sessions.idle_finalize_seconds,
+            self.config.sessions.open_finalize_seconds,
+        )
     }
 
     pub fn jobs(&self) -> Result<Vec<JobRecord>> {
@@ -731,6 +854,13 @@ impl Menvane {
 
     pub fn session_consolidation(&self, id: Uuid) -> Result<Option<ConsolidationMarker>> {
         self.sessions.consolidation_result(id)
+    }
+
+    pub fn session_delivery_audit(&self, id: Uuid) -> Result<Vec<DeliveryAudit>> {
+        let Some(session) = self.sessions.find_session(id)? else {
+            return Ok(Vec::new());
+        };
+        self.sessions.delivery_audit(&session)
     }
 
     pub fn handoff_is_stale(&self, _project: &Project) -> Result<Option<bool>> {
@@ -843,7 +973,10 @@ impl Menvane {
         if memory.metadata.knowledge_type != KnowledgeType::Playbook {
             bail!("memory is not a playbook");
         }
-        if memory.metadata.status == MemoryStatus::Forgotten {
+        if matches!(
+            memory.metadata.status,
+            MemoryStatus::Forgotten | MemoryStatus::Quarantined | MemoryStatus::Superseded
+        ) {
             return Ok(false);
         }
         if !self
@@ -861,6 +994,8 @@ impl Menvane {
             },
         )?;
         if successful {
+            memory.metadata.utility += (1.0 - memory.metadata.utility) * 0.25;
+            memory.metadata.confidence = (memory.metadata.confidence + 0.2).min(1.0);
             let successes = memory.metadata.successes.get_or_insert(0);
             *successes = successes.saturating_add(1);
             if memory.metadata.status == MemoryStatus::Candidate && *successes >= 2 {
@@ -868,8 +1003,13 @@ impl Menvane {
             }
             memory.metadata.last_verified_at = Some(Utc::now());
         } else {
+            memory.metadata.utility *= 0.6;
+            memory.metadata.confidence = (memory.metadata.confidence - 0.25).max(0.0);
             let failures = memory.metadata.failures.get_or_insert(0);
             *failures = failures.saturating_add(1);
+            if *failures >= 3 && memory.metadata.confidence < 0.45 {
+                memory.metadata.status = MemoryStatus::Quarantined;
+            }
         }
         memory.metadata.updated_at = Utc::now();
         self.markdown.update_memory(&path, &memory)?;
@@ -894,31 +1034,43 @@ impl Menvane {
             self.sessions
                 .injection_identity(client, external_session_id, Some(&project.id))?;
         let handoff = self.current_handoff_items(Some(&project.id))?;
-        let mut context = String::from(
-            "MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n",
-        );
-        context.push_str("Scope: project\n");
-        context.push_str(&format!("Project: {}\n", project.identity));
-        if !handoff.is_empty() {
-            context.push_str("\n[CURRENT HANDOFF]\n");
-            context.push_str(&session_rendering::render_handoff_items(&handoff, 2_000));
-            context.push('\n');
+        let identity_delivered = self.sessions.claim_delivery(
+            &identity,
+            PROJECT_IDENTITY_DELIVERY_KIND,
+            &project.id,
+            &project.id,
+            "Project identity",
+            &project.identity,
+        )?;
+        let mut delivered_handoff = Vec::new();
+        for item in handoff {
+            let rendered =
+                session_rendering::render_handoff_items(std::slice::from_ref(&item), 2_000);
+            let content_id = format!("{}:{}", item.id, content_identifier(&rendered));
+            if self.sessions.claim_delivery(
+                &identity,
+                HANDOFF_DELIVERY_KIND,
+                &content_id,
+                &item.id.to_string(),
+                &item.state,
+                &rendered,
+            )? {
+                delivered_handoff.push(rendered);
+            }
         }
-        context.push_str(
-            "\nAdditional memory is available through recall.\nEND MENVANE MEMORY CONTEXT",
-        );
-        let handoff_content_id = content_identifier(&session_rendering::render_handoff_items(
-            &handoff,
-            usize::MAX,
-        ));
-        if self
-            .sessions
-            .claim_delivery(&identity, HANDOFF_DELIVERY_KIND, &handoff_content_id)?
-        {
-            Ok(context)
-        } else {
-            Ok(String::new())
+        if !identity_delivered && delivered_handoff.is_empty() {
+            return Ok(String::new());
         }
+        let mut context = historical_context_header();
+        if identity_delivered {
+            context.push_str(&format!("Project: {}\n", project.identity));
+        }
+        for rendered in delivered_handoff {
+            context.push_str("\nCurrent work in progress:\n");
+            context.push_str(&rendered);
+        }
+        context.push_str("\nEND HISTORICAL CONTEXT");
+        Ok(context)
     }
 
     pub fn prompt_context(&self, cwd: &Path, prompt: &str, session_key: &str) -> Result<String> {
@@ -982,40 +1134,61 @@ impl Menvane {
         diagnostics.handoff_match_terms.sort();
         diagnostics.handoff_required_match_count = required_match_count;
         let mut context = String::new();
-        let related_handoff = session_rendering::render_handoff_items(&related, 2_000);
-        let related_content_id = content_identifier(&session_rendering::render_handoff_items(
-            &related,
-            usize::MAX,
-        ));
         diagnostics.handoff_reason = if prompt_tokens.is_empty() {
             "no-meaningful-prompt-terms".to_owned()
         } else if !has_handoff_items {
             "no-current-handoff".to_owned()
         } else if related.is_empty() {
             "insufficient-overlap".to_owned()
-        } else if self.sessions.claim_delivery(
-            &identity,
-            HANDOFF_DELIVERY_KIND,
-            &related_content_id,
-        )? {
-            context.push_str("MENVANE MEMORY CONTEXT\nHistorical context only.\nCurrent user instructions and current repository state are authoritative.\n\n[CURRENT HANDOFF]\n");
-            context.push_str(&related_handoff);
-            "delivered".to_owned()
         } else {
-            "already-delivered".to_owned()
+            let mut delivered = 0;
+            for item in &related {
+                let rendered =
+                    session_rendering::render_handoff_items(std::slice::from_ref(item), 2_000);
+                let content_id = format!("{}:{}", item.id, content_identifier(&rendered));
+                if self.sessions.claim_delivery(
+                    &identity,
+                    HANDOFF_DELIVERY_KIND,
+                    &content_id,
+                    &item.id.to_string(),
+                    &item.state,
+                    &rendered,
+                )? {
+                    if context.is_empty() {
+                        context.push_str(&historical_context_header());
+                    }
+                    context.push_str("\nCurrent work in progress:\n");
+                    context.push_str(&rendered);
+                    delivered += 1;
+                }
+            }
+            if delivered > 0 {
+                "delivered".to_owned()
+            } else {
+                "already-delivered".to_owned()
+            }
         };
         for result in &results {
-            let entry = format!(
-                "\n\n[MEMORY CARD]\nID: {}\nType: {}\nTitle: {}\nExcerpt: {}",
-                result.id, result.knowledge_type, result.title, result.excerpt
-            );
+            let memory = self.read_without_recording(result.id)?;
+            let entry = render_automatic_card(&memory, &prompt_tokens);
             if context.chars().count() + entry.chars().count() > 6_000 {
                 break;
             }
-            if self
-                .sessions
-                .claim_delivery(&identity, "memory", &result.id.to_string())?
-            {
+            let kind = match result.knowledge_type {
+                KnowledgeType::Memory => "memory",
+                KnowledgeType::Playbook => "playbook",
+            };
+            if self.sessions.claim_delivery(
+                &identity,
+                kind,
+                &result.id.to_string(),
+                &result.id.to_string(),
+                &result.title,
+                &entry,
+            )? {
+                if context.is_empty() {
+                    context.push_str(&historical_context_header());
+                }
                 context.push_str(&entry);
                 if result.knowledge_type == KnowledgeType::Memory {
                     self.record_memory_reinforcement(result.id, ReinforcementSignal::Injected)?;
@@ -1023,7 +1196,7 @@ impl Menvane {
             }
         }
         if !context.is_empty() {
-            context.push_str("\n\nEND MENVANE MEMORY CONTEXT");
+            context.push_str("\n\nEND HISTORICAL CONTEXT");
         }
         Ok((context, diagnostics))
     }
@@ -1210,6 +1383,7 @@ impl Menvane {
         if parsed.decay.memory_lifetime_days < 1 {
             bail!("decay.memory_lifetime_days must be at least 1");
         }
+        validate_recall_configuration(parsed.recall)?;
         let lowercase = configuration.to_ascii_lowercase();
         for forbidden in ["api_key =", "token =", "password =", "secret ="] {
             if lowercase.contains(forbidden) {
@@ -1606,6 +1780,7 @@ impl Menvane {
                 session.project_id.as_deref(),
             )?,
             related_memories: self.related_memories(&events, session.project_id.as_deref())?,
+            delivered_context: self.sessions.delivered_context(&session)?,
         };
         let prompt = self
             .config
@@ -1634,12 +1809,91 @@ impl Menvane {
         project_id: Option<&str>,
         result: &ConsolidationResult,
     ) -> Result<()> {
+        let session = self.sessions.session(session_id)?;
+        let evaluations = self
+            .sessions
+            .record_context_evaluations(&session, &result.context_evaluations)?;
+        for evaluation in &evaluations {
+            self.apply_context_evaluation(evaluation)?;
+        }
         for (index, operation) in result.handoff.iter().enumerate() {
             self.apply_handoff_operation(session_id, project_id, index, operation)?;
         }
         for (index, operation) in result.knowledge.iter().enumerate() {
             self.apply_knowledge_operation(session_id, project_id, operation, index)?;
         }
+        Ok(())
+    }
+
+    fn apply_context_evaluation(&self, evaluation: &ContextEvaluation) -> Result<()> {
+        if evaluation.kind == DeliveredContextKind::Handoff {
+            return Ok(());
+        }
+        let Ok(id) = Uuid::parse_str(&evaluation.content_id) else {
+            return Ok(());
+        };
+        let Ok((mut memory, path)) = self.index.read_memory(&self.markdown, id) else {
+            return Ok(());
+        };
+        let previous = (memory.metadata.utility, memory.metadata.confidence);
+        match evaluation.utility {
+            ContextUtility::Useful => {
+                memory.metadata.utility += (1.0 - memory.metadata.utility) * 0.25;
+                memory.metadata.confidence = (memory.metadata.confidence + 0.2).min(1.0);
+                if memory.metadata.knowledge_type == KnowledgeType::Playbook {
+                    let successes = memory.metadata.successes.get_or_insert(0);
+                    *successes = successes.saturating_add(1);
+                    if memory.metadata.status == MemoryStatus::Candidate && *successes >= 2 {
+                        memory.metadata.status = MemoryStatus::Active;
+                    }
+                }
+                memory.metadata.last_verified_at = Some(Utc::now());
+            }
+            ContextUtility::Unused => {
+                memory.metadata.utility *= 0.85;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.08).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Irrelevant => {
+                memory.metadata.utility *= 0.9;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.05).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Incomplete => {
+                memory.metadata.utility *= 0.75;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.15).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Outdated => {
+                memory.metadata.utility *= 0.7;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.25).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Contradicted => {
+                memory.metadata.utility *= 0.5;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.4).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Harmful => {
+                memory.metadata.utility *= 0.25;
+                memory.metadata.confidence = (memory.metadata.confidence - 0.5).max(0.0);
+                record_autonomous_failure(&mut memory);
+            }
+            ContextUtility::Unknown => return Ok(()),
+        }
+        memory.metadata.utility = memory.metadata.utility.clamp(0.0, 1.0);
+        if memory.metadata.knowledge_type == KnowledgeType::Playbook
+            && memory.metadata.failures.unwrap_or_default() >= 3
+            && memory.metadata.confidence < 0.45
+        {
+            memory.metadata.status = MemoryStatus::Quarantined;
+        }
+        if previous == (memory.metadata.utility, memory.metadata.confidence) {
+            return Ok(());
+        }
+        memory.metadata.updated_at = Utc::now();
+        self.markdown.update_memory(&path, &memory)?;
+        self.index.upsert_memory(&memory, &path)?;
         Ok(())
     }
 
@@ -1836,7 +2090,7 @@ impl Menvane {
                     .as_ref()
                     .map(content_markdown)
                     .context("create operation has no content")?;
-                if self.duplicate_memory(&metadata, &title, &body)? {
+                if self.consolidate_similar_memory(&metadata, &title, &body, session_id)? {
                     return Ok(());
                 }
                 let memory = KnowledgeRecord {
@@ -1969,19 +2223,75 @@ impl Menvane {
         }
     }
 
-    fn duplicate_memory(
+    fn similar_memory(
         &self,
         metadata: &KnowledgeMetadata,
         title: &str,
         body: &str,
     ) -> Result<bool> {
-        let title = normalize_memory_text(title);
-        let body = normalize_memory_text(body);
+        let title = lexical_tokens(title);
+        let body = lexical_tokens(body);
         Ok(self.all_memories()?.into_iter().any(|memory| {
             memory.metadata.knowledge_type == metadata.knowledge_type
-                && normalize_memory_text(&memory.title) == title
-                && normalize_memory_text(&memory.body) == body
+                && memory.metadata.scope == metadata.scope
+                && memory.metadata.project_id == metadata.project_id
+                && (semantic_token_similarity(&lexical_tokens(&memory.title), &title) >= 0.8
+                    && semantic_token_similarity(&lexical_tokens(&memory.body), &body) >= 0.78)
         }))
+    }
+
+    fn consolidate_similar_memory(
+        &self,
+        metadata: &KnowledgeMetadata,
+        title: &str,
+        body: &str,
+        session_id: Uuid,
+    ) -> Result<bool> {
+        let title_tokens = lexical_tokens(title);
+        let body_tokens = lexical_tokens(body);
+        let mut memories = self.all_memories()?.into_iter().filter(|memory| {
+            memory.metadata.knowledge_type == metadata.knowledge_type
+                && memory.metadata.scope == metadata.scope
+                && memory.metadata.project_id == metadata.project_id
+                && semantic_token_similarity(&lexical_tokens(&memory.title), &title_tokens) >= 0.8
+                && semantic_token_similarity(&lexical_tokens(&memory.body), &body_tokens) >= 0.78
+        });
+        let Some(memory) = memories.next() else {
+            return Ok(false);
+        };
+        let (mut survivor, path) = self.index.read_memory(&self.markdown, memory.metadata.id)?;
+
+        // A forgotten, quarantined, or superseded record is still the canonical
+        // duplicate. Do not silently revive it or create a second copy.
+        if matches!(
+            survivor.metadata.status,
+            MemoryStatus::Forgotten | MemoryStatus::Quarantined | MemoryStatus::Superseded
+        ) {
+            return Ok(true);
+        }
+        if !survivor.metadata.source_sessions.contains(&session_id) {
+            survivor.metadata.source_sessions.push(session_id);
+        }
+        if normalize_memory_text(&survivor.body) != normalize_memory_text(body)
+            && !normalize_memory_text(&survivor.body).contains(&normalize_memory_text(body))
+        {
+            survivor.body = format!(
+                "{}\n\nAdditional consolidated detail:\n{}",
+                survivor.body.trim(),
+                body.trim()
+            );
+        }
+        survivor.metadata.confidence = (survivor.metadata.confidence + 0.05).min(1.0);
+        survivor.metadata.utility = (survivor.metadata.utility + 0.05).min(1.0);
+        survivor.metadata.updated_at = Utc::now();
+        self.markdown.update_memory(&path, &survivor)?;
+        self.index.upsert_memory(&survivor, &path)?;
+        self.refresh_memory_embedding(&survivor)?;
+        self.markdown.commit(&format!(
+            "chore(memory): consolidate duplicate {} into {}",
+            session_id, survivor.metadata.id
+        ));
+        Ok(true)
     }
 
     fn related_memories(
@@ -2381,7 +2691,12 @@ fn required_handoff_match_count(prompt_token_count: usize) -> usize {
     }
 }
 
-fn recall_diagnostics(query: String, result_count: usize) -> RecallDiagnostics {
+fn recall_diagnostics(
+    query: String,
+    result_count: usize,
+    candidates_considered: usize,
+    abstention_reason: &str,
+) -> RecallDiagnostics {
     RecallDiagnostics {
         query,
         result_count,
@@ -2389,6 +2704,8 @@ fn recall_diagnostics(query: String, result_count: usize) -> RecallDiagnostics {
         handoff_match_terms: Vec::new(),
         handoff_required_match_count: 0,
         handoff_reason: "not-evaluated".to_owned(),
+        candidates_considered,
+        abstention_reason: abstention_reason.to_owned(),
     }
 }
 
@@ -2403,6 +2720,33 @@ fn meaningful_lexical_overlap(
         prompt_tokens.len().div_ceil(3).clamp(2, 3)
     };
     overlap >= required
+}
+
+fn lexical_match_confidence(
+    prompt_tokens: &HashSet<String>,
+    memory_tokens: &HashSet<String>,
+) -> f64 {
+    if prompt_tokens.is_empty() {
+        return 0.0;
+    }
+    prompt_tokens.intersection(memory_tokens).count() as f64 / prompt_tokens.len().min(6) as f64
+}
+
+fn semantic_token_similarity(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
+    let union = left.union(right).count();
+    if union == 0 {
+        0.0
+    } else {
+        left.intersection(right).count() as f64 / union as f64
+    }
+}
+
+fn knowledge_is_confident(memory: &KnowledgeRecord, configuration: RecallConfiguration) -> bool {
+    matches!(
+        memory.metadata.status,
+        MemoryStatus::Active | MemoryStatus::Candidate
+    ) && memory.metadata.confidence >= configuration.min_knowledge_confidence
+        && memory.metadata.utility >= configuration.min_utility
 }
 
 fn reciprocal_rank_fusion(lexical_rank: Option<usize>, embedding_rank: Option<usize>) -> f64 {
@@ -2428,6 +2772,71 @@ fn automatically_eligible(result: &SearchResult, project: Option<&Project>) -> b
 
 fn content_identifier(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn historical_context_header() -> String {
+    "HISTORICAL CONTEXT\nUse only when relevant. Current user instructions and repository state are authoritative.\n"
+        .to_owned()
+}
+
+fn render_automatic_card(memory: &KnowledgeRecord, prompt_tokens: &HashSet<String>) -> String {
+    let (label, field, content, limit) = match memory.metadata.knowledge_type {
+        KnowledgeType::Memory => (
+            "Relevant historical information",
+            "Information",
+            relevant_memory_excerpt(&memory.body, prompt_tokens, 1_200),
+            1_200,
+        ),
+        KnowledgeType::Playbook => (
+            "Relevant historical procedure",
+            "Procedure",
+            bounded_chars(&memory.body, 1_800),
+            1_800,
+        ),
+    };
+    let mut card = format!("\n\n{label}:\nTitle: {}\n{field}: {content}", memory.title);
+    if !memory.metadata.applies_to.is_empty() {
+        card.push_str(&format!(
+            "\nApplies to: {}",
+            serde_json::to_string(&memory.metadata.applies_to).unwrap_or_default()
+        ));
+    }
+    if let Some(verified) = memory.metadata.last_verified_at {
+        card.push_str(&format!("\nLast confirmed: {}", verified.date_naive()));
+    }
+    bounded_chars(&card, limit + 500)
+}
+
+fn relevant_memory_excerpt(body: &str, prompt_tokens: &HashSet<String>, limit: usize) -> String {
+    let best = body
+        .split("\n\n")
+        .max_by_key(|paragraph| {
+            lexical_tokens(paragraph)
+                .intersection(prompt_tokens)
+                .count()
+        })
+        .unwrap_or(body);
+    bounded_chars(best.trim(), limit)
+}
+
+fn bounded_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        value.to_owned()
+    } else {
+        let mut bounded = value
+            .chars()
+            .take(limit.saturating_sub(1))
+            .collect::<String>();
+        bounded.push('…');
+        bounded
+    }
+}
+
+fn record_autonomous_failure(memory: &mut KnowledgeRecord) {
+    if memory.metadata.knowledge_type == KnowledgeType::Playbook {
+        let failures = memory.metadata.failures.get_or_insert(0);
+        *failures = failures.saturating_add(1);
+    }
 }
 
 fn deterministic_uuid(session_id: Uuid, parts: &[String], discriminator: &[u8]) -> Uuid {

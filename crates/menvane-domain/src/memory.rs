@@ -86,6 +86,7 @@ pub struct ParseScopeError(String);
 pub enum MemoryStatus {
     Active,
     Candidate,
+    Quarantined,
     Superseded,
     Forgotten,
 }
@@ -95,6 +96,7 @@ impl Display for MemoryStatus {
         formatter.write_str(match self {
             Self::Active => "active",
             Self::Candidate => "candidate",
+            Self::Quarantined => "quarantined",
             Self::Superseded => "superseded",
             Self::Forgotten => "forgotten",
         })
@@ -148,6 +150,16 @@ pub struct KnowledgeMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     pub status: MemoryStatus,
+    #[serde(
+        default = "default_relevance",
+        skip_serializing_if = "is_default_relevance"
+    )]
+    pub confidence: f64,
+    #[serde(
+        default = "default_relevance",
+        skip_serializing_if = "is_default_relevance"
+    )]
+    pub utility: f64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,6 +199,12 @@ impl KnowledgeMetadata {
             scope,
             project_id,
             status,
+            confidence: if status == MemoryStatus::Candidate {
+                0.6
+            } else {
+                1.0
+            },
+            utility: 1.0,
             created_at: now,
             updated_at: now,
             last_verified_at: Some(now),
@@ -200,6 +218,14 @@ impl KnowledgeMetadata {
             decayed_at: None,
         }
     }
+}
+
+fn default_relevance() -> f64 {
+    1.0
+}
+
+fn is_default_relevance(value: &f64) -> bool {
+    (*value - 1.0).abs() < f64::EPSILON
 }
 
 #[derive(Debug, Clone, PartialEq)]

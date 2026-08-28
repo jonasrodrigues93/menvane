@@ -207,6 +207,9 @@ async fn api_session_detail(
         .session_consolidation(id)
         .map_err(internal_server_error)?;
     let events = menvane.session_events(id).map_err(internal_server_error)?;
+    let deliveries = menvane
+        .session_delivery_audit(id)
+        .map_err(internal_server_error)?;
     let mut detail = session_json(&session);
     detail["summary"] = json!(summary);
     detail["consolidation"] = consolidation.map_or(Value::Null, |marker| {
@@ -224,6 +227,7 @@ async fn api_session_detail(
         })
     });
     detail["events"] = json!(events);
+    detail["deliveries"] = json!(deliveries);
     Ok(Json(detail))
 }
 
@@ -641,6 +645,8 @@ mod tests {
         assert!(body.contains("name='max_prompt_bytes'"));
         assert!(body.contains("name='reasoning_effort'"));
         assert!(body.contains("name='memory_lifetime_days'"));
+        assert!(body.contains("name='open_finalize_seconds'"));
+        assert!(body.contains("name='min_match_confidence'"));
         assert!(!body.contains("<pre>[llm]"));
 
         let response = router
@@ -650,7 +656,7 @@ mod tests {
                     .method("POST")
                     .uri("/settings")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("max_prompt_bytes=12000&max_tool_input_bytes=3000&max_tool_output_bytes=3500&idle_finalize_seconds=90&lease_timeout_seconds=240&memory_lifetime_days=90&provider=openai&model=gpt-test&reasoning_effort=high&base_url=https%3A%2F%2Fapi.openai.com%2Fv1&api_key_env=OPENAI_API_KEY&consolidation_prompt="))
+                    .body(Body::from("max_prompt_bytes=12000&max_tool_input_bytes=3000&max_tool_output_bytes=3500&idle_finalize_seconds=90&open_finalize_seconds=900&lease_timeout_seconds=240&memory_lifetime_days=90&min_match_confidence=0.5&min_knowledge_confidence=0.6&min_utility=0.65&max_cards=2&provider=openai&model=gpt-test&reasoning_effort=high&base_url=https%3A%2F%2Fapi.openai.com%2Fv1&api_key_env=OPENAI_API_KEY&consolidation_prompt="))
                     .unwrap(),
             )
             .await
@@ -660,6 +666,9 @@ mod tests {
         assert!(configuration.contains("max_prompt_bytes = 12000"));
         assert!(configuration.contains("model = \"gpt-test\""));
         assert!(configuration.contains("memory_lifetime_days = 90"));
+        assert!(configuration.contains("open_finalize_seconds = 900"));
+        assert!(configuration.contains("min_match_confidence = 0.5"));
+        assert!(configuration.contains("max_cards = 2"));
 
         let response = router
             .oneshot(

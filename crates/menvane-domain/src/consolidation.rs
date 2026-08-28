@@ -17,6 +17,7 @@ use crate::summary::{
 pub const MAX_KNOWLEDGE_OPERATIONS: usize = 10;
 pub const MAX_RELATED_SUMMARIES: usize = 5;
 pub const MAX_KNOWLEDGE_BODY_CHARS: usize = 8_000;
+pub const MAX_DELIVERED_CONTEXT_ITEMS: usize = 20;
 pub const GLOBAL_SCOPE_CONFIDENCE_THRESHOLD: f64 = 0.9;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,6 +41,46 @@ pub struct RelatedMemory {
     pub source_sessions: Vec<Uuid>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveredContextKind {
+    Memory,
+    Playbook,
+    Handoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveredContext {
+    pub kind: DeliveredContextKind,
+    pub content_id: String,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContextUtility {
+    Useful,
+    Unused,
+    Irrelevant,
+    Incomplete,
+    Outdated,
+    Contradicted,
+    Harmful,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextEvaluation {
+    pub kind: DeliveredContextKind,
+    pub content_id: String,
+    pub utility: ContextUtility,
+    pub evidence_event_ids: Vec<String>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsolidationPacket {
@@ -48,6 +89,7 @@ pub struct ConsolidationPacket {
     pub handoff_items: Vec<HandoffItem>,
     pub related_summaries: Vec<RelatedSummary>,
     pub related_memories: Vec<RelatedMemory>,
+    pub delivered_context: Vec<DeliveredContext>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +146,7 @@ pub struct ConsolidationResult {
     pub summary: EpisodicSummary,
     pub handoff: Vec<HandoffItemOperation>,
     pub knowledge: Vec<KnowledgeOperation>,
+    pub context_evaluations: Vec<ContextEvaluation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,6 +192,11 @@ pub fn validate_consolidation_result(
     if packet.related_summaries.len() > MAX_RELATED_SUMMARIES {
         return Err(ConsolidationValidationError(
             "packet contains too many related summaries".into(),
+        ));
+    }
+    if packet.delivered_context.len() > MAX_DELIVERED_CONTEXT_ITEMS {
+        return Err(ConsolidationValidationError(
+            "packet contains too many delivered context items".into(),
         ));
     }
     let item_ids = packet
@@ -266,6 +314,42 @@ pub fn validate_consolidation_result(
         }
         validate_knowledge_operation(operation)?;
         validate_knowledge_promotion(packet, operation)?;
+    }
+    let delivered = packet
+        .delivered_context
+        .iter()
+        .map(|item| (item.kind, item.content_id.as_str()))
+        .collect::<HashSet<_>>();
+    let mut evaluated = HashSet::new();
+    for evaluation in &result.context_evaluations {
+        let key = (evaluation.kind, evaluation.content_id.as_str());
+        if !delivered.contains(&key) || !evaluated.insert(key) {
+            return Err(ConsolidationValidationError(
+                "context evaluation references an invalid or repeated delivery".into(),
+            ));
+        }
+        if evaluation.reason.trim().is_empty()
+            || evaluation.reason.chars().count() > MAX_SUMMARY_TEXT_CHARS
+            || evaluation
+                .evidence_event_ids
+                .iter()
+                .any(|id| !event_ids.contains(id.as_str()))
+        {
+            return Err(ConsolidationValidationError(
+                "context evaluation has invalid evidence or reason".into(),
+            ));
+        }
+        if evaluation.utility == ContextUtility::Useful && evaluation.evidence_event_ids.is_empty()
+        {
+            return Err(ConsolidationValidationError(
+                "useful context needs session evidence".into(),
+            ));
+        }
+    }
+    if evaluated.len() != delivered.len() {
+        return Err(ConsolidationValidationError(
+            "every delivered context item needs an evaluation".into(),
+        ));
     }
     Ok(())
 }
@@ -608,7 +692,7 @@ pub fn consolidation_result_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["summary", "handoff", "knowledge"],
+        "required": ["summary", "handoff", "knowledge", "context_evaluations"],
         "properties": {
             "summary": {
                 "type": "object",
@@ -637,7 +721,23 @@ pub fn consolidation_result_schema() -> serde_json::Value {
                 }
             },
             "handoff": {"type": "array", "maxItems": 120, "items": handoff_operation_schema()},
-            "knowledge": {"type": "array", "maxItems": MAX_KNOWLEDGE_OPERATIONS, "items": knowledge_operation_schema()}
+            "knowledge": {"type": "array", "maxItems": MAX_KNOWLEDGE_OPERATIONS, "items": knowledge_operation_schema()},
+            "context_evaluations": {
+                "type": "array",
+                "maxItems": MAX_DELIVERED_CONTEXT_ITEMS,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["kind", "content_id", "utility", "evidence_event_ids", "reason"],
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["memory", "playbook", "handoff"]},
+                        "content_id": {"type": "string", "maxLength": 128},
+                        "utility": {"type": "string", "enum": ["useful", "unused", "irrelevant", "incomplete", "outdated", "contradicted", "harmful", "unknown"]},
+                        "evidence_event_ids": {"type": "array", "maxItems": MAX_SUMMARY_ITEMS, "items": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS}},
+                        "reason": {"type": "string", "maxLength": MAX_SUMMARY_TEXT_CHARS}
+                    }
+                }
+            }
         }
     })
 }
@@ -815,6 +915,7 @@ mod tests {
             handoff_items: vec![item(id)],
             related_summaries: Vec::new(),
             related_memories: Vec::new(),
+            delivered_context: Vec::new(),
         };
         for operation in [
             HandoffItemOperation::Resolve(HandoffTransition {
@@ -833,6 +934,7 @@ mod tests {
                     summary: summary(),
                     handoff: vec![operation],
                     knowledge: Vec::new(),
+                    context_evaluations: Vec::new(),
                 },
                 &packet,
             )
@@ -850,6 +952,7 @@ mod tests {
             handoff_items: vec![item(id)],
             related_summaries: Vec::new(),
             related_memories: Vec::new(),
+            delivered_context: Vec::new(),
         };
         let error = validate_consolidation_result(
             &packet,
@@ -857,6 +960,7 @@ mod tests {
                 summary: summary(),
                 handoff: Vec::new(),
                 knowledge: Vec::new(),
+                context_evaluations: Vec::new(),
             },
         )
         .unwrap_err();
@@ -878,11 +982,13 @@ mod tests {
                 handoff_items: Vec::new(),
                 related_summaries: Vec::new(),
                 related_memories: Vec::new(),
+                delivered_context: Vec::new(),
             },
             &ConsolidationResult {
                 summary: episodic,
                 handoff: Vec::new(),
                 knowledge: Vec::new(),
+                context_evaluations: Vec::new(),
             },
         )
         .unwrap_err();
@@ -922,6 +1028,7 @@ mod tests {
             handoff_items: Vec::new(),
             related_summaries: Vec::new(),
             related_memories: Vec::new(),
+            delivered_context: Vec::new(),
         }
     }
 

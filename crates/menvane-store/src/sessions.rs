@@ -5,7 +5,8 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use menvane_domain::{
-    ConsolidationExecution, ConsolidationResult, EpisodicSummary, HandoffItem, HandoffItemKind,
+    ConsolidationExecution, ConsolidationResult, ContextEvaluation, ContextUtility,
+    DeliveredContext, DeliveredContextKind, EpisodicSummary, HandoffItem, HandoffItemKind,
     HandoffItemSource, NormalizedEvent, NormalizedEventKind, ReinforcementSignal, SessionState,
     SummaryStatus,
 };
@@ -19,6 +20,20 @@ pub const MAX_HANDOFF_SOURCE_EVENTS: usize = 128;
 pub const MAX_HANDOFF_TOTAL_BYTES: usize = 32_768;
 pub const MAX_CHECKPOINT_DEBOUNCE_SECONDS: i64 = 86_400;
 pub const GLOBAL_HANDOFF_KEY: &str = "__global__";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryAudit {
+    pub content_kind: String,
+    pub content_id: String,
+    pub subject_id: String,
+    pub title: String,
+    pub content: String,
+    pub claimed_at: String,
+    pub evaluated_at: Option<String>,
+    pub utility: Option<String>,
+    pub evaluation_reason: Option<String>,
+    pub evidence_event_ids: Vec<String>,
+}
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -38,6 +53,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     imported INTEGER NOT NULL DEFAULT 0,
     summary_status TEXT NOT NULL DEFAULT 'pending',
     summary_json TEXT,
+    finalization_reason TEXT,
     UNIQUE(client, external_session_id, generation)
 );
 CREATE INDEX IF NOT EXISTS sessions_external ON sessions(client, external_session_id, generation DESC);
@@ -138,7 +154,14 @@ CREATE TABLE IF NOT EXISTS delivery_claims (
     generation INTEGER NOT NULL,
     content_kind TEXT NOT NULL,
     content_id TEXT NOT NULL,
+    subject_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
     claimed_at TEXT NOT NULL,
+    evaluated_at TEXT,
+    utility TEXT,
+    evaluation_reason TEXT,
+    evidence_event_ids_json TEXT,
     PRIMARY KEY(client, external_session_id, generation, content_kind, content_id)
 );
 "#;
@@ -157,6 +180,7 @@ pub struct SessionRecord {
     pub markdown_path: Option<PathBuf>,
     pub imported: bool,
     pub summary_status: SummaryStatus,
+    pub finalization_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +194,18 @@ pub struct InjectionIdentity {
     pub client: String,
     pub external_session_id: String,
     pub generation: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UtilitySummary {
+    pub useful: u32,
+    pub unused: u32,
+    pub irrelevant: u32,
+    pub incomplete: u32,
+    pub outdated: u32,
+    pub contradicted: u32,
+    pub harmful: u32,
+    pub unknown: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +276,8 @@ impl SessionRepository {
         reject_unversioned_database(&connection)?;
         connection.execute_batch(SCHEMA)?;
         ensure_retryable_job_column(&connection)?;
+        ensure_session_finalization_reason_column(&connection)?;
+        ensure_delivery_evaluation_columns(&connection)?;
         connection.execute("INSERT OR IGNORE INTO schema_meta(version) VALUES (1)", [])?;
         Ok(())
     }
@@ -286,9 +324,11 @@ impl SessionRepository {
         )?;
         let state = state_after_event(session.state, event.kind);
         let ended_at = (state == SessionState::Finalized).then(|| event.timestamp.to_rfc3339());
+        let finalization_reason =
+            (event.kind == NormalizedEventKind::SessionEnded).then_some("session-ended");
         transaction.execute(
-            "UPDATE sessions SET state=?1, last_event_at=?2, ended_at=COALESCE(?3, ended_at), project_id=COALESCE(project_id, ?4) WHERE id=?5",
-            params![session_state(state), event.timestamp.to_rfc3339(), ended_at, project_id, session.id.to_string()],
+            "UPDATE sessions SET state=?1, last_event_at=?2, ended_at=COALESCE(?3, ended_at), project_id=COALESCE(project_id, ?4), finalization_reason=COALESCE(?5, finalization_reason) WHERE id=?6",
+            params![session_state(state), event.timestamp.to_rfc3339(), ended_at, project_id, finalization_reason, session.id.to_string()],
         )?;
         if state == SessionState::Finalized {
             enqueue_job_tx(
@@ -323,18 +363,25 @@ impl SessionRepository {
         })
     }
 
-    pub fn finalize_idle_before(&self, cutoff: DateTime<Utc>) -> Result<Vec<SessionRecord>> {
+    pub fn finalize_inactive_before(
+        &self,
+        idle_cutoff: DateTime<Utc>,
+        open_cutoff: DateTime<Utc>,
+    ) -> Result<Vec<SessionRecord>> {
         let mut connection = self.open()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ids = {
-            let mut statement = transaction.prepare("SELECT id FROM sessions WHERE state='idle' AND last_event_at <= ?1 ORDER BY last_event_at")?;
+            let mut statement = transaction.prepare("SELECT id, CASE WHEN state='idle' THEN 'idle-timeout' ELSE 'inactivity-timeout' END FROM sessions WHERE (state='idle' AND last_event_at <= ?1) OR (state='open' AND last_event_at <= ?2) ORDER BY last_event_at")?;
             statement
-                .query_map([cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
+                .query_map(
+                    params![idle_cutoff.to_rfc3339(), open_cutoff.to_rfc3339()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut sessions = Vec::new();
-        for id in ids {
-            transaction.execute("UPDATE sessions SET state='finalized', ended_at=last_event_at WHERE id=?1 AND state='idle'", [&id])?;
+        for (id, reason) in ids {
+            transaction.execute("UPDATE sessions SET state='finalized', ended_at=last_event_at, finalization_reason=?2 WHERE id=?1 AND state IN ('idle', 'open')", params![id, reason])?;
             enqueue_job_tx(&transaction, "finalize_session", &id, "{}")?;
             sessions.push(session_by_id(&transaction, Uuid::parse_str(&id)?)?);
         }
@@ -377,14 +424,14 @@ impl SessionRepository {
     pub fn find_session(&self, id: Uuid) -> Result<Option<SessionRecord>> {
         let connection = self.open()?;
         connection
-            .query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE id=?1", [id.to_string()], session_from_row)
+            .query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions WHERE id=?1", [id.to_string()], session_from_row)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn sessions(&self, limit: usize) -> Result<Vec<SessionRecord>> {
         let connection = self.open()?;
-        let mut statement = connection.prepare("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions ORDER BY last_event_at DESC, id DESC LIMIT ?1")?;
+        let mut statement = connection.prepare("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions ORDER BY last_event_at DESC, id DESC LIMIT ?1")?;
         let rows = statement.query_map([i64::try_from(limit)?], session_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -633,9 +680,135 @@ impl SessionRepository {
         identity: &InjectionIdentity,
         content_kind: &str,
         content_id: &str,
+        subject_id: &str,
+        title: &str,
+        content: &str,
     ) -> Result<bool> {
         let connection = self.open()?;
-        Ok(connection.execute("INSERT OR IGNORE INTO delivery_claims(client, external_session_id, generation, content_kind, content_id, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![identity.client, identity.external_session_id, identity.generation, content_kind, content_id, Utc::now().to_rfc3339()])? == 1)
+        Ok(connection.execute("INSERT OR IGNORE INTO delivery_claims(client, external_session_id, generation, content_kind, content_id, subject_id, title, content, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)", params![identity.client, identity.external_session_id, identity.generation, content_kind, content_id, subject_id, title, content, Utc::now().to_rfc3339()])? == 1)
+    }
+
+    pub fn delivered_context(&self, session: &SessionRecord) -> Result<Vec<DeliveredContext>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare("SELECT content_kind, content_id, title, content FROM delivery_claims WHERE client=?1 AND external_session_id=?2 AND generation=?3 AND content_kind IN ('memory', 'playbook', 'handoff') ORDER BY claimed_at, content_kind, content_id")?;
+        let rows = statement.query_map(
+            params![
+                session.client,
+                session.external_session_id,
+                session.generation
+            ],
+            |row| {
+                let kind = parse_delivered_context_kind(&row.get::<_, String>(0)?)?;
+                Ok(DeliveredContext {
+                    kind,
+                    content_id: row.get(1)?,
+                    title: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delivery_audit(&self, session: &SessionRecord) -> Result<Vec<DeliveryAudit>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare("SELECT content_kind, content_id, subject_id, title, content, claimed_at, evaluated_at, utility, evaluation_reason, evidence_event_ids_json FROM delivery_claims WHERE client=?1 AND external_session_id=?2 AND generation=?3 ORDER BY claimed_at, content_kind, content_id")?;
+        let rows = statement.query_map(
+            params![
+                session.client,
+                session.external_session_id,
+                session.generation
+            ],
+            |row| {
+                let evidence = row
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                Ok(DeliveryAudit {
+                    content_kind: row.get(0)?,
+                    content_id: row.get(1)?,
+                    subject_id: row.get(2)?,
+                    title: row.get(3)?,
+                    content: row.get(4)?,
+                    claimed_at: row.get(5)?,
+                    evaluated_at: row.get(6)?,
+                    utility: row.get(7)?,
+                    evaluation_reason: row.get(8)?,
+                    evidence_event_ids: evidence,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn record_context_evaluations(
+        &self,
+        session: &SessionRecord,
+        evaluations: &[ContextEvaluation],
+    ) -> Result<Vec<ContextEvaluation>> {
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let evaluated_at = Utc::now().to_rfc3339();
+        let mut newly_recorded = Vec::new();
+        for evaluation in evaluations {
+            let changed = transaction.execute(
+                "UPDATE delivery_claims SET evaluated_at=?1, utility=?2, evaluation_reason=?3, evidence_event_ids_json=?4 WHERE client=?5 AND external_session_id=?6 AND generation=?7 AND content_kind=?8 AND content_id=?9 AND evaluated_at IS NULL",
+                params![
+                    evaluated_at,
+                    context_utility(evaluation.utility),
+                    evaluation.reason,
+                    serde_json::to_string(&evaluation.evidence_event_ids)?,
+                    session.client,
+                    session.external_session_id,
+                    session.generation,
+                    delivered_context_kind(evaluation.kind),
+                    evaluation.content_id,
+                ],
+            )?;
+            if changed == 1 {
+                newly_recorded.push(evaluation.clone());
+            } else {
+                let exists = transaction
+                    .query_row(
+                        "SELECT 1 FROM delivery_claims WHERE client=?1 AND external_session_id=?2 AND generation=?3 AND content_kind=?4 AND content_id=?5",
+                        params![session.client, session.external_session_id, session.generation, delivered_context_kind(evaluation.kind), evaluation.content_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    bail!("context evaluation does not match one delivery")
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(newly_recorded)
+    }
+
+    pub fn knowledge_utility(&self, memory_id: Uuid) -> Result<UtilitySummary> {
+        let connection = self.open()?;
+        let mut summary = UtilitySummary::default();
+        let mut statement = connection.prepare("SELECT utility, COUNT(*) FROM delivery_claims WHERE subject_id=?1 AND utility IS NOT NULL GROUP BY utility")?;
+        let rows = statement.query_map([memory_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
+        for row in rows {
+            let (utility, count) = row?;
+            match utility.as_str() {
+                "useful" => summary.useful = count,
+                "unused" => summary.unused = count,
+                "irrelevant" => summary.irrelevant = count,
+                "incomplete" => summary.incomplete = count,
+                "outdated" => summary.outdated = count,
+                "contradicted" => summary.contradicted = count,
+                "harmful" => summary.harmful = count,
+                "unknown" => summary.unknown = count,
+                _ => {}
+            }
+        }
+        Ok(summary)
     }
 
     pub fn integrations(&self) -> Result<Vec<IntegrationRecord>> {
@@ -847,7 +1020,7 @@ fn latest_session_tx(
     client: &str,
     external_session_id: &str,
 ) -> Result<Option<SessionRecord>> {
-    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1", params![client, external_session_id], session_from_row).optional().map_err(Into::into)
+    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions WHERE client=?1 AND external_session_id=?2 ORDER BY generation DESC LIMIT 1", params![client, external_session_id], session_from_row).optional().map_err(Into::into)
 }
 
 fn latest_session_for_project(
@@ -856,11 +1029,11 @@ fn latest_session_for_project(
     external_session_id: &str,
     project_id: Option<&str>,
 ) -> Result<Option<SessionRecord>> {
-    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE client=?1 AND external_session_id=?2 AND project_id IS ?3 ORDER BY generation DESC LIMIT 1", params![client, external_session_id, project_id], session_from_row).optional().map_err(Into::into)
+    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions WHERE client=?1 AND external_session_id=?2 AND project_id IS ?3 ORDER BY generation DESC LIMIT 1", params![client, external_session_id, project_id], session_from_row).optional().map_err(Into::into)
 }
 
 fn session_by_id(connection: &Connection, id: Uuid) -> Result<SessionRecord> {
-    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status FROM sessions WHERE id=?1", [id.to_string()], session_from_row).map_err(Into::into)
+    connection.query_row("SELECT id, client, external_session_id, project_id, generation, state, started_at, ended_at, last_event_at, markdown_path, imported, summary_status, finalization_reason FROM sessions WHERE id=?1", [id.to_string()], session_from_row).map_err(Into::into)
 }
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -877,6 +1050,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
         markdown_path: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
         imported: row.get(10)?,
         summary_status: parse_summary_status(&row.get::<_, String>(11)?)?,
+        finalization_reason: row.get(12)?,
     })
 }
 
@@ -978,6 +1152,78 @@ fn ensure_retryable_job_column(connection: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn ensure_session_finalization_reason_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "finalization_reason") {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN finalization_reason TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_delivery_evaluation_columns(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(delivery_claims)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (column, definition) in [
+        ("subject_id", "TEXT NOT NULL DEFAULT ''"),
+        ("title", "TEXT NOT NULL DEFAULT ''"),
+        ("content", "TEXT NOT NULL DEFAULT ''"),
+        ("evaluated_at", "TEXT"),
+        ("utility", "TEXT"),
+        ("evaluation_reason", "TEXT"),
+        ("evidence_event_ids_json", "TEXT"),
+    ] {
+        if !columns.iter().any(|existing| existing == column) {
+            connection.execute(
+                &format!("ALTER TABLE delivery_claims ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    connection.execute(
+        "UPDATE delivery_claims SET subject_id=content_id WHERE subject_id=''",
+        [],
+    )?;
+    Ok(())
+}
+
+fn delivered_context_kind(kind: DeliveredContextKind) -> &'static str {
+    match kind {
+        DeliveredContextKind::Memory => "memory",
+        DeliveredContextKind::Playbook => "playbook",
+        DeliveredContextKind::Handoff => "handoff",
+    }
+}
+
+fn parse_delivered_context_kind(value: &str) -> rusqlite::Result<DeliveredContextKind> {
+    match value {
+        "memory" => Ok(DeliveredContextKind::Memory),
+        "playbook" => Ok(DeliveredContextKind::Playbook),
+        "handoff" => Ok(DeliveredContextKind::Handoff),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn context_utility(utility: ContextUtility) -> &'static str {
+    match utility {
+        ContextUtility::Useful => "useful",
+        ContextUtility::Unused => "unused",
+        ContextUtility::Irrelevant => "irrelevant",
+        ContextUtility::Incomplete => "incomplete",
+        ContextUtility::Outdated => "outdated",
+        ContextUtility::Contradicted => "contradicted",
+        ContextUtility::Harmful => "harmful",
+        ContextUtility::Unknown => "unknown",
+    }
 }
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRecord> {

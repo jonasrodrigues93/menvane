@@ -39,12 +39,16 @@ impl<'a> SessionEngine<'a> {
         })
     }
 
-    pub fn finalize_idle(&self, idle_seconds: u64) -> Result<usize> {
-        let seconds = i64::try_from(idle_seconds)?;
+    pub fn finalize_inactive(&self, idle_seconds: u64, open_seconds: u64) -> Result<usize> {
+        let idle_seconds = i64::try_from(idle_seconds)?;
+        let open_seconds = i64::try_from(open_seconds)?;
         Ok(self
             .menvane
             .sessions
-            .finalize_idle_before(Utc::now() - Duration::seconds(seconds))?
+            .finalize_inactive_before(
+                Utc::now() - Duration::seconds(idle_seconds),
+                Utc::now() - Duration::seconds(open_seconds),
+            )?
             .len())
     }
 
