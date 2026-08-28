@@ -153,22 +153,23 @@ install -d "$HOME/.local/bin"
 install -m 755 menvane "$HOME/.local/bin/menvane"
 ```
 
-The release workflow runs for `v*` tags, packages one executable per asset,
-and publishes the `SHA256SUMS` manifest with the GitHub release. Native
-Windows is not a release target.
+The release workflow runs when a `v*` GitHub release is published, packages one
+executable per asset, and publishes the `SHA256SUMS` manifest with that release.
+Native Windows is not a release target.
 
-### Automatic Versioning
+### Manual Releases
 
-Release automation follows [Conventional Commits](https://www.conventionalcommits.org/):
+Release versions are selected manually by creating and publishing a GitHub release with a `vX.Y.Z` tag. Publishing the release starts the binary workflow, which builds and attaches one archive per supported target plus `SHA256SUMS`:
 
-- `fix:` creates a patch release.
-- `feat:` creates a minor release.
-- `BREAKING CHANGE` or `!` creates a major release.
+- Linux x86_64: `x86_64-unknown-linux-gnu`
+- Linux arm64: `aarch64-unknown-linux-gnu`
+- macOS Intel: `x86_64-apple-darwin`
+- macOS Apple Silicon: `aarch64-apple-darwin`
 
-After changes reach `master`, GitHub Actions opens or updates a release PR.
-Merging it updates the Cargo workspace version, creates a `vX.Y.Z` tag, and
-publishes the platform binaries automatically. The binary workflow can also be
-run directly by pushing a `vX.Y.Z` tag.
+When creating the release, use GitHub's generated release notes to consolidate
+pull requests under Features, Fixes, and Other Changes. The workflow does not
+calculate versions, create tags, or modify the Cargo workspace version. It can
+also be dispatched manually for an already published release tag.
 
 ### Enable Memory Compilation
 

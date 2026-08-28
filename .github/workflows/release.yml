@@ -1,13 +1,13 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_call:
+  release:
+    types:
+      - published
+  workflow_dispatch:
     inputs:
       tag_name:
-        description: Tag to build and publish
+        description: Published release tag to build
         required: true
         type: string
 
@@ -36,7 +36,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.tag_name || github.ref }}
+          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -110,10 +110,9 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.event.release.tag_name || inputs.tag_name }}
         run: |
           set -eu
-          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
-              gh release create "$TAG_NAME" --verify-tag --title "Menvane $TAG_NAME" --generate-notes
-          fi
-          gh release upload "$TAG_NAME" dist/menvane-*.tar.gz dist/SHA256SUMS --clobber
+          gh release view "$TAG_NAME" --repo "$GH_REPO" >/dev/null
+          gh release upload "$TAG_NAME" dist/menvane-*.tar.gz dist/SHA256SUMS --clobber --repo "$GH_REPO"

@@ -154,23 +154,23 @@ install -d "$HOME/.local/bin"
 install -m 755 menvane "$HOME/.local/bin/menvane"
 ```
 
-O workflow de release é executado para tags `v*`, empacota um executável por
-asset e publica o manifesto `SHA256SUMS` com o release do GitHub. Windows
-nativo não é um alvo de release.
+O workflow de release é executado quando um release `v*` do GitHub é publicado,
+empacota um executável por asset e publica o manifesto `SHA256SUMS` com esse
+release. Windows nativo não é um alvo de release.
 
-### Versionamento automático
+### Releases manuais
 
-A automação de release segue [Conventional Commits](https://www.conventionalcommits.org/):
+As versões são escolhidas manualmente ao criar e publicar um release do GitHub com uma tag `vX.Y.Z`. A publicação inicia o workflow de binários, que compila e anexa um arquivo por alvo suportado e o `SHA256SUMS`:
 
-- `fix:` cria um release patch.
-- `feat:` cria um release minor.
-- `BREAKING CHANGE` ou `!` cria um release major.
+- Linux x86_64: `x86_64-unknown-linux-gnu`
+- Linux arm64: `aarch64-unknown-linux-gnu`
+- macOS Intel: `x86_64-apple-darwin`
+- macOS Apple Silicon: `aarch64-apple-darwin`
 
-Depois que as mudanças chegam à branch `master`, o GitHub Actions abre ou
-atualiza um PR de release. Ao fazer merge, ele atualiza a versão do workspace
-Cargo, cria uma tag `vX.Y.Z` e publica automaticamente os binários das
-plataformas. O workflow de binários também pode ser executado diretamente ao
-enviar uma tag `vX.Y.Z`.
+Ao criar o release, use as notas geradas pelo GitHub para consolidar os PRs nas
+categorias Features, Fixes e Other Changes. O workflow não calcula versões,
+cria tags nem altera a versão do workspace Cargo. Ele também pode ser iniciado
+manualmente para uma tag de release já publicada.
 
 ### Ative a compilação de memória
 
