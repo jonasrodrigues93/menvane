@@ -356,6 +356,47 @@ fn inferred_memory_and_playbook_cross_the_promotion_barrier() {
 }
 
 #[test]
+fn similar_created_knowledge_is_consolidated_into_existing_record() {
+    let mut result = promotion_result();
+    result["knowledge"][0]["content"]["memory"]["body"] = serde_json::json!(
+        "Remote deployments require an external approval window before verification and audit."
+    );
+    let (_temporary, project, _provider, menvane) = setup_provider(vec![Ok(result)]);
+    let existing = menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Remote deployment approval".to_owned(),
+                body: "Remote deployments require an external approval window before verification."
+                    .to_owned(),
+                knowledge_type: KnowledgeType::Memory,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    ingest_promotion_session(&menvane, &project);
+    process_next_job(&menvane);
+    process_next_job(&menvane);
+
+    let memories = menvane.all_memories().unwrap();
+    assert_eq!(memories.len(), 2);
+    let consolidated = memories
+        .iter()
+        .find(|memory| memory.metadata.knowledge_type == KnowledgeType::Memory)
+        .unwrap();
+    assert_eq!(consolidated.metadata.id, existing.metadata.id);
+    assert_eq!(consolidated.metadata.source_sessions.len(), 1);
+    assert!(
+        consolidated
+            .body
+            .contains("Additional consolidated detail:")
+    );
+}
+
+#[test]
 fn playbook_application_is_independent_and_idempotent() {
     let (_temporary, project, provider, menvane) =
         setup_provider(vec![Ok(promotion_result()), Ok(promotion_result())]);
@@ -1457,14 +1498,14 @@ fn related_prompt_receives_matching_items_and_bounded_cards() {
             Uuid::from_u128(43),
         ))
         .unwrap();
-    for number in 0..5 {
+    for topic in ["alpha", "bravo", "charlie", "delta", "echo"] {
         menvane
             .write(
                 &project,
                 WriteMemory {
-                    title: format!("Export schema note {number}"),
+                    title: format!("Export schema {topic} note"),
                     body: format!(
-                        "Export schema guidance number {number} explains the remote runner \
+                        "Export schema guidance for {topic} explains the remote runner \
                          approval flow in detail with several additional descriptive filler \
                          words so the stored body stays well beyond the excerpt window and \
                          only ends with the FULL_BODY_MARKER token."
@@ -1484,9 +1525,44 @@ fn related_prompt_receives_matching_items_and_bounded_cards() {
     assert!(context.contains("Current work in progress:"));
     assert!(context.contains("Export is blocked on the schema"));
     assert!(!context.contains("Billing invoice cleanup"));
-    assert!(context.matches("[MEMORY CARD]").count() <= 3);
-    assert!(context.contains("[MEMORY CARD]"));
-    assert!(!context.contains("FULL_BODY_MARKER"));
+    assert!(context.matches("Relevant historical information:").count() <= 3);
+    assert!(context.contains("Relevant historical information:"));
+    assert!(context.contains("FULL_BODY_MARKER"));
+    assert!(!context.contains("MENVANE"));
+    assert!(!context.contains("ID:"));
+}
+
+#[test]
+fn automatic_recall_abstains_when_match_confidence_is_below_minimum() {
+    let (_temporary, project, menvane) = setup_project();
+    menvane
+        .write(
+            &project,
+            WriteMemory {
+                title: "Remote deployment approval".to_owned(),
+                body: "Remote deployments require an external approval window before verification."
+                    .to_owned(),
+                knowledge_type: KnowledgeType::Memory,
+                scope: Scope::Project,
+                tags: Vec::new(),
+                applies_to: Applicability::default(),
+            },
+        )
+        .unwrap();
+
+    let recall = menvane
+        .prompt_recall(
+            &project,
+            "test",
+            "low-confidence",
+            "remote billing schema migration",
+            3,
+        )
+        .unwrap();
+
+    assert!(recall.results.is_empty());
+    assert_eq!(recall.diagnostics.abstention_reason, "below-confidence");
+    assert!(recall.diagnostics.candidates_considered <= 1);
 }
 
 #[test]
