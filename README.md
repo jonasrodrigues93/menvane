@@ -153,23 +153,27 @@ install -d "$HOME/.local/bin"
 install -m 755 menvane "$HOME/.local/bin/menvane"
 ```
 
-The release workflow runs when a `v*` GitHub release is published, packages one
-executable per asset, and publishes the `SHA256SUMS` manifest with that release.
-Native Windows is not a release target.
+The release workflow runs when a `v*` tag is pushed, verifies that the tag
+matches the Cargo workspace version, runs the project checks, packages one
+executable per asset, and creates the GitHub release with `SHA256SUMS`. Native
+Windows is not a release target.
 
 ### Manual Releases
 
-Release versions are selected manually by creating and publishing a GitHub release with a `vX.Y.Z` tag. Publishing the release starts the binary workflow, which builds and attaches one archive per supported target plus `SHA256SUMS`:
+Release versions are selected manually by updating the Cargo workspace version,
+merging that change with a green CI run, and pushing the matching `vX.Y.Z` tag.
+The tag starts the binary workflow, which validates the project and creates a
+release with one archive per supported target plus `SHA256SUMS`:
 
 - Linux x86_64: `x86_64-unknown-linux-gnu`
 - Linux arm64: `aarch64-unknown-linux-gnu`
 - macOS Intel: `x86_64-apple-darwin`
 - macOS Apple Silicon: `aarch64-apple-darwin`
 
-When creating the release, use GitHub's generated release notes to consolidate
-pull requests under Features, Fixes, and Other Changes. The workflow does not
-calculate versions, create tags, or modify the Cargo workspace version. It can
-also be dispatched manually for an already published release tag.
+GitHub-generated release notes consolidate pull requests under Features, Fixes,
+and Other Changes. The workflow does not calculate versions, create tags, or
+modify the Cargo workspace version. It can also be dispatched manually for an
+existing matching tag.
 
 ### Enable Memory Compilation
 

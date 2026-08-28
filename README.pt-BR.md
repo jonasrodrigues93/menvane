@@ -154,23 +154,27 @@ install -d "$HOME/.local/bin"
 install -m 755 menvane "$HOME/.local/bin/menvane"
 ```
 
-O workflow de release é executado quando um release `v*` do GitHub é publicado,
-empacota um executável por asset e publica o manifesto `SHA256SUMS` com esse
-release. Windows nativo não é um alvo de release.
+O workflow de release é executado quando uma tag `v*` é enviada, verifica se a
+tag corresponde à versão do workspace Cargo, executa as validações do projeto,
+empacota um executável por asset e cria o release do GitHub com `SHA256SUMS`.
+Windows nativo não é um alvo de release.
 
 ### Releases manuais
 
-As versões são escolhidas manualmente ao criar e publicar um release do GitHub com uma tag `vX.Y.Z`. A publicação inicia o workflow de binários, que compila e anexa um arquivo por alvo suportado e o `SHA256SUMS`:
+As versões são escolhidas manualmente ao atualizar a versão do workspace Cargo,
+integrar essa alteração com o CI verde e enviar a tag `vX.Y.Z` correspondente.
+A tag inicia o workflow de binários, que valida o projeto e cria um release com
+um arquivo por alvo suportado e o `SHA256SUMS`:
 
 - Linux x86_64: `x86_64-unknown-linux-gnu`
 - Linux arm64: `aarch64-unknown-linux-gnu`
 - macOS Intel: `x86_64-apple-darwin`
 - macOS Apple Silicon: `aarch64-apple-darwin`
 
-Ao criar o release, use as notas geradas pelo GitHub para consolidar os PRs nas
-categorias Features, Fixes e Other Changes. O workflow não calcula versões,
-cria tags nem altera a versão do workspace Cargo. Ele também pode ser iniciado
-manualmente para uma tag de release já publicada.
+As notas geradas pelo GitHub consolidam os PRs nas categorias Features, Fixes e
+Other Changes. O workflow não calcula versões, cria tags nem altera a versão do
+workspace Cargo. Ele também pode ser iniciado manualmente para uma tag
+correspondente já existente.
 
 ### Ative a compilação de memória
 

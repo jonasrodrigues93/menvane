@@ -1,22 +1,70 @@
 name: Release
 
 on:
-  release:
-    types:
-      - published
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       tag_name:
-        description: Published release tag to build
+        description: Existing tag to build and publish
         required: true
         type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag_name || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          components: clippy, rustfmt
+
+      - name: Verify release version
+        env:
+          TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          set -eu
+          package_version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "menvane-cli"))')
+          expected_tag="v${package_version}"
+          if [ "$TAG_NAME" != "$expected_tag" ]; then
+              printf 'Release tag %s does not match Cargo version %s\n' "$TAG_NAME" "$package_version" >&2
+              exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --workspace --all-targets --all-features
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Test installer
+        run: ./tests/install.sh
+
   build:
     name: Build ${{ matrix.target }}
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +84,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag_name }}
+          ref: ${{ inputs.tag_name || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +129,7 @@ jobs:
           PY
 
       - name: Upload packaged binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: release-${{ matrix.target }}
           path: dist/menvane-${{ matrix.target }}.tar.gz
@@ -95,7 +143,7 @@ jobs:
       contents: write
     steps:
       - name: Download packaged binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: release-*
           path: dist
@@ -111,8 +159,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG_NAME: ${{ github.event.release.tag_name || inputs.tag_name }}
+          TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
         run: |
           set -eu
-          gh release view "$TAG_NAME" --repo "$GH_REPO" >/dev/null
-          gh release upload "$TAG_NAME" dist/menvane-*.tar.gz dist/SHA256SUMS --clobber --repo "$GH_REPO"
+          if gh release view "$TAG_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
+              gh release upload "$TAG_NAME" dist/menvane-*.tar.gz dist/SHA256SUMS --clobber --repo "$GH_REPO"
+          else
+              gh release create "$TAG_NAME" dist/menvane-*.tar.gz dist/SHA256SUMS --verify-tag --title "Menvane $TAG_NAME" --generate-notes --repo "$GH_REPO"
+          fi
