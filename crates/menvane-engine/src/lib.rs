@@ -42,8 +42,9 @@ pub use decay::{MemoryDecay, memory_decay};
 pub use embeddings::OpenAICompatibleEmbeddingProvider;
 pub use github_copilot_provider::GithubCopilotProvider;
 pub use menvane_store::{
-    ConsolidationMarker, IngestResult, JobRecord as StoreJobRecord, MAX_HANDOFF_ITEM_BYTES,
-    MAX_HANDOFF_LIST_LIMIT, RecallContext, SessionEvent, SessionRecord, conversation_key,
+    ConsolidationMarker, DeliveryAudit, IngestResult, JobRecord as StoreJobRecord,
+    MAX_HANDOFF_ITEM_BYTES, MAX_HANDOFF_LIST_LIMIT, RecallContext, SessionEvent, SessionRecord,
+    conversation_key,
 };
 pub use oauth_provider::OpenAiOAuthProvider;
 pub use project_resolver::{ProjectResolution, ProjectResolver, normalize_git_remote};
@@ -853,6 +854,13 @@ impl Menvane {
 
     pub fn session_consolidation(&self, id: Uuid) -> Result<Option<ConsolidationMarker>> {
         self.sessions.consolidation_result(id)
+    }
+
+    pub fn session_delivery_audit(&self, id: Uuid) -> Result<Vec<DeliveryAudit>> {
+        let Some(session) = self.sessions.find_session(id)? else {
+            return Ok(Vec::new());
+        };
+        self.sessions.delivery_audit(&session)
     }
 
     pub fn handoff_is_stale(&self, _project: &Project) -> Result<Option<bool>> {

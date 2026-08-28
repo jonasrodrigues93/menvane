@@ -238,6 +238,7 @@ async fn session_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid
         let summary = menvane.session_summary(id)?;
         let consolidation = menvane.session_consolidation(id)?;
         let events = menvane.session_events(id)?;
+        let deliveries = menvane.session_delivery_audit(id)?;
         let evidence = events.iter().map(session_evidence_row).collect::<String>();
         let evidence_section = format!(
             "<section class='panel'><header class='panel-head'><div><h2>Session evidence</h2><p>Chronological, sanitized capture</p></div></header><div class='evidence-list'>{}</div></section>",
@@ -247,8 +248,9 @@ async fn session_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid
                 evidence
             }
         );
+        let delivery_section = delivery_audit_section(&deliveries);
         Ok(format!(
-            "{}<section class='panel session-overview'><div><span class='eyebrow'>Session identity</span><h2>{} / {}</h2><p>Last event {}</p></div><div class='status-stack'><span class='status-badge'>{:?}</span><span class='status-badge subtle'>Summary {:?}</span></div></section><div class='session-detail-grid'><div>{}{}</div><aside>{}</aside></div>",
+            "{}<section class='panel session-overview'><div><span class='eyebrow'>Session identity</span><h2>{} / {}</h2><p>Last event {}</p></div><div class='status-stack'><span class='status-badge'>{:?}</span><span class='status-badge subtle'>Summary {:?}</span></div></section><div class='session-detail-grid'><div>{}{}{}</div><aside>{}</aside></div>",
             page_head("Session", "Episodic summary and chronological evidence."),
             escape(&session.client),
             escape(&session.external_session_id),
@@ -257,6 +259,7 @@ async fn session_detail(State(menvane): State<Arc<Menvane>>, Path(id): Path<Uuid
             session.summary_status,
             summary_section(summary.as_ref()),
             evidence_section,
+            delivery_section,
             consolidation_section(consolidation.as_ref()),
         ))
     });
@@ -310,6 +313,35 @@ fn consolidation_section(consolidation: Option<&menvane_engine::ConsolidationMar
         execution
             .credits
             .map_or_else(|| "not reported".to_owned(), |credits| credits.to_string()),
+    )
+}
+
+fn delivery_audit_section(deliveries: &[menvane_engine::DeliveryAudit]) -> String {
+    let rows = deliveries
+        .iter()
+        .map(|delivery| {
+            let assessment = delivery.utility.as_deref().unwrap_or("pending assessment");
+            let reason = delivery
+                .evaluation_reason
+                .as_deref()
+                .unwrap_or("awaiting post-session evidence");
+            format!(
+                "<article class='evidence-row'><div><strong>{}</strong><span>{}</span></div><p><b>{}</b> — {}<br>{}</p></article>",
+                escape(&delivery.title),
+                escape(&delivery.content_kind),
+                escape(assessment),
+                escape(reason),
+                escape(&delivery.content),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<section class='panel'><header class='panel-head'><div><h2>Delivered context</h2><p>Exact automatic cards and post-session assessment</p></div></header><div class='evidence-list'>{}</div></section>",
+        if rows.is_empty() {
+            empty_state("No automatic context was delivered.")
+        } else {
+            rows
+        }
     )
 }
 

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "client", "external_session_id", "project_id", "generation", "state", "started_at", "ended_at", "last_event_at", "imported", "summary_status", "summary", "consolidation", "events"],
+  "required": ["id", "client", "external_session_id", "project_id", "generation", "state", "started_at", "ended_at", "last_event_at", "imported", "summary_status", "summary", "consolidation", "events", "deliveries"],
   "properties": {
     "id": { "type": "string", "format": "uuid" },
     "client": { "type": "string" },
@@ -17,6 +17,7 @@
     "summary_status": { "enum": ["pending", "ready", "skipped"] },
     "summary": { "type": ["object", "null"] },
     "consolidation": { "type": ["object", "null"] },
-    "events": { "type": "array" }
+    "events": { "type": "array" },
+    "deliveries": { "type": "array" }
   }
 }

@@ -21,6 +21,20 @@ pub const MAX_HANDOFF_TOTAL_BYTES: usize = 32_768;
 pub const MAX_CHECKPOINT_DEBOUNCE_SECONDS: i64 = 86_400;
 pub const GLOBAL_HANDOFF_KEY: &str = "__global__";
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DeliveryAudit {
+    pub content_kind: String,
+    pub content_id: String,
+    pub subject_id: String,
+    pub title: String,
+    pub content: String,
+    pub claimed_at: String,
+    pub evaluated_at: Option<String>,
+    pub utility: Option<String>,
+    pub evaluation_reason: Option<String>,
+    pub evidence_event_ids: Vec<String>,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (
     version INTEGER PRIMARY KEY CHECK (version = 1)
@@ -690,6 +704,38 @@ impl SessionRepository {
                     content_id: row.get(1)?,
                     title: row.get(2)?,
                     content: row.get(3)?,
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delivery_audit(&self, session: &SessionRecord) -> Result<Vec<DeliveryAudit>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare("SELECT content_kind, content_id, subject_id, title, content, claimed_at, evaluated_at, utility, evaluation_reason, evidence_event_ids_json FROM delivery_claims WHERE client=?1 AND external_session_id=?2 AND generation=?3 ORDER BY claimed_at, content_kind, content_id")?;
+        let rows = statement.query_map(
+            params![
+                session.client,
+                session.external_session_id,
+                session.generation
+            ],
+            |row| {
+                let evidence = row
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or_default();
+                Ok(DeliveryAudit {
+                    content_kind: row.get(0)?,
+                    content_id: row.get(1)?,
+                    subject_id: row.get(2)?,
+                    title: row.get(3)?,
+                    content: row.get(4)?,
+                    claimed_at: row.get(5)?,
+                    evaluated_at: row.get(6)?,
+                    utility: row.get(7)?,
+                    evaluation_reason: row.get(8)?,
+                    evidence_event_ids: evidence,
                 })
             },
         )?;

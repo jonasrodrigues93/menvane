@@ -207,6 +207,9 @@ async fn api_session_detail(
         .session_consolidation(id)
         .map_err(internal_server_error)?;
     let events = menvane.session_events(id).map_err(internal_server_error)?;
+    let deliveries = menvane
+        .session_delivery_audit(id)
+        .map_err(internal_server_error)?;
     let mut detail = session_json(&session);
     detail["summary"] = json!(summary);
     detail["consolidation"] = consolidation.map_or(Value::Null, |marker| {
@@ -224,6 +227,7 @@ async fn api_session_detail(
         })
     });
     detail["events"] = json!(events);
+    detail["deliveries"] = json!(deliveries);
     Ok(Json(detail))
 }
 
