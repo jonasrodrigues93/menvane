@@ -86,20 +86,38 @@ Requisitos: macOS ou Linux com shell POSIX, `install`, e `curl` ou `wget` com
 exige uma sessão systemd do usuário e `systemctl --user`; no WSL, o systemd
 precisa estar habilitado. Windows nativo ainda não é um alvo de release.
 
+Instalação em uma linha (sem precisar clonar o repositório):
+
 ```bash
+# Usando curl
 curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
   https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh
 
+# Ou usando wget
+wget --https-only -qO- \
+  https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh
+```
+
+Em seguida, verifique a instalação e conecte seu agente:
+
+```bash
 menvane doctor
 menvane connect claude
 ```
 
 O script baixa e verifica o release compatível mais recente e o instala em
-`~/.local/bin/menvane`. Use `--version <versão>` para fixar um release ou
-`--binary <caminho>` para instalar um executável existente. Se não houver um
-release compatível, a instalação falha em vez de compilar da fonte. Uma versão
-solicitada que não esteja disponível falha sem instalar uma versão diferente.
-Garanta que `~/.local/bin` esteja no seu `PATH`.
+`~/.local/bin/menvane`. Para fixar uma versão específica via instalação direta:
+
+```bash
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh -s -- --version 0.1.0
+```
+
+Use `--version <versão>` ao executar a partir de um checkout para fixar um
+release ou `--binary <caminho>` para instalar um executável existente. Se não
+houver um release compatível, a instalação falha em vez de compilar da fonte.
+Uma versão solicitada que não esteja disponível falha sem instalar uma versão
+diferente. Garanta que `~/.local/bin` esteja no seu `PATH`.
 
 No Linux, a instalação habilita e inicia um `menvane.service` no escopo do
 usuário. O daemon e a UI local passam a iniciar automaticamente com a sessão

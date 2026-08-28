@@ -86,19 +86,37 @@ Requirements: macOS or Linux with a POSIX shell, `install`, and `curl` or
 requires a user systemd session and `systemctl --user`; WSL requires systemd to
 be enabled. Native Windows is not currently a release target.
 
+One-line installation (no clone required):
+
 ```bash
+# Using curl
 curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
   https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh
 
+# Or using wget
+wget --https-only -qO- \
+  https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh
+```
+
+Then check the installation and connect your agent:
+
+```bash
 menvane doctor
 menvane connect claude
 ```
 
 The script downloads and verifies the latest compatible release, then installs
-it at `~/.local/bin/menvane`. Use a checkout's `./install.sh --version
-<version>` for a pinned release or `./install.sh --binary <path>` to install an
-existing executable. If no compatible release is available, installation fails
-instead of compiling from source. Make sure `~/.local/bin` is in your `PATH`.
+it at `~/.local/bin/menvane`. For a pinned release via one-liner:
+
+```bash
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh -s -- --version 0.1.0
+```
+
+Use a checkout's `./install.sh --version <version>` for a pinned release or
+`./install.sh --binary <path>` to install an existing executable. If no
+compatible release is available, installation fails instead of compiling from
+source. Make sure `~/.local/bin` is in your `PATH`.
 
 On Linux, installation enables and starts a user-scoped `menvane.service`.
 The daemon and local UI then start automatically with the user session. On
