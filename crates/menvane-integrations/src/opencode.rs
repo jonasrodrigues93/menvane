@@ -167,7 +167,7 @@ export const Menvane = async ({{ directory }}) => {{
     if (!prompt) return
     const response = await invoke("UserPromptSubmit", {{ session_id: input.sessionID, cwd: directory, prompt, hook_event_name: "UserPromptSubmit" }})
     const context = response.hookSpecificOutput?.additionalContext
-    if (context && Array.isArray(output.parts)) output.parts.push({{ type: "text", text: `\n\n${{context}}` }})
+    if (context && Array.isArray(output.parts)) output.parts.push({{ id: crypto.randomUUID(), sessionID: input.sessionID, messageID: output.message.id, type: "text", text: `\n\n${{context}}`, synthetic: true }})
   }},
   "experimental.chat.system.transform": async (input, output) => {{
     if (!input.sessionID) return
@@ -261,6 +261,9 @@ mod tests {
         assert!(source.contains("const response = await invoke(\"UserPromptSubmit\""));
         assert!(source.contains("response.hookSpecificOutput?.additionalContext"));
         assert!(source.contains("output.parts.push"));
+        assert!(source.contains("id: crypto.randomUUID()"));
+        assert!(source.contains("messageID: output.message.id"));
+        assert!(source.contains("synthetic: true"));
         assert!(source.contains("output.system.push"));
         assert!(!source.contains("output.options.system"));
         assert!(installer.disconnect().unwrap());
