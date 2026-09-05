@@ -219,6 +219,18 @@ menvane provider status
 
 The login command prints a GitHub verification URL and user code. Menvane stores its own refreshable credentials under `~/.menvane/oauth/github-copilot.json` and never reads GitHub CLI or Copilot CLI credentials.
 
+To use an API-compatible provider, define the key directly in `~/.menvane/config.toml`:
+
+```toml
+[llm]
+provider = "openai-api"
+model = "gpt-4.1-mini"
+base_url = "https://api.openai.com/v1"
+api_key = "your-api-key"
+```
+
+The `api_key_env` field remains available as a fallback when `api_key` is not set. TOML keys are stored in plain text and included in backups.
+
 ## Integrations
 
 | Client | Connect command | Captured lifecycle |
@@ -243,19 +255,20 @@ Session start delivers only minimal project identity and the current handoff. Ea
 
 Explicit search uses the query provided by the caller. Full Markdown and bounded provenance remain available through `menvane read` and the local UI.
 
-Automatic recall uses conservative English and Portuguese lexical matching. It combines FTS5 with embeddings whenever an independent embedding provider is configured and healthy, and falls back to FTS5 when embeddings are unavailable. Configure an OpenAI-compatible embedding endpoint in `~/.menvane/config.toml`:
+Automatic recall uses conservative English and Portuguese lexical matching. It combines FTS5 with embeddings whenever an independent embedding provider is configured and healthy, and falls back to FTS5 when embeddings are unavailable. Configure an OpenAI-compatible embedding endpoint in `~/.menvane/config.toml`; the key can be defined directly in TOML:
 
 ```toml
 [embeddings]
 provider = "openai-api"
 model = "text-embedding-3-small"
 base_url = "https://api.openai.com/v1"
+api_key = "your-api-key"
 api_key_env = "OPENAI_API_KEY"
 min_similarity = 0.78
 ```
 
 Restart the daemon and run `menvane reindex` after enabling or changing the embedding model.
-External embeddings are disabled by default. Enabling them sends sanitized recall prompts and durable memory titles and bodies to the configured endpoint.
+External embeddings are disabled by default. Enabling them sends sanitized recall prompts and durable memory titles and bodies to the configured endpoint. When `api_key` is absent, `api_key_env` continues to define the environment variable name used.
 
 ## Privacy And Trust
 
@@ -266,6 +279,7 @@ External embeddings are disabled by default. Enabling them sends sanitized recal
 - Private model reasoning is never captured.
 - Injected memories are historical context; current user instructions and repository state remain authoritative.
 - Menvane never reads or modifies OpenCode or Codex credentials.
+- Keys defined in `api_key` are stored in plain text in `config.toml` and included in backups.
 
 ## Recovery
 

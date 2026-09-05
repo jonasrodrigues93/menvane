@@ -29,9 +29,8 @@ impl OpenAICompatibleEmbeddingProvider {
         }
     }
 
-    #[cfg(test)]
-    fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
-        self.api_key = Some(api_key.into());
+    pub fn with_optional_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
         self
     }
 
@@ -39,9 +38,12 @@ impl OpenAICompatibleEmbeddingProvider {
         let api_key = self
             .api_key
             .clone()
-            .map(Ok)
-            .unwrap_or_else(|| env::var(&self.api_key_env))
-            .map_err(|_| EmbeddingError::Unavailable(format!("{} is not set", self.api_key_env)))?;
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| env::var(&self.api_key_env).ok())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                EmbeddingError::Unavailable(format!("{} is not set", self.api_key_env))
+            })?;
         let response = Client::new()
             .post(format!(
                 "{}/embeddings",
@@ -184,7 +186,7 @@ mod tests {
             format!("http://{address}/v1"),
             "UNUSED_API_KEY",
         )
-        .with_api_key("secret");
+        .with_optional_api_key(Some("secret".to_owned()));
 
         assert_eq!(provider.embed("semantic input").unwrap(), vec![0.5, -0.25]);
         server.join().unwrap();

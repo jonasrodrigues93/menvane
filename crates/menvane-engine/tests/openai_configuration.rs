@@ -1,5 +1,6 @@
 use std::fs;
 
+use menvane_domain::ProviderHealth;
 use menvane_engine::Menvane;
 use tempfile::TempDir;
 
@@ -40,4 +41,29 @@ fn github_copilot_configuration_uses_device_oauth_without_token_configuration() 
     assert!(configuration.contains("base_url = \"https://api.githubcopilot.com\""));
     assert!(!configuration.contains("access_token"));
     assert!(!configuration.contains("refresh_token"));
+}
+
+#[tokio::test]
+async fn openai_api_configuration_uses_api_key_from_toml() {
+    let temporary = TempDir::new().unwrap();
+    let home = temporary.path().join("home");
+    let menvane = Menvane::new(&home).unwrap();
+    menvane
+        .update_configuration_text(
+            r#"
+[llm]
+provider = "openai-api"
+model = "gpt-test-model"
+base_url = "https://api.openai.com/v1"
+api_key = "toml-test-key"
+api_key_env = "MENVANE_UNSET_OPENAI_KEY"
+"#,
+        )
+        .unwrap();
+
+    let configured = Menvane::new(&home).unwrap();
+    assert_eq!(
+        configured.provider_health().await.unwrap().2,
+        ProviderHealth::Ready
+    );
 }
