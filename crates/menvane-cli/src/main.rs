@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
@@ -15,6 +15,7 @@ use menvane_server::{
     DEFAULT_ADDRESS, DEFAULT_PORT, daemon_running, home_from_environment, serve, start_daemon,
     stop_daemon,
 };
+use menvane_setup::{Agent, SetupOptions};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -26,6 +27,180 @@ use uuid::Uuid;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+fn run_setup(arguments: &SetupArgs) -> Result<()> {
+    if arguments.visual {
+        if arguments.from.is_some() || arguments.non_interactive || arguments.output_json {
+            bail!("--visual cannot be combined with manifest or non-interactive options");
+        }
+        let status = std::process::Command::new("menvane-setup").status()?;
+        if !status.success() {
+            bail!("visual setup exited with status {status}");
+        }
+        return Ok(());
+    }
+    let executable = std::env::current_exe()?;
+    let options = if arguments.non_interactive {
+        let mut manifest = String::new();
+        match arguments.from.as_deref() {
+            Some(path) if path.as_os_str() != "-" => {
+                std::fs::File::open(path)?.read_to_string(&mut manifest)?;
+            }
+            _ => {
+                io::stdin().read_to_string(&mut manifest)?;
+            }
+        }
+        SetupOptions::from_toml(&manifest)?
+    } else {
+        interactive_setup()?
+    };
+    let report = menvane_setup::apply(&options, &executable)?;
+    if arguments.output_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("setup complete");
+        println!("home\t{}", report.home.display());
+        println!("service\tenabled and started");
+        for action in report.actions {
+            println!("action\t{action}");
+        }
+    }
+    Ok(())
+}
+
+fn interactive_setup() -> Result<SetupOptions> {
+    let home = home_from_environment()?;
+    println!("Menvane setup");
+    println!("No daemon will start until the final confirmation succeeds.");
+    let mut options = SetupOptions::new(home);
+    options.provider = Some(prompt("Provider", "openai")?);
+    options.model = Some(prompt("Model", "gpt-5.6-luna")?);
+    options.reasoning_effort = Some(prompt("Reasoning effort", "medium")?);
+    options.base_url = Some(prompt("Provider endpoint", "https://api.openai.com/v1")?);
+    let api_key = rpassword::prompt_password("API key (leave empty to use api_key_env): ")?;
+    if !api_key.trim().is_empty() {
+        options.api_key = Some(api_key);
+    }
+    options.api_key_env = Some(prompt("API key environment variable", "OPENAI_API_KEY")?);
+    if prompt_bool("Enable embeddings", false)? {
+        options.embedding_provider = Some(prompt("Embedding provider", "openai-api")?);
+        options.embedding_model = Some(prompt("Embedding model", "text-embedding-3-small")?);
+        options.embedding_base_url =
+            Some(prompt("Embedding endpoint", "https://api.openai.com/v1")?);
+        let embedding_key = rpassword::prompt_password(
+            "Embedding API key (leave empty to reuse the environment variable): ",
+        )?;
+        if !embedding_key.trim().is_empty() {
+            options.embedding_api_key = Some(embedding_key);
+        }
+        options.embedding_api_key_env = Some(prompt(
+            "Embedding API key environment variable",
+            "OPENAI_API_KEY",
+        )?);
+        options.embedding_min_similarity = Some(
+            prompt("Minimum embedding similarity", "0.78")?
+                .parse()
+                .map_err(|_| anyhow::anyhow!("minimum embedding similarity must be a number"))?,
+        );
+    }
+    options.max_prompt_bytes = Some(prompt_u64("Maximum prompt bytes", 16_384)?);
+    options.max_tool_input_bytes = Some(prompt_u64("Maximum tool input bytes", 4_096)?);
+    options.max_tool_output_bytes = Some(prompt_u64("Maximum tool output bytes", 4_096)?);
+    options.idle_finalize_seconds = Some(prompt_u64("Idle finalization seconds", 120)?);
+    options.open_finalize_seconds = Some(prompt_u64("Open session timeout seconds", 1_800)?);
+    options.lease_timeout_seconds = Some(prompt_u64("Job lease timeout seconds", 300)?);
+    options.memory_lifetime_days = Some(prompt_u64("Memory lifetime days", 90)?);
+    options.min_match_confidence = Some(prompt("Minimum match confidence", "0.45")?.parse()?);
+    options.min_knowledge_confidence =
+        Some(prompt("Minimum knowledge confidence", "0.55")?.parse()?);
+    options.min_utility = Some(prompt("Minimum utility", "0.55")?.parse()?);
+    options.max_cards = Some(prompt_u64("Maximum knowledge cards", 3)?);
+    options.agents = selected_agents()?;
+    println!("\nThe following changes will be applied:");
+    println!("- configuration at {}", options.home.display());
+    for agent in &options.agents {
+        println!("- connect {}", agent.key());
+    }
+    println!("- enable and start menvane.service");
+    if !prompt_bool("Apply and start the service now", false)? {
+        bail!("setup cancelled; no changes were applied");
+    }
+    Ok(options)
+}
+
+fn selected_agents() -> Result<Vec<Agent>> {
+    let mut selected = Vec::new();
+    for (name, agent, detected) in detected_agents()? {
+        println!(
+            "{name}: {}",
+            if detected { "detected" } else { "not detected" }
+        );
+        if prompt_bool(&format!("Connect {name}"), detected)? {
+            selected.push(agent);
+        }
+    }
+    Ok(selected)
+}
+
+fn detected_agents() -> Result<Vec<(&'static str, Agent, bool)>> {
+    let claude = ClaudePaths::discover()?;
+    let codex = CodexPaths::discover()?;
+    let opencode = OpenCodePaths::discover()?;
+    let antigravity = AntigravityPaths::discover()?;
+    Ok(vec![
+        (
+            "Claude Code",
+            Agent::Claude,
+            claude.settings.exists() || claude.configuration.exists(),
+        ),
+        ("Codex", Agent::Codex, codex.configuration.exists()),
+        (
+            "OpenCode",
+            Agent::Opencode,
+            opencode.configuration.exists() || opencode.plugin.exists(),
+        ),
+        (
+            "Antigravity",
+            Agent::Antigravity,
+            antigravity.mcp_configuration.exists() || antigravity.hooks_configuration.exists(),
+        ),
+    ])
+}
+
+fn prompt(label: &str, default: &str) -> Result<String> {
+    print!("{label} [{default}]: ");
+    io::stdout().flush()?;
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    let value = value.trim();
+    Ok(if value.is_empty() {
+        default.to_owned()
+    } else {
+        value.to_owned()
+    })
+}
+
+fn prompt_u64(label: &str, default: u64) -> Result<u64> {
+    prompt(label, &default.to_string())?
+        .parse()
+        .map_err(Into::into)
+}
+
+fn prompt_bool(label: &str, default: bool) -> Result<bool> {
+    let hint = if default { "Y/n" } else { "y/N" };
+    loop {
+        print!("{label} [{hint}]: ");
+        io::stdout().flush()?;
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("Please answer yes or no."),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -48,6 +223,19 @@ enum Command {
     Doctor,
     Handoff(HandoffArgs),
     Mcp,
+    Setup(SetupArgs),
+}
+
+#[derive(Args)]
+struct SetupArgs {
+    #[arg(long)]
+    visual: bool,
+    #[arg(long, value_name = "FILE")]
+    from: Option<PathBuf>,
+    #[arg(long)]
+    non_interactive: bool,
+    #[arg(long)]
+    output_json: bool,
 }
 
 #[derive(Args)]
@@ -361,6 +549,10 @@ enum SearchScopeArg {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Setup(arguments) = &cli.command {
+        run_setup(arguments)?;
+        return Ok(());
+    }
     let menvane = Menvane::from_environment()?;
     match cli.command {
         Command::Serve(arguments) => {
@@ -797,6 +989,7 @@ async fn main() -> Result<()> {
             let stdout = std::io::stdout();
             McpServer::new(&menvane, cwd).serve(stdin.lock(), stdout.lock())?;
         }
+        Command::Setup(_) => unreachable!(),
     }
     Ok(())
 }

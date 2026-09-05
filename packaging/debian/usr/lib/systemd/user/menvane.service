@@ -1,0 +1,13 @@
+[Unit]
+Description=Menvane local memory daemon and UI
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/menvane serve
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=default.target

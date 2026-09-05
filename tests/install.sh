@@ -29,6 +29,7 @@ chmod 755 "$fake_bin/uname"
 
 cat > "$fake_bin/systemctl" <<'EOF'
 #!/bin/sh
+printf '%s\n' "$*" >> "${MENVANE_TEST_SYSTEMCTL_LOG:?MENVANE_TEST_SYSTEMCTL_LOG is not set}"
 exit 0
 EOF
 chmod 755 "$fake_bin/systemctl"
@@ -91,6 +92,7 @@ run_install() {
     XDG_CONFIG_HOME="$test_home/.config" \
     MENVANE_TEST_PLATFORM="$platform" \
     MENVANE_TEST_ARCHITECTURE="$architecture" \
+    MENVANE_TEST_SYSTEMCTL_LOG="$test_root/systemctl.log" \
     PATH="$fake_bin:$PATH" \
         "$script_dir/install.sh" --binary "$binary"
 }
@@ -109,6 +111,7 @@ linux_home=$test_root/linux-home
 run_install "$linux_home" Linux x86_64
 [ -x "$linux_home/.local/bin/menvane" ]
 [ -f "$linux_home/.config/systemd/user/menvane.service" ]
+[ ! -e "$test_root/systemctl.log" ]
 
 mac_home=$test_root/mac-home
 run_install "$mac_home" Darwin x86_64

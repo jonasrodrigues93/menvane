@@ -2,7 +2,7 @@ mod markdown;
 mod sessions;
 mod sqlite;
 
-pub use markdown::{MarkdownStore, ParsedMarkdown};
+pub use markdown::{MarkdownStore, ParsedMarkdown, default_config_text};
 pub use sessions::{
     ConsolidationMarker, DeliveryAudit, GLOBAL_HANDOFF_KEY, IngestResult, InjectionIdentity,
     IntegrationRecord, JobRecord, MAX_CHECKPOINT_DEBOUNCE_SECONDS, MAX_HANDOFF_ITEM_BYTES,

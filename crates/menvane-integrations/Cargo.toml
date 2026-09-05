@@ -13,7 +13,7 @@ chrono.workspace = true
 hex.workspace = true
 menvane-domain = { path = "../menvane-domain" }
 menvane-engine = { path = "../menvane-engine" }
-menvane-server = { path = "../menvane-server" }
+menvane-runtime = { path = "../menvane-runtime" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

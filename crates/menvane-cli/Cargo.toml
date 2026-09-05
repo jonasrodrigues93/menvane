@@ -15,7 +15,10 @@ clap.workspace = true
 menvane-domain = { path = "../menvane-domain" }
 menvane-engine = { path = "../menvane-engine" }
 menvane-integrations = { path = "../menvane-integrations" }
+menvane-runtime = { path = "../menvane-runtime" }
 menvane-server = { path = "../menvane-server" }
+menvane-setup = { path = "../menvane-setup" }
+rpassword.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true

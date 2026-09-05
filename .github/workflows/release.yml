@@ -62,6 +62,12 @@ jobs:
       - name: Test installer
         run: ./tests/install.sh
 
+      - name: Test setup flow
+        run: ./tests/setup.sh
+
+      - name: Test Debian package
+        run: ./tests/package.sh
+
   build:
     name: Build ${{ matrix.target }}
     needs: validate
@@ -135,6 +141,23 @@ jobs:
           path: dist/menvane-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+      - name: Package Debian release
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "menvane-cli"))')
+          ./packaging/build-deb.sh "$version" "$TARGET" "target/${TARGET}/release/menvane" "target/${TARGET}/release/menvane-setup"
+
+      - name: Upload Debian package
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v6
+        with:
+          name: deb-${{ matrix.target }}
+          path: dist/*.deb
+          if-no-files-found: error
+
   publish:
     name: Publish release
     needs: build
@@ -149,11 +172,18 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Download Debian packages
+        uses: actions/download-artifact@v6
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+
       - name: Generate checksums
         run: |
           set -eu
           cd dist
-          sha256sum menvane-*.tar.gz > SHA256SUMS
+          sha256sum menvane-*.tar.gz menvane_*.deb > SHA256SUMS
 
       - name: Publish GitHub release
         env:
@@ -163,7 +193,7 @@ jobs:
         run: |
           set -eu
           if gh release view "$TAG_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
-              gh release upload "$TAG_NAME" dist/menvane-*.tar.gz dist/SHA256SUMS --clobber --repo "$GH_REPO"
+              gh release upload "$TAG_NAME" dist/menvane-*.tar.gz dist/menvane_*.deb dist/SHA256SUMS --clobber --repo "$GH_REPO"
           else
-              gh release create "$TAG_NAME" dist/menvane-*.tar.gz dist/SHA256SUMS --verify-tag --title "Menvane $TAG_NAME" --generate-notes --repo "$GH_REPO"
+              gh release create "$TAG_NAME" dist/menvane-*.tar.gz dist/menvane_*.deb dist/SHA256SUMS --verify-tag --title "Menvane $TAG_NAME" --generate-notes --repo "$GH_REPO"
           fi

@@ -98,11 +98,10 @@ wget --https-only -qO- \
   https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh
 ```
 
-Em seguida, verifique a instalação e conecte seu agente:
+Em seguida, execute o wizard de configuração e conecte seu agente:
 
 ```bash
-menvane doctor
-menvane connect claude
+menvane setup
 ```
 
 O script baixa e verifica o release compatível mais recente e o instala em
@@ -119,14 +118,21 @@ houver um release compatível, a instalação falha em vez de compilar da fonte.
 Uma versão solicitada que não esteja disponível falha sem instalar uma versão
 diferente. Garanta que `~/.local/bin` esteja no seu `PATH`.
 
-No Linux, a instalação habilita e inicia um `menvane.service` no escopo do
-usuário. O daemon e a UI local passam a iniciar automaticamente com a sessão
-do usuário. No macOS, a instalação cria e carrega um LaunchAgent em
+No Linux, a instalação apenas instala um `menvane.service` no escopo do
+usuário. O wizard habilita e inicia o serviço depois que a configuração for
+concluída. No macOS, o instalador portátil cria e carrega um LaunchAgent em
 `~/Library/LaunchAgents/com.jonasrodrigues93.menvane.plist`; assim, o daemon
-inicia no login e reinicia após falhas. Use `menvane connect codex` ou
-`menvane connect opencode` para os outros clientes. Captura e recuperação
-acontecem automaticamente; nenhuma Skill, arquivo de instruções do repositório
-ou instrução explícita de memória é necessária.
+inicia no login e reinicia após falhas. Use `menvane-setup` para o wizard
+desktop nativo ou `menvane setup` no terminal. A importação histórica fica
+fora do setup. Captura e recuperação acontecem automaticamente depois da
+configuração; nenhuma Skill, arquivo de instruções do repositório ou instrução
+explícita de memória é necessária.
+
+No Debian ou Ubuntu, instale o pacote nativo com `apt install
+./menvane_<versão>_<arquitetura>.deb`. O pacote instala `menvane`, o serviço do
+usuário e o launcher desktop `Menvane Setup`, mas não inicia o serviço nem abre
+uma janela. Execute `menvane-setup` pelo desktop ou `menvane setup` no terminal;
+o serviço só é habilitado e iniciado depois da confirmação final.
 
 O Menvane suporta Linux, macOS e WSL com systemd habilitado.
 

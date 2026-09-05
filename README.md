@@ -98,11 +98,10 @@ wget --https-only -qO- \
   https://raw.githubusercontent.com/jonasrodrigues93/menvane/master/install.sh | sh
 ```
 
-Then check the installation and connect your agent:
+Then run the setup wizard and connect your agent:
 
 ```bash
-menvane doctor
-menvane connect claude
+menvane setup
 ```
 
 The script downloads and verifies the latest compatible release, then installs
@@ -118,14 +117,21 @@ Use a checkout's `./install.sh --version <version>` for a pinned release or
 compatible release is available, installation fails instead of compiling from
 source. Make sure `~/.local/bin` is in your `PATH`.
 
-On Linux, installation enables and starts a user-scoped `menvane.service`.
-The daemon and local UI then start automatically with the user session. On
-macOS, installation creates and loads a LaunchAgent at
+On Linux, installation only installs the user-scoped `menvane.service`.
+The setup wizard enables and starts it after configuration is complete. On
+macOS, the portable installer creates and loads a LaunchAgent at
 `~/Library/LaunchAgents/com.jonasrodrigues93.menvane.plist`, so the daemon
-starts at login and restarts after failure. Use `menvane connect codex` or
-`menvane connect opencode` for the other supported clients. Capture and recall
-happen automatically; no Skill, repository instruction file, or explicit
-memory prompt is required.
+starts at login and restarts after failure. Use `menvane-setup` for the native
+desktop wizard or `menvane setup` on a terminal. Historical import is outside
+the setup flow. Capture and recall happen automatically after setup; no Skill,
+repository instruction file, or explicit memory prompt is required.
+
+For Debian or Ubuntu, install the native package with `apt install
+./menvane_<version>_<architecture>.deb`. The package installs `menvane`, the
+user service, and the `Menvane Setup` desktop launcher, but does not start the
+service or open a window. Launch `menvane-setup` from the desktop or use
+`menvane setup` in a terminal; the service is enabled and started only after
+the final setup confirmation succeeds.
 
 Menvane supports Linux, macOS, and WSL with systemd enabled.
 

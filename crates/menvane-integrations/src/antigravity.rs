@@ -10,7 +10,7 @@ use menvane_domain::{
     NormalizedEvent, NormalizedEventKind, NormalizedEventOrigin, NormalizedEventRole,
 };
 use menvane_engine::Menvane;
-use menvane_server::{DEFAULT_PORT, daemon_running, home_from_environment, start_daemon};
+use menvane_runtime::{DEFAULT_PORT, daemon_running, home_from_environment, start_daemon};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 

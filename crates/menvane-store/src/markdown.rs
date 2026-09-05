@@ -47,7 +47,7 @@ impl MarkdownStore {
         }
         let config = self.home.join("config.toml");
         if !config.exists() {
-            self.atomic_write(&config, default_config().as_bytes())?;
+            self.atomic_write(&config, default_config_text().as_bytes())?;
         }
         self.initialize_git();
         Ok(())
@@ -346,7 +346,7 @@ fn slugify(value: &str) -> String {
     }
 }
 
-fn default_config() -> &'static str {
+pub fn default_config_text() -> &'static str {
     "[capture]\nmax_prompt_bytes = 16384\nmax_tool_output_bytes = 4096\nmax_tool_input_bytes = 4096\nignore_paths = [\".env\", \".env.*\", \"**/secrets/**\", \"**/.ssh/**\", \"AGENTS.md\", \"**/AGENTS.md\", \"SKILL.md\", \"**/SKILL.md\", \"skills/**\", \"**/skills/**\"]\n\n[sessions]\nidle_finalize_seconds = 120\nopen_finalize_seconds = 1800\n\n[recall]\nmin_match_confidence = 0.45\nmin_knowledge_confidence = 0.55\nmin_utility = 0.55\nmax_cards = 3\n\n[decay]\nmemory_lifetime_days = 90\n\n[jobs]\nlease_timeout_seconds = 300\n\n[llm]\nprovider = \"openai\"\nmodel = \"gpt-5.6-luna\"\nreasoning_effort = \"medium\"\noauth_issuer = \"https://auth.openai.com\"\noauth_endpoint = \"https://chatgpt.com/backend-api/codex/responses\"\n"
 }
 

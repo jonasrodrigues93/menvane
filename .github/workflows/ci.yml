@@ -43,3 +43,9 @@ jobs:
 
       - name: Test installer
         run: ./tests/install.sh
+
+      - name: Test Debian package
+        run: ./tests/package.sh
+
+      - name: Test setup flow
+        run: ./tests/setup.sh
