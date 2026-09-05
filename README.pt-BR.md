@@ -220,6 +220,18 @@ menvane provider status
 
 O comando de login exibe uma URL de verificação do GitHub e um código de usuário. O Menvane armazena suas próprias credenciais renováveis em `~/.menvane/oauth/github-copilot.json` e nunca lê credenciais do GitHub CLI ou Copilot CLI.
 
+Para usar um provider compatível com API, defina a chave diretamente em `~/.menvane/config.toml`:
+
+```toml
+[llm]
+provider = "openai-api"
+model = "gpt-4.1-mini"
+base_url = "https://api.openai.com/v1"
+api_key = "sua-chave-api"
+```
+
+O campo `api_key_env` continua disponível como alternativa quando `api_key` não for definido. Chaves no TOML ficam em texto claro e são incluídas em backups.
+
 ## Integrações
 
 | Cliente | Comando de conexão | Ciclo de vida capturado |
@@ -244,19 +256,20 @@ O início da sessão entrega apenas a identidade mínima do projeto e o handoff 
 
 A busca explícita usa somente a consulta fornecida pelo chamador. O Markdown completo e a proveniência limitada continuam disponíveis por `menvane read` e pela interface local.
 
-A recuperação automática usa correspondência lexical conservadora em português e inglês. Ela combina FTS5 com embeddings sempre que um provider independente de embeddings está configurado e saudável, e retorna ao FTS5 quando embeddings não estão disponíveis. Configure um endpoint de embeddings compatível com OpenAI em `~/.menvane/config.toml`:
+A recuperação automática usa correspondência lexical conservadora em português e inglês. Ela combina FTS5 com embeddings sempre que um provider independente de embeddings está configurado e saudável, e retorna ao FTS5 quando embeddings não estão disponíveis. Configure um endpoint de embeddings compatível com OpenAI em `~/.menvane/config.toml`; a chave pode ser definida diretamente no TOML:
 
 ```toml
 [embeddings]
 provider = "openai-api"
 model = "text-embedding-3-small"
 base_url = "https://api.openai.com/v1"
+api_key = "sua-chave-api"
 api_key_env = "OPENAI_API_KEY"
 min_similarity = 0.78
 ```
 
 Reinicie o daemon e execute `menvane reindex` depois de ativar ou alterar o modelo de embeddings.
-Embeddings externos ficam desativados por padrão. Ativá-los envia prompts de recuperação sanitizados e títulos e corpos das memórias duráveis ao endpoint configurado.
+Embeddings externos ficam desativados por padrão. Ativá-los envia prompts de recuperação sanitizados e títulos e corpos das memórias duráveis ao endpoint configurado. Se `api_key` estiver ausente, `api_key_env` continua definindo o nome da variável de ambiente usada.
 
 ## Privacidade e confiança
 
@@ -267,6 +280,7 @@ Embeddings externos ficam desativados por padrão. Ativá-los envia prompts de r
 - Raciocínio privado do modelo nunca é capturado.
 - Memórias injetadas são contexto histórico; instruções atuais do usuário e o estado do repositório continuam tendo autoridade.
 - O Menvane nunca lê nem modifica credenciais do OpenCode ou Codex.
+- Chaves definidas em `api_key` ficam em texto claro no `config.toml` e são incluídas em backups.
 
 ## Recuperação
 

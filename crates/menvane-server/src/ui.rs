@@ -693,6 +693,10 @@ async fn render_unified_settings(menvane: &Menvane, active_tab: &str) -> Respons
             ),
         };
 
+        let active_content = active_content.replace(
+            "Secret values are read strictly from environment variables and never stored in files.",
+            "API keys may be stored directly in config.toml using api_key or read from the configured environment variable.",
+        );
         Ok::<_, anyhow::Error>(format!(
             "{}<div class='settings-tabs-header'><nav class='tabs-nav'>{}</nav></div><div class='settings-tab-container'>{}</div>",
             page_head("Settings &amp; System", "Manage operational parameters, agent connections, inference providers and historical imports."),

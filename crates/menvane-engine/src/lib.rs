@@ -201,6 +201,8 @@ struct EmbeddingConfiguration {
     model: String,
     #[serde(default = "default_api_url")]
     base_url: String,
+    #[serde(default)]
+    api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
     api_key_env: String,
     #[serde(default = "default_embedding_min_similarity")]
@@ -213,6 +215,7 @@ impl Default for EmbeddingConfiguration {
             provider: None,
             model: String::new(),
             base_url: default_api_url(),
+            api_key: None,
             api_key_env: default_api_key_env(),
             min_similarity: default_embedding_min_similarity(),
         }
@@ -258,6 +261,8 @@ struct LlmConfiguration {
     model: String,
     #[serde(default = "default_api_url")]
     base_url: String,
+    #[serde(default)]
+    api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
     api_key_env: String,
     #[serde(default)]
@@ -282,6 +287,7 @@ impl Default for LlmConfiguration {
             provider: default_llm_provider(),
             model: default_llm_model(),
             base_url: default_api_url(),
+            api_key: None,
             api_key_env: default_api_key_env(),
             reasoning_effort: Some("medium".to_owned()),
             oauth_issuer: default_oauth_issuer(),
@@ -1384,12 +1390,6 @@ impl Menvane {
             bail!("decay.memory_lifetime_days must be at least 1");
         }
         validate_recall_configuration(parsed.recall)?;
-        let lowercase = configuration.to_ascii_lowercase();
-        for forbidden in ["api_key =", "token =", "password =", "secret ="] {
-            if lowercase.contains(forbidden) {
-                bail!("secrets must be supplied through environment variables");
-            }
-        }
         atomic_replace(&self.home.join("config.toml"), configuration.as_bytes())
     }
 
@@ -1417,6 +1417,7 @@ impl Menvane {
             toml::Value::String(model.trim().to_owned()),
         );
         llm.remove("base_url");
+        llm.remove("api_key");
         llm.remove("api_key_env");
         llm.remove("github_client_id");
         llm.remove("github_oauth_issuer");
@@ -1476,6 +1477,7 @@ impl Menvane {
             toml::Value::String(default_github_api_endpoint()),
         );
         llm.remove("api_key_env");
+        llm.remove("api_key");
         llm.remove("oauth_issuer");
         llm.remove("oauth_endpoint");
         if let Some(value) = reasoning_effort {
@@ -2870,6 +2872,7 @@ fn provider_from_configuration(
                 &configuration.base_url,
                 &configuration.api_key_env,
             )
+            .with_optional_api_key(configuration.api_key.clone())
             .with_reasoning_effort(configuration.reasoning_effort.clone()),
         )),
         "github-copilot" | "copilot" => Ok(Arc::new(GithubCopilotProvider::with_endpoints(
@@ -2888,19 +2891,22 @@ fn provider_from_configuration(
             if configuration.model.trim().is_empty() || configuration.model == "default" {
                 bail!("OpenRouter requires an explicit model");
             }
-            Ok(Arc::new(OpenRouterProvider::new(
-                &configuration.model,
-                if configuration.base_url == default_api_url() {
-                    "https://openrouter.ai/api/v1"
-                } else {
-                    &configuration.base_url
-                },
-                if configuration.api_key_env == default_api_key_env() {
-                    "OPENROUTER_API_KEY"
-                } else {
-                    &configuration.api_key_env
-                },
-            )))
+            Ok(Arc::new(
+                OpenRouterProvider::new(
+                    &configuration.model,
+                    if configuration.base_url == default_api_url() {
+                        "https://openrouter.ai/api/v1"
+                    } else {
+                        &configuration.base_url
+                    },
+                    if configuration.api_key_env == default_api_key_env() {
+                        "OPENROUTER_API_KEY"
+                    } else {
+                        &configuration.api_key_env
+                    },
+                )
+                .with_optional_api_key(configuration.api_key.clone()),
+            ))
         }
         provider => bail!("unsupported LLM provider: {provider}"),
     }
@@ -2919,12 +2925,15 @@ fn configured_embedding_provider(
         bail!("embedding minimum similarity must be between zero and one")
     }
     match provider {
-        "openai-api" => Ok(Some(Arc::new(OpenAICompatibleEmbeddingProvider::new(
-            provider,
-            &configuration.model,
-            &configuration.base_url,
-            &configuration.api_key_env,
-        )))),
+        "openai-api" => Ok(Some(Arc::new(
+            OpenAICompatibleEmbeddingProvider::new(
+                provider,
+                &configuration.model,
+                &configuration.base_url,
+                &configuration.api_key_env,
+            )
+            .with_optional_api_key(configuration.api_key.clone()),
+        ))),
         provider => bail!("unsupported embedding provider: {provider}"),
     }
 }

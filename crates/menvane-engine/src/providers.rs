@@ -155,6 +155,7 @@ pub struct OpenRouterProvider {
     model: String,
     base_url: String,
     api_key_env: String,
+    api_key: Option<String>,
     reasoning_effort: Option<String>,
 }
 
@@ -175,6 +176,11 @@ impl OpenAIApiProvider {
 
     pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
         self.compatible = self.compatible.with_reasoning_effort(reasoning_effort);
+        self
+    }
+
+    pub fn with_optional_api_key(mut self, api_key: Option<String>) -> Self {
+        self.compatible = self.compatible.with_optional_api_key(api_key);
         self
     }
 }
@@ -219,12 +225,18 @@ impl OpenRouterProvider {
             model: model.into(),
             base_url: base_url.into(),
             api_key_env: api_key_env.into(),
+            api_key: None,
             reasoning_effort: None,
         }
     }
 
     pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    pub fn with_optional_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
         self
     }
 }
@@ -236,8 +248,13 @@ impl LlmProvider for OpenRouterProvider {
         request: LlmRequest,
         schema: JsonSchema,
     ) -> Result<StructuredResponse, LlmError> {
-        let api_key = std::env::var(&self.api_key_env)
-            .map_err(|_| authentication("OpenRouter API key is not configured"))?;
+        let api_key = self
+            .api_key
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| std::env::var(&self.api_key_env).ok())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| authentication("OpenRouter API key is not configured"))?;
         let mut payload = json!({
             "model": self.model,
             "messages": [
@@ -296,7 +313,14 @@ impl LlmProvider for OpenRouterProvider {
     }
 
     async fn health(&self) -> ProviderHealth {
-        if std::env::var_os(&self.api_key_env).is_none() {
+        let has_api_key = self
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || std::env::var(&self.api_key_env)
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty());
+        if !has_api_key {
             ProviderHealth::MissingApiKey
         } else if self.model.trim().is_empty() {
             ProviderHealth::ModelUnavailable
@@ -689,7 +713,7 @@ exit 1
                 if headers
                     .get("authorization")
                     .and_then(|value| value.to_str().ok())
-                    != Some("Bearer openai-test-key")
+                    != Some("Bearer toml-test-key")
                 {
                     return (
                         StatusCode::UNAUTHORIZED,
@@ -713,6 +737,7 @@ exit 1
         );
         tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let provider = OpenAIApiProvider::new("test-model", format!("http://{address}"), key_name)
+            .with_optional_api_key(Some("toml-test-key".to_owned()))
             .with_reasoning_effort(Some("medium".to_owned()));
         let response = provider
             .generate_structured(request(), schema())
