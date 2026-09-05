@@ -14,6 +14,7 @@ chrono.workspace = true
 fs2.workspace = true
 menvane-domain = { path = "../menvane-domain" }
 menvane-engine = { path = "../menvane-engine" }
+menvane-runtime = { path = "../menvane-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Menvane Setup
+Comment=Configure local memory for coding agents
+Exec=menvane-setup
+Icon=menvane
+Terminal=false
+Categories=Utility;Development;
+StartupNotify=true

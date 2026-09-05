@@ -3,9 +3,12 @@ members = [
     "crates/menvane-domain",
     "crates/menvane-store",
     "crates/menvane-engine",
+    "crates/menvane-runtime",
     "crates/menvane-integrations",
+    "crates/menvane-setup",
     "crates/menvane-server",
     "crates/menvane-cli",
+    "crates/menvane-setup-gui",
 ]
 resolver = "2"
 
@@ -27,6 +30,7 @@ getrandom = "0.4"
 hex = "0.4"
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rpassword = "7.4"
 rusqlite = { version = "0.37", features = ["backup", "bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -41,3 +45,4 @@ url = "2.5"
 webbrowser = "1.0"
 uuid = { version = "1.18", features = ["serde", "v7"] }
 jsonschema = { version = "0.49", default-features = false }
+iced = { version = "0.13", default-features = false, features = ["advanced", "tiny-skia"] }

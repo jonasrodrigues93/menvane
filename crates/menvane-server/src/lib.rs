@@ -1,6 +1,5 @@
 use std::fs::{self, File, OpenOptions};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,8 +20,9 @@ use uuid::Uuid;
 
 mod ui;
 
-pub const DEFAULT_ADDRESS: &str = "127.0.0.1";
-pub const DEFAULT_PORT: u16 = 47_831;
+pub use menvane_runtime::{
+    DEFAULT_ADDRESS, DEFAULT_PORT, daemon_running, home_from_environment, start_daemon, stop_daemon,
+};
 
 pub async fn serve(menvane: Menvane, address: &str, port: u16) -> Result<()> {
     let home = menvane.home().to_path_buf();
@@ -71,46 +71,6 @@ pub fn app(state: Arc<Menvane>) -> Router {
         .merge(ui::router())
         .fallback(api_fallback)
         .with_state(state)
-}
-
-pub fn daemon_running(home: &std::path::Path) -> bool {
-    let Ok(pid) = fs::read_to_string(home.join("daemon.pid")) else {
-        return false;
-    };
-    std::process::Command::new("kill")
-        .args(["-0", pid.trim()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-pub fn start_daemon(home: &std::path::Path, executable: &std::path::Path) -> Result<u32> {
-    if daemon_running(home) {
-        anyhow::bail!("Menvane daemon is already running");
-    }
-    fs::create_dir_all(home.join("logs"))?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(home.join("logs/daemon.log"))?;
-    let child = std::process::Command::new(executable)
-        .arg("serve")
-        .env("MENVANE_HOME", home)
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()?;
-    Ok(child.id())
-}
-
-pub fn stop_daemon(home: &std::path::Path) -> Result<()> {
-    let pid = fs::read_to_string(home.join("daemon.pid")).context("daemon is not running")?;
-    let status = std::process::Command::new("kill")
-        .arg(pid.trim())
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("failed to stop daemon process {}", pid.trim());
-    }
-    Ok(())
 }
 
 async fn health() -> Json<Value> {
@@ -465,13 +425,6 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
-}
-
-pub fn home_from_environment() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("MENVANE_HOME") {
-        return Ok(PathBuf::from(home));
-    }
-    Ok(PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".menvane"))
 }
 
 #[cfg(test)]

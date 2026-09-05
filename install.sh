@@ -179,10 +179,6 @@ installed_binary=$install_dir/menvane
 install -d "$install_dir"
 
 if [ "$platform" = Linux ]; then
-    command -v systemctl >/dev/null 2>&1 || {
-        printf '%s\n' "systemctl is required for automatic startup on Linux" >&2
-        exit 1
-    }
     config_home=${XDG_CONFIG_HOME:-$home/.config}
     unit_dir=$config_home/systemd/user
     unit=$unit_dir/menvane.service
@@ -206,12 +202,8 @@ if [ "$platform" = Linux ]; then
     mv "$temporary_unit" "$unit"
     temporary_unit=
 
-    systemctl --user daemon-reload
-    systemctl --user enable menvane.service
-    systemctl --user stop menvane.service
     install -m 755 "$binary" "$installed_binary"
-    systemctl --user restart --no-block menvane.service
-    printf 'Installed %s and enabled menvane.service\n' "$installed_binary"
+    printf 'Installed %s; run menvane setup to configure and start the service\n' "$installed_binary"
 elif [ "$platform" = Darwin ]; then
     command -v launchctl >/dev/null 2>&1 || {
         printf '%s\n' "launchctl is required for automatic startup on macOS" >&2

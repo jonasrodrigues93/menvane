@@ -1,0 +1,15 @@
+[package]
+name = "menvane-setup-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "menvane-setup"
+path = "src/main.rs"
+
+[dependencies]
+iced.workspace = true
+menvane-integrations = { path = "../menvane-integrations" }
+menvane-runtime = { path = "../menvane-runtime" }
+menvane-setup = { path = "../menvane-setup" }
